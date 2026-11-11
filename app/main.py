@@ -132,12 +132,23 @@ async def healthz() -> JSONResponse:
     body.update(token_manager.describe())
     body["base_url"] = settings.base_url
     body["proxy"] = bool(settings.upstream_proxy)
-    try:
-        await token_manager.get()
-    except CredentialError as exc:
+
+    token = token_manager.peek()
+    if token is None:
         body["status"] = "degraded"
-        body["error"] = str(exc)
+        body["error"] = (
+            "no credential available: set MINIMAX_ACCESS_TOKEN, MINIMAX_REFRESH_TOKEN, "
+            "or provide MINIMAX_AUTH_FILE / TOKEN_STORE"
+        )
         return JSONResponse(status_code=503, content=body)
+
+    if token.expires_at_ms:
+        body["expires_at_ms"] = token.expires_at_ms
+        body["expired"] = token.is_expired()
+        if token.is_expired() and not token.refresh_token:
+            body["status"] = "degraded"
+            body["error"] = "access token expired and no refresh token available"
+            return JSONResponse(status_code=503, content=body)
     return JSONResponse(status_code=200, content=body)
 
 
@@ -160,8 +171,6 @@ async def list_models_meta() -> dict:
 async def chat_completions(request: Request):
     if not _authorized(request):
         return error_response(401, "invalid gateway api key", "authentication_error")
-    if request.headers.get("x-api-key") and not settings.api_keys:
-        pass
 
     try:
         body = await _read_json(request)

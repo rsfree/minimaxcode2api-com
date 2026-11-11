@@ -195,6 +195,15 @@ class TokenManager:
         async with self._lock:
             self._token = None
 
+    def peek(self) -> Token | None:
+        """Return a credential without ever going to the network.
+
+        Used by ``/healthz`` so a probe can never block on a token refresh.
+        """
+        if self._token is not None:
+            return self._token
+        return self._from_sources()
+
     def describe(self) -> dict:
         token = self._token
         return {

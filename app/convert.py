@@ -438,8 +438,11 @@ async def stream_openai(
             delta = data.get("delta") or {}
             if delta.get("stop_reason"):
                 finish = FINISH_REASONS.get(delta["stop_reason"], "stop")
-            if (data.get("usage") or {}).get("output_tokens") is not None:
-                usage = {**usage, **_usage({"usage": {**usage, **data["usage"]}})}
+            update = data.get("usage") or {}
+            output_tokens = update.get("output_tokens")
+            if output_tokens is not None:
+                usage["completion_tokens"] = int(output_tokens)
+                usage["total_tokens"] = int(usage.get("prompt_tokens", 0)) + int(output_tokens)
 
         elif kind == "message_stop":
             break
