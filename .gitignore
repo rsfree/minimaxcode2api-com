@@ -1,0 +1,24 @@
+# local
+.venv/
+.tmp/
+data/
+token.json
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# secrets
+.env
+.env.local
+.env.*.local
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

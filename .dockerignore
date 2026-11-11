@@ -1,0 +1,22 @@
+# Build context hygiene for docker build.
+.git
+.github
+.venv
+.venv/**
+.tmp
+data
+*.md
+!README.md
+.env
+.env.*
+!.env.example
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.DS_Store
+Thumbs.db
+token.json

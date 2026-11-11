@@ -1,0 +1,38 @@
+services:
+  minimax-code2api:
+    image: ${MINIMAX_IMAGE:-ghcr.io/jushenzhidao/minimax-code2api:latest}
+    # For a local build instead of the registry image:
+    # build: .
+    container_name: minimax-code2api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    volumes:
+      # Holds token.json written by `python -m app.login` and rotated on refresh.
+      - ./data:/data
+    # `user:` override is only needed if you mount a host directory that the
+    # container user cannot write to:  user: "<PUID>:<PGID>"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=4).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
