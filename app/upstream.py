@@ -221,11 +221,18 @@ class Upstream:
         last: UpstreamError | None = None
         attempts = max(1, len(getattr(token_manager, "_tokens", []) or [1]))
         current = ""
+        model_misses = 0
 
         for _ in range(attempts + 1):
             try:
                 token = await token_manager.acquire(exclude=tried)
             except CredentialError as exc:
+                # Nothing left to try. Report what actually went wrong: a bad
+                # model name used to surface here as "out of quota", because the
+                # extra lap ran the pool dry and then blamed the balance.
+                if last is not None and not _quota_exhausted(last.message):
+                    last.account = last.account or current
+                    raise last from exc
                 # 503, not 502: nothing is wrong with the upstream, the pool itself
                 # has nothing to spend. The message says when the reset lands.
                 raise UpstreamError(503, f"no usable account: {exc}") from exc
@@ -273,10 +280,16 @@ class Upstream:
                             token.label or token.short, err.message,
                         )
                     else:
+                        # A model name is global, not per-account: if three
+                        # accounts do not know it, the request is wrong and
+                        # walking the rest of the pool just wastes round trips.
+                        model_misses += 1
                         log.warning(
                             "account %s lacks this model; trying next",
                             token.label or token.short,
                         )
+                        if model_misses >= 3:
+                            raise err
                     last = err
                     continue
                 raise err

@@ -803,6 +803,69 @@ def test_log_clock_uses_console_timezone() -> None:
         metrics_mod._TZ, metrics_mod._TZ_NAME = None, ""
 
 
+def test_bad_model_is_not_blamed_on_the_balance() -> None:
+    """A wrong model name must come back as 400, not "every account is out of quota".
+
+    The retry loop used to take one extra lap, so after walking the pool it called
+    acquire() with every account excluded and surfaced that CredentialError —
+    which reads "out of quota until the daily reset" no matter why the pool emptied.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from app import upstream as upstream_mod
+    from app.auth import Token
+
+    pool = [Token(access_token=f"tok{i}", label=f"t{i}@x") for i in range(5)]
+    calls: list[str] = []
+
+    class Resp:
+        status_code = 400
+        account = ""
+
+        async def aread(self):
+            return b'{"error":{"message":"unknown model: nope"}}'
+
+        async def aclose(self):
+            pass
+
+    async def fake_dispatch(url, payload, headers, stream):
+        calls.append(url)
+        return Resp()
+
+    async def fake_acquire(exclude=None):
+        exclude = exclude or set()
+        for token in pool:
+            if token.access_token not in exclude:
+                return token
+        raise TokenExhausted("every account is out of quota")
+
+    class TokenExhausted(Exception):
+        pass
+
+    async def run():
+        with patch.object(upstream_mod.upstream, "startup", return_value=None), \
+             patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
+             patch.object(upstream_mod.token_manager, "acquire", fake_acquire), \
+             patch.object(upstream_mod.token_manager, "_tokens", pool):
+            try:
+                await upstream_mod.upstream._send({"model": "nope", "messages": []}, False)
+            except Exception as exc:  # noqa: BLE001 - the class is what matters
+                return exc
+        return None
+
+    # The exception type is imported lazily to avoid a module cycle at import time.
+    from app.auth import CredentialError
+
+    with patch.object(upstream_mod, "CredentialError", CredentialError):
+        err = asyncio.run(run())
+    assert err is not None, "the request should have failed"
+    assert not isinstance(err, type(None))
+    assert "quota" not in str(err).lower(), str(err)
+    assert "unknown model" in str(err).lower(), str(err)
+    assert len(calls) == 3, f"stopped after 3 model misses, made {len(calls)} calls"
+
+
 def test_capacity_math() -> None:
     """补号测算 has to be arithmetically sane, not just pretty."""
     from fastapi.testclient import TestClient
@@ -848,6 +911,7 @@ def main() -> None:
         test_store_degrades_to_memory,
         test_admin_logs_pagination,
         test_log_clock_uses_console_timezone,
+        test_bad_model_is_not_blamed_on_the_balance,
         test_capacity_math,
     ]
     for test in tests:
