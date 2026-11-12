@@ -996,7 +996,9 @@ async function loadOverview() {
   $("sCredits").textContent = balKnown ? num(bal) : "—";
   $("sCredits").parentElement.className = "stat " + (balKnown ? (bal > 0 ? "good" : bal < 0 ? "bad" : "") : "");
   $("sCreditsNote").textContent = balKnown
-    ? (t.balance_zero ? t.balance_zero + "/" + t.balance_accounts + " 个为 0" : "")
+    ? (p.pool_size && t.balance_accounts < p.pool_size
+        ? t.balance_accounts + "/" + p.pool_size + " 已采"
+        : (t.balance_zero ? t.balance_zero + "/" + t.balance_accounts + " 个为 0" : ""))
     : "待采样";
   $("accHint").textContent = p.pool_watch_seconds
     ? "新账号 " + p.pool_watch_seconds + " 秒内自动进池"
