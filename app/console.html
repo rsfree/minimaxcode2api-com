@@ -423,6 +423,7 @@ const THEME_STORE = "mmx.theme.v1";
 let apiKey = localStorage.getItem(KEY_STORE) || "";
 let models = [];
 let chatHistory = [];
+let voicesLoaded = false;
 let controller = null;
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
@@ -458,12 +459,13 @@ function authHeaders(extra) {
   return h;
 }
 
-async function api(path, opts) {
+async function api(path, opts, quiet) {
   opts = opts || {};
   opts.headers = authHeaders(opts.headers);
   const res = await fetch(path, opts);
   if (res.status === 401) {
-    openKeyGate();
+    // 后台请求（例如进页面就预取音色）不该打断用户，只有用户主动发起的调用才弹门。
+    if (!quiet) openKeyGate();
     throw new Error("需要访问密钥");
   }
   return res;
@@ -496,7 +498,7 @@ $("keySave").addEventListener("click", () => {
   toast("密钥已保存到本机浏览器", "ok");
   refreshAll();
   loadModels();
-  loadVoices();
+  voicesLoaded = false;
 });
 $("keyInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("keySave").click(); });
 
@@ -508,6 +510,7 @@ function show(view) {
   $("ttl").textContent = TITLES[view] || view;
   if (location.hash.slice(1) !== view) history.replaceState(null, "", "#" + view);
   if (view === "chat") setTimeout(() => $("prompt").focus(), 20);
+  if (view === "speech") loadVoices();
 }
 document.querySelectorAll(".nav a").forEach((a) => {
   a.addEventListener("click", (e) => { e.preventDefault(); show(a.dataset.view); });
@@ -583,15 +586,17 @@ async function loadModels() {
 
 /* ── 音色 ─────────────────────────────────────────────────────────── */
 async function loadVoices() {
+  if (voicesLoaded) return;
   try {
-    const res = await api("/v1/audio/voices");
+    const res = await api("/v1/audio/voices", null, true);
     if (!res.ok) throw new Error(await errorText(res));
     const data = await res.json();
     const items = data.data || [];
     $("voiceCount").textContent = items.length ? "(" + items.length + ")" : "";
     $("voiceList").innerHTML = items.slice(0, 400).map((v) =>
       '<option value="' + esc(v.voice_id) + '">' + esc(v.voice_name || v.voice_id) + "</option>").join("");
-  } catch (e) { /* 静默：音色清单不是必需 */ }
+    voicesLoaded = true;
+  } catch (e) { /* 静默：音色清单不是必需，缺密钥时用户手动输入也能合成 */ }
 }
 
 /* ── 消息渲染 ─────────────────────────────────────────────────────── */
@@ -874,7 +879,6 @@ $("btnRefresh").addEventListener("click", () => {
 /* ── 启动 ─────────────────────────────────────────────────────────── */
 refreshAll();
 loadModels();
-loadVoices();
 setInterval(refreshAll, 15000);
 </script>
 </body>
