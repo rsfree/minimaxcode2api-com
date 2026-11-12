@@ -1264,6 +1264,8 @@ async function loadCapacity() {
   const b = d.balance, r = d.run_rate;
   $("capDays").textContent = b.days_left != null ? b.days_left : "—";
   document.querySelector(".hero .unit").hidden = b.days_left == null;
+  // 没有可预测的对象时整块藏掉：一个孤零零的大号破折号只会让人以为坏了。
+  document.querySelector(".hero").hidden = d.ledger_empty && b.days_left == null;
   $("capHeroNote").textContent = d.ledger_empty
     ? "上游积分台账里没有在用批次（签到额度不计入），余额不可用于预测"
     : b.days_left != null
