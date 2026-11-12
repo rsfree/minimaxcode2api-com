@@ -64,6 +64,12 @@ def _alerts(pool: dict, usage: dict, probe_totals: dict) -> list[dict]:
             "key": "disabled",
             "text": f"{pool['disabled']} 个账号被手动禁用，不参与轮换",
         })
+    if pool.get("cooling_quota"):
+        out.append({
+            "level": "warn",
+            "key": "quota",
+            "text": f"{pool['cooling_quota']} 个号额度用尽，已冷却到次日重置（签到最后会自动解除）",
+        })
     rate = usage.get("success_rate")
     if usage.get("requests", 0) >= 10 and rate is not None and rate < 98:
         out.append({
@@ -214,6 +220,10 @@ async def claim_signin(request: Request) -> dict:
             return {"label": name, "claimed": False, "error": str(exc)[:200]}
 
     results = await asyncio.gather(*(one(t) for t in tokens))
+    # 签到的意义就是回血：签完把这些号从「额度冷却到次日」里放出来。
+    for row in results:
+        if not row.get("error"):
+            token_manager.clear_quota_cooldown(row.get("label"))
     gained = sum(r.get("points") or 0 for r in results if r.get("claimed"))
     return {
         "results": results,
@@ -288,32 +298,53 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
         if span_hours >= 0.5 and first["remaining"] > last["remaining"]:
             drain_per_day = (first["remaining"] - last["remaining"]) / span_hours * 24
 
-    remaining = totals.get("credits_remaining") or 0.0
-    # The paid-credit ledger only lists packs that were granted. Free check-in
-    # points do not appear there at all, so an all-zero ledger means "nothing to
-    # measure here", not "the pool is broke".
-    ledger_empty = not totals.get("credit_batches")
+    # Two credit numbers exist upstream and they answer different questions:
+    # `balance` is the membership balance (real, can go negative), while the
+    # ledger only lists paid packs and is empty for every free account. Show the
+    # balance when the probe has one; the ledger is the historical fallback.
+    balance = totals.get("balance")
+    balance_known = bool(totals.get("balance_accounts"))
+    remaining = float(balance) if (balance_known and balance is not None) else float(totals.get("credits_remaining") or 0)
+    ledger_only = not totals.get("credit_batches") and not balance_known
     elapsed_hours = max(0.01, (time.time() - metrics.started_at) / 3600)
     window_days = hours / 24
     tokens_per_day = round(total["total_tokens"] / window_days) if total["total_tokens"] else 0
     requests_per_day = round(total["requests"] / window_days) if total["requests"] else 0
 
-    days_left = round(remaining / drain_per_day, 1) if drain_per_day > 0 else None
+    # A negative balance cannot "last N days"; it is already spent past zero.
+    days_left = round(remaining / drain_per_day, 1) if drain_per_day > 0 and remaining > 0 else None
     supply_per_day = SIGNIN_DAILY * max(1, pool["pool_size"])
 
     advice: list[dict] = []
-    if ledger_empty:
+    if ledger_only:
         advice.append({
             "level": "info",
-            "title": "积分台账里没有在用批次",
-            "text": "上游台账只记录「有偿积分包」的授予与消耗；签到送的额度不记在这里，"
-                    "所以余额显示 0 不代表号不能用。容量判断改看下面的请求量、成功率和签到供给。",
+            "title": "上游还没给出积分余额",
+            "text": "探针尚未采到会员余额，有偿积分台账也没有在用批次（免费号本来就没有）。"
+                    "点「刷新探针」拉一次余额；在此之前请按请求量和成功率判断供给。",
+        })
+    elif balance_known and (balance or 0) < 0:
+        advice.append({
+            "level": "warn",
+            "title": f"积分余额合计 {round(remaining)}（已为负）",
+            "text": f"{totals.get('balance_negative', 0)} 个号把额度用成了负数，"
+                    f"{totals.get('balance_zero', 0)} 个号是 0。Free 计划的额度按日发、不累计成积分，"
+                    "负数不会拦请求，但它是「这批号确实在欠着用」的信号："
+                    "真跑空的时候上游回 402 insufficient balance，网关会冷却换号。",
+        })
+    elif balance_known:
+        advice.append({
+            "level": "info",
+            "title": f"积分余额合计 {round(remaining)}",
+            "text": f"{totals.get('balance_accounts', 0)} 个号采到余额，计划分布 "
+                    + "、".join(f"{k} {v}" for k, v in (totals.get("plans") or {}).items())
+                    + "。免费计划的日额度不折算成积分，所以 0 是常态。",
         })
     if drain_per_day <= 0:
         advice.append({
             "level": "info",
-            "title": "还测不出积分消耗速率",
-            "text": "积分台账需要至少两次间隔 30 分钟以上的采样才能算出日均消耗。"
+            "title": "还测不出余额消耗速率",
+            "text": "要算日均消耗，至少需要两次间隔 30 分钟以上、余额真的变化过的采样。"
                     "后台每 " + str(int(settings.probe_interval // 60) or 1) + " 分钟采一次，"
                     "或者点「刷新探针」立刻再采一次。",
         })
@@ -369,7 +400,7 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
         })
 
     return {
-        "ledger_empty": ledger_empty,
+        "balance_known": balance_known,
         "generated_at": time.time(),
         "window_hours": hours,
         "horizon_days": days,
@@ -383,8 +414,11 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
         },
         "balance": {
             "credits_remaining": round(remaining, 1),
+            "balance_known": balance_known,
+            "balance_negative": totals.get("balance_negative", 0),
+            "balance_zero": totals.get("balance_zero", 0),
             "credit_batches": totals.get("credit_batches", 0),
-            "ledger_empty": ledger_empty,
+            "plans": totals.get("plans") or {},
             "days_left": days_left,
             "accounts": pool["pool_size"],
             "usable": pool["usable"],
@@ -399,8 +433,11 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
         "forecast": forecast,
         "advice": advice,
         "method": [
-            "消耗速率只认积分台账的实测差值（总剩余下降速度），不按 token 折算 —— 不同模型单价不同，折算会给出假精度。",
+            "余额取上游会员接口的 total_remains_credit（可正可负）；有偿积分台账只记买过/发过的包，"
+            "免费号恒为空，两者不叠加。",
+            "消耗速率取「余额合计」的实测差值，不按 token 折算 —— 不同模型单价不同，折算会给出假精度。",
             f"补给按每号每天签到 {SIGNIN_DAILY} 积分计（第 4、7 天为 1000，这里取保守值）。",
+            "Free 计划的日额度上游不暴露剩余量，所以余额为 0 的号照样能跑，真跑空时表现为 402 insufficient balance。",
             "所有数字来自本进程内存 + 探针缓存；容器重启后从零开始采样。",
         ],
     }

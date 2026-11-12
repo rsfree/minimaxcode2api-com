@@ -557,7 +557,8 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | 首字很慢（10s+） | M3.1-Flash 强制思考，先出 `thinking` | 正常；或换 `MiniMax-M2.5-highspeed` |
 | `429` / 限流 | 账号额度或并发限制 | 降并发、错峰，或换账号 |
 | `502 upstream error` + 具体 message | 上游返回的业务错误，原文透传 | 按 message 处理 |
-| 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（文案：`plan balance has run out`） | 桌面端充值，重试无效 |
+| 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（文案：`plan balance has run out`） | 桌面端充值，重试无效；对话路径会把这个号冷却到次日 00:10 |
+| 对话 `503 no usable account: every account is out of quota until the daily reset at 00:10` | 全池都撞了 1008，免费额度按天重置 | 等次日重置（网关会自动签到并解除冷却），或加号 / 充值 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单（H3 4s = 320 credits） | 充值，或改用 `MiniMax-Hailuo-2.3` 6s |
 | 视频提交 `503 temporarily unavailable` | **该账号没有视频权限**（按账号给，不是按 key） | 池里只要有一个号能提交就没事，网关自动换号；日志会打印 `cannot use this tool (503)` |
 | 视频查询 `404 does not belong to the current caller` | 提交/查询不是同一个账号，或网关重启丢了 `task_id→账号` 映射 | 同一实例内轮询；重启后旧任务查不了 |

@@ -510,6 +510,152 @@ def test_admin_requires_key() -> None:
         settings.api_keys = original
 
 
+def test_balance_surfacing() -> None:
+    """积分余额 must come from the membership endpoint, not the paid ledger.
+
+    Free-plan accounts have an empty ledger but a real balance — often exactly 0,
+    sometimes negative after overspending a granted pack. The old console treated
+    "no ledger batches" as "no data" and printed a dash, which is what made the
+    card look broken.
+    """
+    import time
+
+    from app.probe import AccountProbe, ProbeCache, summarize_membership
+
+    info = summarize_membership({
+        "plan_name": "Free",
+        "total_remains_credit": -72,
+        "opcredit_balance": 0,
+        "op_credit_summary": {
+            "total_remaining_amount": "0",
+            "purchased_remaining_amount": "0",
+            "free_remaining_amount": "0",
+        },
+        "daily_login_gift_credit_remaining": 0,
+        "has_token_plan": False,
+        "expires_at": 0,
+    })
+    assert info["credit"] == -72 and info["plan"] == "Free"
+    assert info["free"] == 0 and info["purchased"] == 0
+
+    # A sparse payload must not explode, and absent decimals stay None (not 0):
+    # "unknown" and "zero" are different answers.
+    sparse = summarize_membership({"total_remains_credit": 0})
+    assert sparse["credit"] == 0 and sparse["free"] is None and sparse["plan"] == ""
+
+    cache = ProbeCache()
+    for label, credit in (("a@x", 0), ("b@x", -72), ("c@x", 400)):
+        item = AccountProbe(label=label)
+        item.membership = {"credit": credit, "plan": "Free"}
+        item.updated_at = time.time()
+        cache._items[label] = item
+
+    totals = cache.snapshot()["totals"]
+    assert totals["balance"] == 328
+    assert totals["balance_negative"] == 1 and totals["balance_zero"] == 1
+    assert totals["balance_positive"] == 1
+    assert totals["plans"] == {"Free": 3}
+    # No paid batches at all — the figure the console used to render as "—".
+    assert totals["credit_batches"] == 0
+    # Capacity planning watches the same number, so a real spend becomes a rate.
+    assert cache._tracked_remaining() == 328
+
+
+def test_membership_payload_is_not_unwrapped() -> None:
+    """`get_membership_info` puts its fields next to base_resp, not under `data`.
+
+    Unwrapping it like the sign-in panel returns `{}`, which silently turns every
+    balance into None — the exact failure that made the card show a dash.
+    """
+    import subprocess as sp
+
+    from app import signin
+
+    class Done:
+        def __init__(self, payload: str) -> None:
+            self.returncode = 0
+            self.stdout = payload.encode()
+            self.stderr = b""
+
+    original = signin.subprocess.run
+    try:
+        signin.subprocess.run = lambda *a, **k: Done(
+            '{"plan_name":"Free","total_remains_credit":-72,'
+            '"base_resp":{"status_code":0,"status_msg":"ok"}}'
+        )
+        body = signin._request(
+            "POST", "https://agent.minimax.io/matrix/api/v1/commerce/get_membership_info",
+            "tok", body={}, unwrap=False,
+        )
+        assert body["total_remains_credit"] == -72, body
+        assert body["plan_name"] == "Free"
+
+        # Default behaviour is unchanged for the endpoints that do wrap in data.
+        signin.subprocess.run = lambda *a, **k: Done(
+            '{"data":{"days":[{"day_no":1}]},"base_resp":{"status_code":0,"status_msg":"ok"}}'
+        )
+        assert signin._request("GET", "https://agent.minimax.io/signin/status", "tok") == {
+            "days": [{"day_no": 1}]
+        }
+    finally:
+        signin.subprocess.run = original
+
+
+def test_quota_park_lasts_until_reset() -> None:
+    """1008 is a *daily* allowance: parking for 15 minutes just buys another fail.
+
+    The park lasts until the next local midnight (plus a settle buffer) and a
+    successful sign-in is what lifts it — that is the whole "签到再恢复" loop.
+    """
+    import time
+
+    from app.auth import (
+        REASON_AUTH,
+        REASON_QUOTA,
+        CredentialError,
+        Token,
+        TokenPool,
+        next_reset_label,
+        seconds_until_next_day,
+    )
+    from app.config import settings
+
+    seconds = seconds_until_next_day(settings.signin_timezone)
+    assert 60 <= seconds <= 24 * 3600 + 11 * 60, seconds
+    assert len(next_reset_label(settings.signin_timezone)) == 5
+
+    pool = TokenPool()
+    token = Token(access_token="tok-a", label="a@x", pooled=True)
+    pool._tokens = [token]
+    pool._loaded = True
+
+    pool.park(token, 402, "insufficient balance (1008)", next_day=True)
+    assert token.cooldown_reason == REASON_QUOTA
+    assert token.cooldown_until - time.time() > 3600, "a daily quota must not cool down for 15 minutes"
+    assert token.is_cooling() is True
+
+    # 签到 = 回血：解除额度冷却，但绝不顺手放过凭证类冷却。
+    assert pool.clear_quota_cooldown("a@x") is True
+    assert token.is_cooling() is False
+    pool.park(token, 401, "invalid token")
+    assert token.cooldown_reason == REASON_AUTH
+    assert pool.clear_quota_cooldown("a@x") is False
+    assert token.is_cooling() is True
+
+    # 全池都因额度停摆时，错误要告诉运维什么时候恢复，而不是「都不可用」。
+    other = TokenPool()
+    lone = Token(access_token="tok-b", label="b@x", pooled=True)
+    other._tokens = [lone]
+    other._loaded = True
+    other.park(lone, 402, "1008", next_day=True)
+    try:
+        asyncio.run(other.acquire())
+    except CredentialError as exc:
+        assert "daily reset" in str(exc), exc
+    else:
+        raise AssertionError("expected CredentialError when every account is out of quota")
+
+
 def test_capacity_math() -> None:
     """补号测算 has to be arithmetically sane, not just pretty."""
     from fastapi.testclient import TestClient
@@ -547,6 +693,9 @@ def main() -> None:
         test_quota_errors_rotate,
         test_metrics_rollup,
         test_account_import_flow,
+        test_balance_surfacing,
+        test_membership_payload_is_not_unwrapped,
+        test_quota_park_lasts_until_reset,
         test_admin_requires_key,
         test_capacity_math,
     ]

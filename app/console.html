@@ -456,7 +456,8 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sInflight">-</div><div class="k">在途</div></div>
         <div class="stat warn"><div class="v" id="sClaimable">-</div><div class="k">今日可签积分</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k" title="上游只记有偿积分包的授予与消耗，签到额度不在此台账">台账余额</div></div>
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k"
+          title="上游会员接口 total_remains_credit 的池内汇总。可正可负：负数=用超了授予的积分包；Free 计划的日额度按天发、不折算成积分，所以 0 是常态，不代表不能用。真跑空时上游回 402 insufficient balance，网关会冷却换号。">积分余额 <span class="dim" id="sCreditsNote"></span></div></div>
       </div>
 
       <div class="alertbar" id="alertBar" hidden></div>
@@ -584,7 +585,7 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
     <!-- 容量规划 -->
     <section class="view" id="view-capacity" hidden>
       <div class="box">
-        <header><h3>容量预测 <span class="hint">消耗速率只认积分台账实测差值，不按 token 折算</span></h3>
+        <header><h3>容量预测 <span class="hint">余额取会员接口，消耗速率取两次采样差值，不按 token 折算</span></h3>
           <div class="grow"></div>
           <label class="sel-note">用量窗口
             <select id="capHours"><option value="6">6 小时</option><option value="24" selected>24 小时</option><option value="72">3 天</option><option value="168">7 天</option></select>
@@ -988,8 +989,15 @@ async function loadOverview() {
   $("sDisabled").textContent = p.disabled;
   $("sInflight").textContent = p.in_flight;
   $("sClaimable").textContent = t.claimable_today || 0;
-  // 台账里一条批次都没有时显示「—」：那是「没有可统计的对象」，不是「余额 0」。
-  $("sCredits").textContent = t.credit_batches ? num(t.credits_remaining || 0) : "—";
+  // 真实余额来自会员接口（可正可负）；None 才是「还没采到」。0 是 Free 计划的常态，
+  // 不能像旧版那样当成「没有数据」——这正是之前一直显示破折号的原因。
+  const bal = t.balance;
+  const balKnown = bal != null;
+  $("sCredits").textContent = balKnown ? num(bal) : "—";
+  $("sCredits").parentElement.className = "stat " + (balKnown ? (bal < 0 ? "bad" : bal > 0 ? "good" : "") : "");
+  $("sCreditsNote").textContent = balKnown
+    ? (t.balance_negative ? t.balance_negative + " 个号为负" : (t.balance_zero ? "全部为 0（Free）" : "汇总"))
+    : "待采样";
   $("accHint").textContent = p.pool_watch_seconds
     ? "新账号 " + p.pool_watch_seconds + " 秒内自动进池"
     : "GET /admin/overview";
@@ -1049,12 +1057,26 @@ function renderAccounts() {
   $("accBody").innerHTML = slice.map((a) => {
     const cooling = (a.cooling_for || 0) > 0;
     const cls = a.disabled ? "off" : (cooling ? "cool" : (!a.usable ? "off" : ""));
+    // 额度冷却动辄到次日，用「至 00:10」比「冷却 8h16m」更直观；其余仍是相对时长。
+    const coolLong = cooling && a.cooling_for > 3600 && !!a.cooldown_until;
+    const coolText = coolLong
+      ? "至 " + new Date(a.cooldown_until * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+      : dur(a.cooling_for);
+    const coolWhy = a.cooldown_reason === "quota" ? "额度用尽，等次日重置（签到后会解除）"
+      : a.cooldown_reason === "auth" ? "凭证失效，等网关自动续期"
+      : a.cooldown_reason === "rate" ? "被上游限流" : "";
     const tag = a.disabled ? '<span class="tag mute">已禁用</span>'
       : a.usable ? '<span class="tag ok">可用</span>'
-      : cooling ? '<span class="tag warn">冷却 ' + dur(a.cooling_for) + "</span>"
+      : cooling ? '<span class="tag warn"' + (coolWhy ? ' title="' + esc(coolWhy) + '"' : "") + ">冷却 " + coolText + "</span>"
       : '<span class="tag bad">不可用</span>';
-    // 「没有批次」和「余额 0」是两件事，前者显示 —，否则整列都是 0 会误导。
-    const cr = a.credits && a.credits.batches ? num(a.credits.remaining) : "—";
+    // 余额来自会员接口，0 与负数都是真实值；只有「没采到」才是破折号。
+    const bal = a.balance || null;
+    const credit = bal && bal.credit != null ? bal.credit : null;
+    const cr = credit == null
+      ? "—"
+      : credit < 0
+        ? '<span style="color:var(--bad)" title="余额为负：用超了授予的积分包">' + num(credit) + "</span>"
+        : num(credit);
     const tokens = (a.tokens_in || 0) + (a.tokens_out || 0);
     const sign = a.signin
       ? (a.signin.claimable
@@ -1436,16 +1458,18 @@ async function loadCapacity() {
     return;
   }
   const b = d.balance, r = d.run_rate;
+  const hasBalance = !!b.balance_known;
   $("capDays").textContent = b.days_left != null ? b.days_left : "—";
   document.querySelector(".hero .unit").hidden = b.days_left == null;
-  // 没有可预测的对象时整块藏掉：一个孤零零的大号破折号只会让人以为坏了。
-  document.querySelector(".hero").hidden = d.ledger_empty && b.days_left == null;
-  $("capHeroNote").textContent = d.ledger_empty
-    ? "上游积分台账里没有在用批次（签到额度不计入），余额不可用于预测"
-    : b.days_left != null
-      ? "按实测消耗速率估算 · 余额 " + num(b.credits_remaining) + " 积分"
-      : "台账还测不出消耗速率（需要两次间隔 ≥30 分钟的采样）";
-  $("capRemain").textContent = b.ledger_empty ? "—" : num(b.credits_remaining);
+  // 天数算不出来时把大数字藏掉，但余额本身要如实显示：0 和负数都是真实值，
+  // 换成破折号反而让人以为坏了。
+  document.querySelector(".hero").hidden = !hasBalance && b.days_left == null;
+  $("capHeroNote").textContent = b.days_left != null
+    ? "按实测消耗速率估算 · 余额 " + num(b.credits_remaining) + " 积分"
+    : hasBalance
+      ? "余额 " + num(b.credits_remaining) + " 积分 · 还没有消耗速率（需要两次间隔 ≥30 分钟、余额真的变化过的采样）"
+      : "探针还没采到余额，点「刷新探针」拉一次";
+  $("capRemain").textContent = hasBalance ? num(b.credits_remaining) : "—";
   $("capDrain").textContent = r.credits_per_day ? num(r.credits_per_day) : "—";
   $("capSupply").textContent = num(r.supply_per_day);
   $("capReq").textContent = num(r.requests_per_day);

@@ -226,7 +226,9 @@ class Upstream:
             try:
                 token = await token_manager.acquire(exclude=tried)
             except CredentialError as exc:
-                raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
+                # 503, not 502: nothing is wrong with the upstream, the pool itself
+                # has nothing to spend. The message says when the reset lands.
+                raise UpstreamError(503, f"no usable account: {exc}") from exc
             tried.add(token.access_token or token.label)
             current = token.label or token.short
 
@@ -261,10 +263,13 @@ class Upstream:
                 )
                 if retriable and len(tried) < attempts:
                     if _quota_exhausted(err.message):
-                        token_manager.park(token, 402, err.message)
+                        # The daily allowance resets at local midnight, not in
+                        # fifteen minutes — park until then and let the sign-in
+                        # sweep lift the park once it has topped the account up.
+                        token_manager.park(token, 402, err.message, next_day=True)
                         token_manager.note_failure(token, err.message)
                         log.warning(
-                            "account %s is out of credits (%s); trying next",
+                            "account %s is out of credits (%s); parked until the daily reset",
                             token.label or token.short, err.message,
                         )
                     else:
@@ -294,7 +299,10 @@ class Upstream:
                     await retry.aclose()
                     last = _error_from(retry.status_code, body)
 
-                token_manager.park(token, response.status_code, last.message)
+                token_manager.park(
+                    token, response.status_code, last.message,
+                    next_day=response.status_code == 402,
+                )
                 token_manager.note_failure(token, last.message)
                 log.warning(
                     "account %s failed (%s); trying next", token.label or token.short, response.status_code

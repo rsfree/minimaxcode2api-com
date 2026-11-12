@@ -1,15 +1,24 @@
-"""Per-account upstream probes: the sign-in panel and credit batches.
+"""Per-account upstream probes: the sign-in panel, the credit ledger and the balance.
 
-Both are cheap read-only GETs, but there is one round trip per account and the
-account host is not always fast. The console therefore never fans them out on
+All three are cheap read-only calls, but there is one round trip per account and
+the account host is not always fast. The console therefore never fans them out on
 page load: a background loop keeps a cache warm, `/admin/probes` serves that
 cache, and `?refresh=1` forces a synchronous re-read when the operator asks for
 one explicitly.
 
-Credits deserve a caveat that the UI repeats: the upstream ledger only lists
-batches it has something to say about (granted / consumed / expired). An account
-that has never been granted anything returns `total_count: 0` with no `details`
-key at all, which is *not* an error — it is an empty ledger.
+Two different "credit" numbers exist upstream and conflating them is what made
+the console show a dash:
+
+* ``/minimax-cloud/api/v1/credit/details`` — the **paid** ledger. It lists packs
+  that were granted or consumed, so an account that never bought one answers
+  ``total_count: 0`` with no ``details`` key. Empty is not an error; it is the
+  normal state of a free account.
+* ``/matrix/api/v1/commerce/get_membership_info`` — the **balance**: plan name,
+  ``total_remains_credit``, the free/paid split and the check-in gift. Free-plan
+  accounts sit at ``0`` and some go *negative* (spend beyond a granted pack);
+  neither stops them from serving, because requests are metered against a daily
+  free allowance that upstream does not expose. A 402 ``insufficient balance
+  (1008)`` is that allowance running out, not this number.
 """
 
 from __future__ import annotations
@@ -17,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 
 from . import signin
@@ -26,8 +35,36 @@ from .config import settings
 log = logging.getLogger("minimax.probe")
 
 CREDIT_PATH = "/minimax-cloud/api/v1/credit/details"
+MEMBERSHIP_PATH = "/matrix/api/v1/commerce/get_membership_info"
 PAGE_SIZE = 100
 MAX_PAGES = 5
+
+
+def _number(value) -> float | None:
+    """Upstream mixes ints and decimal strings in the same payload."""
+    if value is None or value == "":
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def summarize_membership(payload: dict) -> dict:
+    """Fold ``get_membership_info`` into the few numbers the console shows."""
+    summary = payload.get("op_credit_summary") or {}
+    credit = _number(payload.get("total_remains_credit"))
+    return {
+        "credit": credit,
+        "op_credit": _number(payload.get("opcredit_balance")),
+        "free": _number(summary.get("free_remaining_amount")),
+        "purchased": _number(summary.get("purchased_remaining_amount")),
+        "gift": _number(payload.get("daily_login_gift_credit_remaining")),
+        "plan": (payload.get("plan_name") or "").strip(),
+        "subscription": (payload.get("subscription_type") or "").strip(),
+        "token_plan": bool(payload.get("has_token_plan")),
+        "expires_at_ms": payload.get("expires_at") or None,
+    }
 
 
 @dataclass
@@ -36,6 +73,7 @@ class AccountProbe:
     signin: dict | None = None
     credits: list[dict] = field(default_factory=list)
     credit_total: int = 0
+    membership: dict = field(default_factory=dict)
     error: str = ""
     updated_at: float = 0.0
 
@@ -50,6 +88,7 @@ class AccountProbe:
         return {
             "label": self.label,
             "signin": self.signin,
+            "balance": self.membership or None,
             "credits": {
                 "batches": len(batches),
                 "remaining": round(remaining, 2),
@@ -88,8 +127,17 @@ def _batches(token: str, region: str) -> tuple[list[dict], int]:
     return rows, total
 
 
+def _membership(token: str, region: str) -> dict:
+    host = signin._host(region)
+    payload = signin._request(
+        "POST", f"{host}{MEMBERSHIP_PATH}", token, body={},
+        proxy=settings.upstream_proxy or None, unwrap=False,
+    )
+    return summarize_membership(payload)
+
+
 def probe_one(token: str, label: str, region: str, timezone: str) -> AccountProbe:
-    """Blocking: one account, both endpoints. Runs in a worker thread."""
+    """Blocking: one account, all endpoints. Runs in a worker thread."""
     item = AccountProbe(label=label, updated_at=time.time())
     try:
         panel = signin.status(token, region=region, timezone=timezone,
@@ -103,6 +151,10 @@ def probe_one(token: str, label: str, region: str, timezone: str) -> AccountProb
         item.credit_total = total
     except Exception as exc:  # noqa: BLE001
         item.error = (item.error + " | " if item.error else "") + f"credits: {exc}"[:200]
+    try:
+        item.membership = _membership(token, region)
+    except Exception as exc:  # noqa: BLE001
+        item.error = (item.error + " | " if item.error else "") + f"balance: {exc}"[:200]
     item.updated_at = time.time()
     return item
 
@@ -136,14 +188,30 @@ class ProbeCache:
 
             await asyncio.gather(*(one(label, token) for label, token in pairs))
             self._updated_at = time.time()
-            total = sum(
-                float(b.get("remaining_amount") or 0)
-                for item in self._items.values()
-                for b in item.credits
-            )
-            self._history.append((self._updated_at, total))
+            self._history.append((self._updated_at, self._tracked_remaining()))
             log.info("probes refreshed for %d account(s)", len(pairs))
             return self.snapshot()
+
+    def _tracked_remaining(self) -> float:
+        """The number capacity planning watches.
+
+        The membership balance when upstream answers it (it is the only figure
+        that reflects spends), else the paid ledger. Everything is added across
+        the pool; a negative total is legitimate and means the pool has spend
+        beyond whatever was granted.
+        """
+        balances = [
+            float(item.membership["credit"])
+            for item in self._items.values()
+            if item.membership.get("credit") is not None
+        ]
+        if balances:
+            return round(sum(balances), 2)
+        return round(sum(
+            float(b.get("remaining_amount") or 0)
+            for item in self._items.values()
+            for b in item.credits
+        ), 2)
 
     def snapshot(self) -> dict:
         items = list(self._items.values())
@@ -160,6 +228,13 @@ class ProbeCache:
             owed += int(panel.get("cycle_pending_points") or 0)
             batches += len(item.credits)
             remaining += sum(float(b.get("remaining_amount") or 0) for b in item.credits)
+
+        balances = [
+            item.membership for item in items
+            if item.membership and item.membership.get("credit") is not None
+        ]
+        credit_sum = round(sum(float(b["credit"]) for b in balances), 2) if balances else None
+        plans = Counter((b.get("plan") or "未知") for b in balances)
         return {
             "updated_at": self._updated_at,
             "age_seconds": round(time.time() - self._updated_at) if self._updated_at else None,
@@ -168,6 +243,14 @@ class ProbeCache:
                 "claimable_today": claimable,
                 "claimable_accounts": claimable_accounts,
                 "cycle_pending": owed,
+                # 真实积分余额。None = 还没采到；0 和负数都是有效值。
+                "balance": credit_sum,
+                "balance_accounts": len(balances),
+                "balance_negative": sum(1 for b in balances if float(b["credit"]) < 0),
+                "balance_zero": sum(1 for b in balances if float(b["credit"]) == 0),
+                "balance_positive": sum(1 for b in balances if float(b["credit"]) > 0),
+                "plans": dict(plans),
+                # 有偿积分台账：只记买过/发过的包，免费号恒为空。
                 "credits_remaining": round(remaining, 2),
                 "credit_batches": batches,
             },

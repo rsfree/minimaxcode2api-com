@@ -125,10 +125,19 @@ async def _signin_loop() -> None:
         else:
             gained = sum(int(row.get("points") or 0) for row in rows if row.get("claimed"))
             claimed = sum(1 for row in rows if row.get("claimed"))
+            # A quota park lasts until the daily reset; a claim is the proof that
+            # the new day's allowance (and the sign-in points) are in, so lift it
+            # here rather than letting the account sit out another cycle.
+            lifted = sum(
+                1 for row in rows
+                if not row.get("error") and token_manager.clear_quota_cooldown(row.get("label"))
+            )
             if claimed:
                 log.info("daily check-in: %s/%s accounts, +%s credits", claimed, len(rows), gained)
             else:
                 log.info("daily check-in: nothing to claim across %s accounts", len(rows))
+            if lifted:
+                log.info("released %s account(s) parked on quota", lifted)
         await asyncio.sleep(max(600.0, settings.signin_interval_hours * 3600))
 
 

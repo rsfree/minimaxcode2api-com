@@ -65,7 +65,13 @@ def _request(
     body: dict | None = None,
     proxy: str | None = None,
     timeout: float = 45.0,
+    unwrap: bool = True,
 ) -> dict:
+    """Call a product endpoint.
+
+    Most of them wrap the payload in ``data``; the commerce endpoints put their
+    fields at the top level next to ``base_resp``, hence ``unwrap=False``.
+    """
     host = url.split("/minimax-cloud/")[0]
     args = [
         "curl", "-sS", "-X", method, "-m", str(int(timeout)),
@@ -98,7 +104,7 @@ def _request(
     code = base.get("status_code")
     if isinstance(code, int) and code != 0:
         raise SigninError(base.get("status_msg") or f"status {code}", code=code)
-    return payload.get("data") or {}
+    return payload if not unwrap else (payload.get("data") or {})
 
 
 def status(token: str, region: str = "en", timezone: str = DEFAULT_TIMEZONE,

@@ -22,6 +22,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 
 import httpx
@@ -37,8 +38,49 @@ AUDIENCE = "agent-backend"
 
 # How long an account is parked after a hard failure.
 COOLDOWN_UNAUTHORIZED = 600.0     # 401 — token or session is dead
-COOLDOWN_EXHAUSTED = 900.0        # 402 / quota codes — balance or limit hit
+COOLDOWN_EXHAUSTED = 900.0        # 402 when the charge is one-off (media, long jobs)
 COOLDOWN_RATE_LIMITED = 60.0      # 429
+
+# Reason tags live on the token so a successful sign-in can lift exactly the
+# quota parks (and never an auth one).
+REASON_AUTH = "auth"
+REASON_QUOTA = "quota"
+REASON_RATE = "rate"
+
+
+def seconds_until_next_day(tz_name: str, buffer_minutes: int = 10) -> float:
+    """Seconds until the next midnight in ``tz_name``, plus a settle buffer.
+
+    A per-account daily allowance resets on the account's local midnight, not
+    fifteen minutes after the request that discovered it was empty. Parking a
+    spent account for 900 s therefore guaranteed another wasted round trip;
+    parking it until the reset costs one probe per day and lets the console say
+    "back at 00:10" instead of "cooling for 14m, again".
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001 - missing tz database must not break rotation
+        log.warning("timezone %s unavailable; assuming UTC+8 for the daily reset", tz_name)
+        tz = dt_timezone(timedelta(hours=8))
+    now = datetime.now(tz)
+    reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    reset += timedelta(minutes=buffer_minutes)
+    return max(60.0, (reset - now).total_seconds())
+
+
+def next_reset_label(tz_name: str, buffer_minutes: int = 10) -> str:
+    """``HH:MM`` of the next daily reset, for error messages an operator reads."""
+    seconds = seconds_until_next_day(tz_name, buffer_minutes)
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        tz = dt_timezone(timedelta(hours=8))
+    moment = datetime.fromtimestamp(time.time() + seconds, tz)
+    return moment.strftime("%H:%M")
 
 
 class CredentialError(RuntimeError):
@@ -56,6 +98,7 @@ class Token:
     index: int = 0
     pooled: bool = False            # True only for records read from TOKEN_POOL
     cooldown_until: float = 0.0
+    cooldown_reason: str = ""       # auth / quota / rate — see REASON_*
     last_error: str = ""
     uses: int = 0
     # Console-facing counters. They live on the token so the pool page can show
@@ -374,6 +417,7 @@ class TokenPool:
             except CredentialError as exc:
                 log.warning("%s", exc)
                 token.cooldown_until = time.time() + COOLDOWN_UNAUTHORIZED
+                token.cooldown_reason = REASON_AUTH
                 token.last_error = str(exc)[:200]
                 return None
         if not token.access_token:
@@ -402,6 +446,13 @@ class TokenPool:
                 if usable is not None:
                     token.uses += 1
                     return token
+            cooling = [t for t in self._tokens if not t.disabled and t.is_cooling()]
+            if cooling and all(t.cooldown_reason == REASON_QUOTA for t in cooling):
+                raise CredentialError(
+                    "every account is out of quota until the daily reset at "
+                    f"{next_reset_label(settings.signin_timezone)} "
+                    f"({settings.signin_timezone})"
+                )
             raise CredentialError("every account in the pool is cooling down or unusable")
 
     async def get(self, force: bool = False) -> str:
@@ -430,17 +481,52 @@ class TokenPool:
                 token.last_error = str(exc)[:200]
                 return False
 
-    def park(self, token: Token, status: int | None = None, reason: str = "") -> None:
-        """Temporarily remove an account from rotation."""
-        if status == 401:
+    def park(
+        self,
+        token: Token,
+        status: int | None = None,
+        reason: str = "",
+        next_day: bool = False,
+    ) -> None:
+        """Temporarily remove an account from rotation.
+
+        ``next_day`` is for the chat path: an account answering 402 there has run
+        out of its *daily* allowance, which does not come back in 15 minutes.
+        One-off charges (media, where a single video costs 320 credits) keep the
+        short cooldown — being too poor for one expensive job says nothing about
+        the text quota.
+        """
+        if next_day and status == 402:
+            delay = seconds_until_next_day(settings.signin_timezone)
+            token.cooldown_reason = REASON_QUOTA
+        elif status == 401:
             delay = COOLDOWN_UNAUTHORIZED
-        elif status in {402, 429}:
-            delay = COOLDOWN_EXHAUSTED if status == 402 else COOLDOWN_RATE_LIMITED
+            token.cooldown_reason = REASON_AUTH
+        elif status == 402:
+            delay = COOLDOWN_EXHAUSTED
+            token.cooldown_reason = REASON_QUOTA
         else:
             delay = COOLDOWN_RATE_LIMITED
+            token.cooldown_reason = REASON_RATE
         token.cooldown_until = time.time() + delay
         token.last_error = reason[:200] or f"HTTP {status}"
-        log.warning("parked %s for %.0fs: %s", token.label or token.short, delay, token.last_error)
+        log.warning("parked %s for %.0fs (%s): %s",
+                    token.label or token.short, delay, token.cooldown_reason, token.last_error)
+
+    def clear_quota_cooldown(self, key: str | None) -> bool:
+        """Put an account back in rotation after a top-up (sign-in).
+
+        Only quota parks are lifted: a dead token or a rate limit has nothing to
+        do with a claim, and clearing it would just produce another 401.
+        """
+        token = self.find(key)
+        if token is None or token.cooldown_reason != REASON_QUOTA:
+            return False
+        token.cooldown_until = 0.0
+        token.cooldown_reason = ""
+        token.last_error = ""
+        log.info("unparked %s after top-up", token.label or token.short)
+        return True
 
     # -- console-facing bookkeeping ----------------------------------------
     def note_success(self, token: Token, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
@@ -463,6 +549,7 @@ class TokenPool:
         token.disabled = disabled
         if not disabled:
             token.cooldown_until = 0.0
+            token.cooldown_reason = ""
             token.last_error = ""
         log.info("%s account %s", "disabled" if disabled else "enabled", token.label or token.short)
         return token
@@ -499,6 +586,10 @@ class TokenPool:
             "usable": usable,
             "disabled": sum(1 for t in self._tokens if t.disabled),
             "cooling": sum(1 for t in self._tokens if (not t.disabled) and t.is_cooling()),
+            "cooling_quota": sum(
+                1 for t in self._tokens
+                if (not t.disabled) and t.is_cooling() and t.cooldown_reason == REASON_QUOTA
+            ),
             "in_flight": sum(t.in_flight for t in self._tokens),
             "pool_watch_seconds": settings.pool_watch if settings.token_pool else 0,
             "accounts": [
@@ -508,6 +599,8 @@ class TokenPool:
                     "disabled": t.disabled,
                     "expires_at_ms": t.expires_at_ms,
                     "cooling_for": round(max(0.0, t.cooldown_until - now)),
+                    "cooldown_until": t.cooldown_until or None,
+                    "cooldown_reason": t.cooldown_reason or None,
                     "uses": t.uses,
                     "ok": t.ok_count,
                     "fail": t.fail_count,
