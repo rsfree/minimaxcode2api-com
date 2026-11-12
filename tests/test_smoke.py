@@ -237,6 +237,11 @@ def test_console_asset() -> None:
                      "/admin/accounts/import"):
         assert endpoint in html, f"console does not call {endpoint}"
 
+    # The pool list carries no balance — it lives in the probe payload. The row
+    # mapping has to lift it, or the whole 积分 column quietly prints dashes
+    # (which is exactly how the empty-balance bug looked).
+    assert "balance: pr.balance" in html
+
 
 def test_pool_hot_reload() -> None:
     """Accounts dropped into TOKEN_POOL join the rotation without a restart."""

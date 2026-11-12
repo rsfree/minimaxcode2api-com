@@ -1016,7 +1016,8 @@ function accountRows() {
     const pr = probe[a.label] || {};
     const credits = pr.credits || null;
     const sign = pr.signin || null;
-    return Object.assign({}, a, { probe: pr, credits: credits, signin: sign });
+    // 余额在探针结果里，不在 pool 列表里；漏了这一步整列都画成破折号。
+    return Object.assign({}, a, { probe: pr, credits: credits, balance: pr.balance || null, signin: sign });
   });
 }
 
@@ -1030,10 +1031,13 @@ function renderAccounts() {
     if (accState.filter === "disabled" && !a.disabled) return false;
     return true;
   });
+  // 排「积分」按真实余额；没采到的排最后，而不是当成 0（0 是有效值，会混淆）。
+  const balOf = (a) => (a.balance && a.balance.credit != null ? a.balance.credit : null);
+  const cmpBal = (x, y) => (x == null && y == null ? 0 : x == null ? 1 : y == null ? -1 : x - y);
   const sorters = {
     default: (a, b) => (a.usable === b.usable ? (b.fail || 0) - (a.fail || 0) : a.usable ? 1 : -1),
-    credits_desc: (a, b) => ((b.credits && b.credits.remaining) || 0) - ((a.credits && a.credits.remaining) || 0),
-    credits_asc: (a, b) => ((a.credits && a.credits.remaining) || 0) - ((b.credits && b.credits.remaining) || 0),
+    credits_desc: (a, b) => cmpBal(balOf(b), balOf(a)),
+    credits_asc: (a, b) => cmpBal(balOf(a), balOf(b)),
     ok_desc: (a, b) => (b.ok || 0) - (a.ok || 0),
     fail_desc: (a, b) => (b.fail || 0) - (a.fail || 0),
     tokens_desc: (a, b) => ((b.tokens_in || 0) + (b.tokens_out || 0)) - ((a.tokens_in || 0) + (a.tokens_out || 0)),
