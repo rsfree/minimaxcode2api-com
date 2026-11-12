@@ -285,10 +285,16 @@ class TokenPool:
     async def reload(self) -> dict:
         """Merge the pool directory into the running pool.
 
-        New files become usable immediately; deleted files leave rotation. An
-        account already in memory is kept as-is — its access/refresh tokens are
-        newer than what is on disk, because this process is the one that writes
-        rotated refresh tokens back out.
+        New files become usable immediately; deleted files leave rotation. For
+        an account already in memory the *live* object is kept — it owns the
+        counters, cool-downs and disabled flag — but its credentials are taken
+        from disk when the file is newer.
+
+        That last part matters because the refresh token is single-use: whoever
+        refreshes second must present the value the first writer stored, or the
+        exchange fails with ``invalid_grant``. Two writers exist (this process
+        and the check-in thread, which works straight from files), so the file
+        is the shared truth and the in-memory copy is only a cache of it.
         """
         async with self._lock:
             if not settings.token_pool:
@@ -329,6 +335,9 @@ class TokenPool:
                     candidate.pooled = True
                     live = candidate
                     log.info("pool: +1 account %s", live.label or live.short)
+                elif self._adopt(live, candidate):
+                    log.info("pool: %s adopted rotated credentials from disk",
+                             live.label or live.short)
                 merged.append(live)
             removed = max(0, before - (len(merged) - len(fixed)))
             for position, token in enumerate(merged):
@@ -350,6 +359,72 @@ class TokenPool:
         return True
 
     # -- refresh -----------------------------------------------------------
+    @staticmethod
+    def _adopt(token: Token, candidate: Token, force: bool = False) -> bool:
+        """Copy a newer credential from a freshly-read record onto a live token.
+
+        Returns True when something actually changed. Counters, cool-downs and
+        the disabled flag stay on the live object; only the credential moves.
+        An auth park is lifted here because the rejection applied to the old
+        token, not the new one — a quota park is not, since a fresh access token
+        says nothing about the daily allowance.
+
+        ``force`` is for the resync after a failed exchange: at that point the
+        file is known to be the newer of the two, whatever its expiry says.
+        Without it, only a record that outlives the in-memory one wins; equal or
+        earlier expiry means the file is behind (a refresh that has not been
+        written back yet) and adopting it would pair a new access token with a
+        spent refresh token.
+        """
+        if not candidate.access_token or candidate.access_token == token.access_token:
+            return False
+        if not force:
+            current = token.expires_at_ms
+            if candidate.expires_at_ms is None or (
+                current is not None and candidate.expires_at_ms <= current
+            ):
+                return False
+        token.access_token = candidate.access_token
+        if candidate.refresh_token:
+            token.refresh_token = candidate.refresh_token
+        token.expires_at_ms = candidate.expires_at_ms
+        if token.cooldown_reason == REASON_AUTH:
+            token.cooldown_until = 0.0
+            token.cooldown_reason = ""
+            token.last_error = ""
+        return True
+
+    def _resync(self, token: Token) -> bool:
+        """Re-read one account's file and adopt a rotated credential, if any."""
+        if token.origin is None:
+            return False
+        try:
+            data = json.loads(token.origin.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        records = data if isinstance(data, list) else [data]
+        if token.position >= len(records) or not isinstance(records[token.position], dict):
+            return False
+        candidate = _record_to_token(records[token.position], token.index)
+        return candidate is not None and self._adopt(token, candidate, force=True)
+
+    async def _refresh_once(self, token: Token) -> Token:
+        """Refresh, retrying once with the on-disk value when that one was rotated.
+
+        The check-in loop refreshes tokens in a worker thread and writes the new
+        pair straight to the file, so the in-memory refresh token can be spent
+        by the time a request needs it. Refreshing again with the stale value
+        earns ``invalid_grant`` and would park a perfectly healthy account.
+        """
+        try:
+            return await self._refresh(token)
+        except CredentialError:
+            if not self._resync(token) or not token.refresh_token:
+                raise
+            log.info("account %s: adopted rotated credentials from disk, retrying",
+                     token.label or token.short)
+            return await self._refresh(token)
+
     async def _refresh(self, token: Token) -> Token:
         if not token.refresh_token:
             raise CredentialError(f"account {token.label or token.short} has no refresh token")
@@ -413,7 +488,7 @@ class TokenPool:
             return None
         if token.is_expired() and token.refresh_token:
             try:
-                return await self._refresh(token)
+                return await self._refresh_once(token)
             except CredentialError as exc:
                 log.warning("%s", exc)
                 token.cooldown_until = time.time() + COOLDOWN_UNAUTHORIZED
@@ -460,7 +535,7 @@ class TokenPool:
         token = await self.acquire()
         if force and token.refresh_token:
             async with self._lock:
-                token = await self._refresh(token)
+                token = await self._refresh_once(token)
         return token.access_token
 
     async def invalidate(self) -> None:
@@ -474,7 +549,7 @@ class TokenPool:
             return False
         async with self._lock:
             try:
-                await self._refresh(token)
+                await self._refresh_once(token)
                 return True
             except CredentialError as exc:
                 log.warning("%s", exc)

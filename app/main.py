@@ -143,6 +143,14 @@ async def _signin_loop() -> None:
                 log.info("daily check-in: nothing to claim across %s accounts", len(rows))
             if lifted:
                 log.info("released %s account(s) parked on quota", lifted)
+            # The check-in thread refreshes straight from files and writes the
+            # rotated pair back there; a refresh token is single-use, so the
+            # in-memory copy is now stale and a later renew would get
+            # invalid_grant. Adopt what the thread just wrote.
+            try:
+                await token_manager.reload()
+            except Exception as exc:  # noqa: BLE001 - never take the gateway down
+                log.warning("pool resync after check-in failed: %s", exc)
         await asyncio.sleep(max(600.0, settings.signin_interval_hours * 3600))
 
 

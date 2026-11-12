@@ -342,6 +342,119 @@ def test_pool_reload_survives_write_race() -> None:
             auth_module._pool_files = original_files
 
 
+def test_pool_adopts_rotated_credentials_from_file() -> None:
+    """A refresh written to the file must reach the live token.
+
+    The refresh token is single-use upstream (verified: the old value answers
+    ``invalid_grant`` right after a rotation). Two writers refresh from files —
+    the daily check-in thread and this process — so the file is the shared
+    truth. Keeping the boot-time copy in memory would make the gateway present a
+    spent refresh token at the next renewal and park a healthy account on auth.
+    """
+    import tempfile
+    import time
+
+    from app.auth import TokenPool
+    from app.config import settings
+
+    def record(access: str, refresh: str, expires: int) -> str:
+        return json.dumps({
+            "email": "aaa@mail.example.com",
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAtMs": expires,
+        })
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "aaa.json").write_text(record("tok-old", "rt-old", 1_800_000_000_000), encoding="utf-8")
+        original = settings.token_pool
+        settings.token_pool = str(root)
+        try:
+            pool = TokenPool()
+            live = pool.find("tok-old")
+            assert live is not None
+            live.ok_count = 7
+            live.cooldown_until = time.time() + 600
+            live.cooldown_reason = "auth"
+
+            # The check-in thread refreshed the account and wrote the new pair.
+            (root / "aaa.json").write_text(
+                record("tok-new", "rt-new", 1_800_043_200_000), encoding="utf-8"
+            )
+            assert asyncio.run(pool.reload_if_changed()) is True
+
+            assert live.access_token == "tok-new", "the live token keeps the spent credential"
+            assert live.refresh_token == "rt-new"
+            assert live.ok_count == 7, "counters belong to the live object, not the file"
+            assert not live.is_cooling(), "a replaced credential lifts the auth park"
+
+            # A file that is *behind* the live object must not win: an unwritten
+            # refresh would pair a new access token with a spent refresh token.
+            live.access_token = "tok-newer"
+            live.expires_at_ms = 1_800_100_000_000
+            assert asyncio.run(pool.reload())["pool_size"] == 1
+            assert live.access_token == "tok-newer"
+        finally:
+            settings.token_pool = original
+
+
+def test_refresh_recovers_when_the_file_is_ahead() -> None:
+    """A failed exchange retries once with the credential the file holds.
+
+    This is the exact production sequence: the check-in thread rotates the pair
+    and writes it out, the gateway's renewal still presents the old refresh
+    token, upstream answers ``invalid_grant``. Parking the account there would
+    take a healthy account out of rotation for ten minutes at a time.
+    """
+    import tempfile
+
+    from app.auth import CredentialError, TokenPool
+    from app.config import settings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "aaa.json"
+        path.write_text(json.dumps({
+            "email": "aaa@mail.example.com",
+            "accessToken": "tok-old",
+            "refreshToken": "rt-old",
+            "expiresAtMs": 1_800_000_000_000,
+        }), encoding="utf-8")
+
+        original = settings.token_pool
+        settings.token_pool = str(root)
+        try:
+            pool = TokenPool()
+            live = pool.find("tok-old")
+            assert live is not None
+
+            # The thread rotates and writes the file, then the gateway renews.
+            path.write_text(json.dumps({
+                "email": "aaa@mail.example.com",
+                "accessToken": "tok-new",
+                "refreshToken": "rt-new",
+                "expiresAtMs": 1_800_043_200_000,
+            }), encoding="utf-8")
+
+            seen: list[str] = []
+
+            async def fake_refresh(token) -> None:
+                seen.append(token.refresh_token or "")
+                if len(seen) == 1:
+                    raise CredentialError(f"refresh failed for {token.label}: invalid_grant")
+                token.access_token = "tok-refreshed"
+                return token
+
+            pool._refresh = fake_refresh  # type: ignore[method-assign]
+
+            assert asyncio.run(pool.renew(live)) is True
+            assert seen == ["rt-old", "rt-new"], seen
+            assert live.access_token == "tok-refreshed"
+        finally:
+            settings.token_pool = original
+
+
 def test_quota_errors_rotate() -> None:
     """An empty account must not fail the request; it must be skipped.
 
@@ -900,6 +1013,8 @@ def main() -> None:
         test_console_asset,
         test_pool_hot_reload,
         test_pool_reload_survives_write_race,
+        test_pool_adopts_rotated_credentials_from_file,
+        test_refresh_recovers_when_the_file_is_ahead,
         test_quota_errors_rotate,
         test_metrics_rollup,
         test_account_import_flow,
