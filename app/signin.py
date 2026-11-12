@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from secrets import token_hex
 from typing import Any
 from urllib.parse import urlencode
 
@@ -145,7 +147,9 @@ def _load(path: Path) -> dict:
 
 
 def _save(path: Path, record: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Unique temp name: the gateway writes rotated tokens into the same
+    # directory, and two writers must not share one rename target.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{token_hex(4)}.tmp")
     tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
     try:
@@ -173,15 +177,25 @@ def claim_file(
     timezone: str = DEFAULT_TIMEZONE,
     proxy: str | None = None,
     dry_run: bool = False,
+    allow_refresh: bool = True,
 ) -> dict:
-    """Check one stored account and claim today's reward when it is available."""
+    """Check one stored account and claim today's reward when it is available.
+
+    ``allow_refresh=False`` is for the gateway's own loop: it renews expiring
+    accounts under the pool lock first, and a second writer refreshing from here
+    would race it into ``invalid_grant`` (upstream revokes the session when a
+    refresh token is reused).
+    """
     record = _load(path)
     label = record.get("email") or path.stem
-    token, rotated = _fresh_token(record, proxy)
-    # The refresh token rotates on every use, so a refresh has to reach the file
-    # even when the reward turns out to be already claimed.
-    if rotated:
-        _save(path, record)
+    if allow_refresh:
+        token, rotated = _fresh_token(record, proxy)
+        # The refresh token rotates on every use, so a refresh has to reach the
+        # file even when the reward turns out to be already claimed.
+        if rotated:
+            _save(path, record)
+    else:
+        token = (record.get("accessToken") or "").strip()
 
     panel = status(token, region, timezone, proxy)
     info = summarize(panel)
@@ -204,7 +218,8 @@ def claim_file(
 
 
 def claim_pool(root: str | Path, region: str = "en", timezone: str = DEFAULT_TIMEZONE,
-               proxy: str | None = None, dry_run: bool = False) -> list[dict]:
+               proxy: str | None = None, dry_run: bool = False,
+               allow_refresh: bool = True) -> list[dict]:
     base = Path(root).expanduser()
     files = [base] if base.is_file() else sorted(base.glob("*.json"))
     if not files:
@@ -214,7 +229,7 @@ def claim_pool(root: str | Path, region: str = "en", timezone: str = DEFAULT_TIM
         if path.name == "index.json":
             continue
         try:
-            results.append(claim_file(path, region, timezone, proxy, dry_run))
+            results.append(claim_file(path, region, timezone, proxy, dry_run, allow_refresh))
         except (SigninError, AccountError, OSError, json.JSONDecodeError) as exc:
             log.warning("check-in failed for %s: %s", path.stem, exc)
             results.append({"label": path.stem, "claimed": False, "error": str(exc)[:200]})

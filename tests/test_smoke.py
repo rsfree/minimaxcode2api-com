@@ -399,6 +399,32 @@ def test_pool_adopts_rotated_credentials_from_file() -> None:
             settings.token_pool = original
 
 
+def test_token_writes_are_atomic_and_leave_no_temp_files() -> None:
+    """Writers must not share a rename target, and must not litter the pool.
+
+    The gateway and the check-in thread both write rotated tokens into the same
+    directory. A shared ``x.json.tmp`` lets their bytes interleave into a file
+    that is then renamed into place — a corrupt record that costs a re-login.
+    """
+    import tempfile
+
+    from app.auth import Token, _write_record
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "aaa.json"
+        token = Token(access_token="tok-1", refresh_token="rt-1", expires_at_ms=1, label="aaa@mail.example.com")
+        _write_record(path, token, "en")
+        token.access_token = "tok-2"
+        _write_record(path, token, "en")
+
+        assert json.loads(path.read_text(encoding="utf-8"))["accessToken"] == "tok-2"
+        leftovers = sorted(p.name for p in Path(tmp).iterdir() if p.name != "aaa.json")
+        assert leftovers == [], f"temp files left behind: {leftovers}"
+        if not sys.platform.startswith("win"):
+            # Windows has no 0600; the permission check only means something on POSIX.
+            assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
 def test_a_spent_refresh_token_is_never_presented() -> None:
     """When the file already holds a newer pair, use it instead of refreshing.
 
@@ -1054,6 +1080,7 @@ def main() -> None:
         test_pool_hot_reload,
         test_pool_reload_survives_write_race,
         test_pool_adopts_rotated_credentials_from_file,
+        test_token_writes_are_atomic_and_leave_no_temp_files,
         test_a_spent_refresh_token_is_never_presented,
         test_expired_token_refreshes_once,
         test_quota_errors_rotate,

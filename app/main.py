@@ -21,6 +21,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -107,6 +108,30 @@ def _signin_enabled() -> bool:
     return bool(settings.signin_auto and settings.token_pool)
 
 
+async def _refresh_before_checkin() -> None:
+    """Renew expiring accounts here, where the pool lock serialises them.
+
+    The check-in thread works straight from the files and cannot take that lock.
+    If it refreshes an account at the same moment a request renews it, one of the
+    two exchanges wins and the other gets ``invalid_grant`` — and upstream treats
+    a reused refresh token as a leaked session, so the winner's fresh access
+    token dies too. Refreshing everything due *before* the thread starts leaves
+    it reading tokens that are still valid, so it never refreshes on its own.
+    """
+    tokens = [
+        t for t in getattr(token_manager, "_tokens", [])
+        if t.refresh_token and not t.disabled
+    ]
+    due = [t for t in tokens if t.is_expired()]
+    if not due:
+        return
+    renewed = 0
+    for token in due:
+        if await token_manager.renew(token):
+            renewed += 1
+    log.info("pre-check-in renewal: %s/%s account(s) refreshed", renewed, len(due))
+
+
 async def _signin_loop() -> None:
     """Claim the daily reward for every pooled account, then idle.
 
@@ -118,8 +143,9 @@ async def _signin_loop() -> None:
 
     while True:
         try:
+            await _refresh_before_checkin()
             rows = await asyncio.to_thread(
-                signin.claim_pool,
+                partial(signin.claim_pool, allow_refresh=False),
                 settings.token_pool,
                 settings.region,
                 settings.signin_timezone,

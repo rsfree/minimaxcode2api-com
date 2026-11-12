@@ -30,6 +30,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from secrets import token_hex
 
 from .account_api import AccountError, provision, refresh
 from .config import settings
@@ -51,8 +52,9 @@ def write_record(directory: Path, record: dict) -> Path:
     path = record_path(directory, record.get("email") or record.get("username") or "")
     payload = {k: v for k, v in record.items() if k != "password"}
     # Atomic swap: the pool watcher stats mtimes, and a half-written file would
-    # make it drop the account on the next reload.
-    tmp = path.with_suffix(".json.tmp")
+    # make it drop the account on the next reload. The temp name is unique
+    # because the gateway writes rotated tokens into the same directory.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{token_hex(4)}.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
     try:

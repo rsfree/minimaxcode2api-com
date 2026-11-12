@@ -20,6 +20,8 @@ import asyncio
 import itertools
 import json
 import logging
+import os
+import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -168,7 +170,11 @@ def _write_record(path: Path, token: Token, region: str) -> None:
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        # Unique temp name per write: the check-in thread and the console
+        # importer write the same directory, and two writers sharing one .tmp
+        # path can interleave their bytes into a file that is then renamed into
+        # place — a corrupt record that costs a login to recover.
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
         path.chmod(0o600)

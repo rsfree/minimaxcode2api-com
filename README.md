@@ -220,7 +220,10 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/healthz |
 2. 磁盘也没有更新值时，用内存里的 `refreshToken` 换新，**原子写回**该账号的 json；
 3. 上游回 `401` → 先重读磁盘（通常是签到线程刚轮换过），采纳后重试一次；磁盘无变化才 `renew`；
 4. `_pool_watch_loop` 每 10 秒和签到跑完各同步一次：文件里的 `expiresAtMs` 比内存晚就采纳，
-   计数、冷却、停用标记保留在内存对象上。
+   计数、冷却、停用标记保留在内存对象上；
+5. 签到**不会自己换 token**：网关先在有锁的路径上把快过期的号续好（`pre-check-in renewal`），
+   再让签到线程只读文件。否则两边同时换同一个 refresh token，必有一方 `invalid_grant`，
+   而 reused token 会连带吊销整个会话。
 
 **唯一不会自动恢复的情况**：`refreshToken` 本身被拒（密码改过、上游吊销）。
 密码不落盘（`write_record` 会剔除 `password`），所以这时只能重新加号。
