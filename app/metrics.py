@@ -1,13 +1,13 @@
 """Request accounting for the console.
 
-Deliberately in-memory: the gateway's whole job is forwarding, and asking it to
-carry a database just so a status page can draw a chart is a poor trade. The
-consequence is stated on the page itself — figures reset when the container
-restarts — rather than being papered over.
+The hot path stays in memory — a deque of recent calls, so a page can render
+without a query — but the durable copy lives in ``app/store.py``. Before that,
+every redeploy reset the counters, which made "a deploy broke something" look
+identical to "nothing has happened yet".
 
-One writer (`record`), many readers (`snapshot`), all under a plain threading
-lock: FastAPI runs handlers on the event loop, but media work happens in worker
-threads and the background loops touch this too.
+One writer (`record`), many readers (`snapshot` / `recent_page`), all under a
+plain threading lock: FastAPI runs handlers on the event loop, but media work
+happens in worker threads and the background loops touch this too.
 """
 
 from __future__ import annotations
@@ -53,6 +53,17 @@ class Call:
             "client": self.client,
         }
 
+    @classmethod
+    def from_row(cls, row: dict) -> "Call":
+        return cls(
+            ts=row["ts"], kind=row["kind"], model=row["model"], account=row["account"],
+            ok=bool(row["ok"]), status=row["status"], latency_ms=row["latency_ms"],
+            request_id=row.get("request_id") or "",
+            prompt_tokens=row.get("prompt_tokens") or 0,
+            completion_tokens=row.get("completion_tokens") or 0,
+            error=row.get("error") or "", client=row.get("client") or "",
+        )
+
 
 def _clock(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts))
@@ -71,7 +82,16 @@ class Metrics:
         self._lock = threading.Lock()
         self._rows: deque[Call] = deque(maxlen=limit)
         self._seq = 0
+        self._store = None
         self.started_at = time.time()
+
+    # -- wiring ------------------------------------------------------------
+    def attach(self, store) -> None:
+        """Point the metrics at a durable store (``app.store.Store``)."""
+        self._store = store
+
+    def _durable(self) -> bool:
+        return self._store is not None and getattr(self._store, "available", False)
 
     # -- write -------------------------------------------------------------
     def record(
@@ -104,10 +124,20 @@ class Metrics:
                 client=client,
             )
             self._rows.append(row)
-            return row
+        if self._store is not None:
+            self._store.write(row)
+        return row
 
     # -- read --------------------------------------------------------------
     def rows(self, hours: float | None = None) -> list[Call]:
+        """Rows in the window, from the store when it is open.
+
+        Memory is only a fallback: it cannot answer for anything older than the
+        current process, which is precisely the question this exists to answer.
+        """
+        if hours and self._durable():
+            self._store.flush()
+            return [Call.from_row(row) for row in self._store.window(hours)]
         with self._lock:
             rows = list(self._rows)
         if hours:
@@ -115,13 +145,35 @@ class Metrics:
             return [r for r in rows if r.ts >= floor]
         return rows
 
-    def recent(self, limit: int = 200, query: str = "", outcome: str = "") -> list[dict]:
+    def recent_page(self, limit: int = 200, offset: int = 0, query: str = "",
+                    outcome: str = "") -> dict:
+        """Newest-first page plus the number of rows matching the filter."""
+        if self._durable():
+            self._store.flush()
+            rows, total = self._store.tail(limit, offset, query, outcome)
+            return {
+                "rows": [self._dump_row(row) for row in rows],
+                "total": total,
+                "source": "sqlite",
+                "buffered": total,
+            }
+        rows = self._filtered(query, outcome)
+        total = len(rows)
+        page = list(reversed(rows))[offset:offset + limit]
+        return {
+            "rows": [r.dump() for r in page],
+            "total": total,
+            "source": "memory",
+            "buffered": len(self.rows()),
+        }
+
+    def _filtered(self, query: str, outcome: str) -> list[Call]:
         rows = self.rows()
-        q = (query or "").strip().lower()
         if outcome == "success":
             rows = [r for r in rows if r.ok]
         elif outcome == "error":
             rows = [r for r in rows if not r.ok]
+        q = (query or "").strip().lower()
         if q:
             rows = [
                 r for r in rows
@@ -131,7 +183,17 @@ class Metrics:
                 or q in r.request_id.lower()
                 or q in r.client.lower()
             ]
-        return [r.dump() for r in reversed(rows[-limit:])]
+        return rows
+
+    def recent(self, limit: int = 200, query: str = "", outcome: str = "") -> list[dict]:
+        return self.recent_page(limit=limit, query=query, outcome=outcome)["rows"]
+
+    @staticmethod
+    def _dump_row(row: dict) -> dict:
+        out = dict(row)
+        out["time"] = _clock(row["ts"])
+        out["total_tokens"] = (row.get("prompt_tokens") or 0) + (row.get("completion_tokens") or 0)
+        return out
 
     def snapshot(self, hours: float = 24) -> dict:
         rows = self.rows(hours)
@@ -139,6 +201,8 @@ class Metrics:
             "window_hours": hours,
             "started_at": self.started_at,
             "uptime_seconds": round(time.time() - self.started_at),
+            "source": "sqlite" if self._durable() and hours else "memory",
+            "store": self._store.stats() if self._store is not None else None,
             "total": self._rollup(rows),
             "series": self._series(rows, hours),
             "by_model": self._group(rows, "model"),

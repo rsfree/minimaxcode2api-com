@@ -95,6 +95,13 @@ class Settings:
         default_factory=lambda: float(_env("PROBE_INTERVAL", "300") or 300)
     )
 
+    # Request history. Empty = /data/metrics.db in the container, data/metrics.db
+    # elsewhere. Set to "off" to keep the old memory-only behaviour.
+    metrics_db: str = field(default_factory=lambda: _env("METRICS_DB", ""))
+    metrics_retention_days: float = field(
+        default_factory=lambda: float(_env("METRICS_RETENTION_DAYS", "30") or 30)
+    )
+
     # Gateway side.
     api_keys: list[str] = field(default_factory=list)
     default_max_tokens: int = field(default_factory=lambda: _env_int("DEFAULT_MAX_TOKENS", 8192))

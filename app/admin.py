@@ -26,6 +26,7 @@ from .metrics import metrics
 from .onboard import importer
 from .probe import probes
 from .security import authorized
+from .store import store
 
 def _guard(request: Request) -> None:
     if not authorized(request):
@@ -40,6 +41,31 @@ SIGNIN_DAILY = 400  # credits a single account's check-in yields on a normal day
 
 def _uptime() -> int:
     return round(time.time() - metrics.started_at)
+
+
+def _with_totals(pool: dict) -> dict:
+    """Fold the durable per-account tallies into the live pool description.
+
+    Two different numbers, both true, and conflating them is why the console
+    looked wrong: ``ok``/``fail`` count *this process*, while ``ok_total`` /
+    ``fail_total`` count every retained request. They also differ in unit — an
+    account is credited with an attempt even when the request was retried on
+    the next account, so attempts can exceed the request count on the usage page.
+    """
+    totals = store.account_totals()
+    if not totals:
+        return pool
+    for account in pool.get("accounts", []):
+        row = totals.get(account.get("label") or "")
+        if not row:
+            continue
+        account["attempts_total"] = row["attempts"]
+        account["ok_total"] = row["ok"]
+        account["fail_total"] = row["fail"]
+        account["tokens_in_total"] = row["tokens_in"]
+        account["tokens_out_total"] = row["tokens_out"]
+        account["last_success_total"] = row["last_success"] or None
+    return pool
 
 
 def _alerts(pool: dict, usage: dict, probe_totals: dict) -> list[dict]:
@@ -89,7 +115,7 @@ def _alerts(pool: dict, usage: dict, probe_totals: dict) -> list[dict]:
 @router.get("/summary")
 async def summary() -> dict:
     """Light payload for the 5-second nav pulse."""
-    pool = token_manager.describe()
+    pool = _with_totals(token_manager.describe())
     snap = metrics.snapshot(24)
     probe = probes.snapshot()
     return {
@@ -100,6 +126,7 @@ async def summary() -> dict:
             "uptime_seconds": _uptime(),
             "proxy": bool(settings.upstream_proxy),
             "key_required": bool(settings.api_keys),
+            "history": store.stats(),
         },
         "pool": {
             "size": pool["pool_size"],
@@ -117,7 +144,7 @@ async def summary() -> dict:
 
 @router.get("/overview")
 async def overview() -> dict:
-    pool = token_manager.describe()
+    pool = _with_totals(token_manager.describe())
     snap = metrics.snapshot(24)
     probe = probes.snapshot()
     return {
@@ -149,10 +176,17 @@ async def usage(hours: float = 24) -> dict:
 
 
 @router.get("/logs")
-async def logs(limit: int = 200, q: str = "", outcome: str = "") -> dict:
+async def logs(limit: int = 200, offset: int = 0, q: str = "", outcome: str = "") -> dict:
     limit = max(1, min(limit, 1000))
-    rows = metrics.recent(limit=limit, query=q, outcome=outcome)
-    return {"rows": rows, "count": len(rows), "buffered": len(metrics.rows())}
+    page = metrics.recent_page(limit=limit, offset=max(0, offset), query=q, outcome=outcome)
+    return {
+        "rows": page["rows"],
+        "count": len(page["rows"]),
+        "total": page["total"],
+        "offset": max(0, offset),
+        "buffered": page["buffered"],
+        "source": page["source"],
+    }
 
 
 @router.get("/probes")

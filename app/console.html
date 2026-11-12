@@ -246,6 +246,9 @@ audio { width: 100%; margin-top: 10px; }
 .veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px);
   display: none; z-index: 60; }
 .veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
+.logfoot { display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-top: 1px solid var(--line); }
+.logfoot button[disabled] { opacity: .4; cursor: default; }
 .modal { width: 100%; max-width: 420px; background: var(--surface); border: 1px solid var(--line);
   border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
 .modal.wide { max-width: 620px; }
@@ -629,7 +632,7 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
     <section class="view" id="view-logs" hidden>
       <div class="box">
         <header>
-          <h3>请求日志 <span class="hint">进程内环形缓冲 · 重启清空</span></h3>
+          <h3>请求日志 <span class="hint" id="logHint">落盘保留 · 重启不清</span></h3>
           <div class="grow"></div>
           <span class="note" id="reqNote">—</span>
           <button class="xs" id="btnLogs">重新读取</button>
@@ -654,6 +657,12 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
             <th class="num">耗时</th><th class="num">Token</th><th>来源</th><th>请求 ID</th></tr></thead>
           <tbody id="logBody"><tr><td colspan="9"><div class="empty">加载中…</div></td></tr></tbody>
         </table></div>
+        <div class="logfoot">
+          <span class="note" id="logPage">—</span>
+          <span style="flex:1"></span>
+          <button class="xs ghost" id="logPrev">上一页</button>
+          <button class="xs ghost" id="logNext">下一页</button>
+        </div>
       </div>
     </section>
 
@@ -1095,7 +1104,11 @@ function renderAccounts() {
       '<div class="id">' + (a.last_error ? esc(String(a.last_error).slice(0, 42)) : "expires " + (a.expires_at_ms ? new Date(a.expires_at_ms).toLocaleDateString("zh-CN") : "—")) + "</div></td>" +
       "<td>" + tag + "</td>" +
       '<td class="num">' + cr + "</td>" +
-      '<td class="num">' + (a.ok || 0) + " / " + (a.fail ? '<span style="color:var(--bad)">' + a.fail + "</span>" : "0") + "</td>" +
+      '<td class="num">' + (a.ok || 0) + " / " + (a.fail ? '<span style="color:var(--bad)">' + a.fail + "</span>" : "0") +
+        (a.attempts_total != null && a.attempts_total > (a.ok || 0) + (a.fail || 0)
+          ? '<div class="dim" style="font-size:11px" title="含重启前的全部尝试">累计 ' +
+            num(a.attempts_total) + " · 失败 " + num(a.fail_total || 0) + "</div>"
+          : "") + "</td>" +
       '<td class="num">' + (a.in_flight || 0) + "</td>" +
       '<td class="num">' + num(tokens) + "</td>" +
       "<td>" + sign + "</td>" +
@@ -1353,7 +1366,9 @@ async function loadUsage() {
   $("uIn").textContent = num(t.prompt_tokens);
   $("uOut").textContent = num(t.completion_tokens);
   $("uP95").textContent = ms(t.p95_latency_ms);
-  $("usNote").textContent = "缓冲 " + usageData.series.points.length + " 个桶 · 每桶 " + dur(usageData.series.bucket_seconds);
+  $("usNote").textContent = "缓冲 " + usageData.series.points.length + " 个桶 · 每桶 " +
+    dur(usageData.series.bucket_seconds) +
+    (usageData.source === "sqlite" ? " · 含重启前" : " · 仅本进程");
   $("usChartNote").textContent = t.requests ? "合计 " + num(t.total_tokens) + " token / " + t.requests + " 次" : "窗口内没有请求";
   drawChart(usageData.series.points);
   renderUsageTable();
@@ -1503,6 +1518,7 @@ $("btnCapacity").addEventListener("click", loadCapacity);
 
 /* ── 请求日志 ─────────────────────────────────────────────────────── */
 let logOutcome = "";
+let logOffset = 0;
 document.querySelectorAll("#logChips .chip").forEach((chip) => {
   chip.addEventListener("click", () => {
     document.querySelectorAll("#logChips .chip").forEach((c) => c.classList.toggle("on", c === chip));
@@ -1511,19 +1527,38 @@ document.querySelectorAll("#logChips .chip").forEach((chip) => {
   });
 });
 $("logQ").addEventListener("input", () => loadLogs());
-$("logLimit").addEventListener("change", loadLogs);
-$("btnLogs").addEventListener("click", loadLogs);
+$("logLimit").addEventListener("change", () => loadLogs());
+$("btnLogs").addEventListener("click", () => loadLogs());
+$("logPrev").addEventListener("click", () => {
+  logOffset = Math.max(0, logOffset - Number($("logLimit").value));
+  loadLogs(true);
+});
+$("logNext").addEventListener("click", () => {
+  logOffset += Number($("logLimit").value);
+  loadLogs(true);
+});
 
-async function loadLogs() {
-  const limit = $("logLimit").value;
+async function loadLogs(keepOffset) {
+  const limit = Number($("logLimit").value);
+  if (!keepOffset) logOffset = 0;
   const q = encodeURIComponent($("logQ").value.trim());
   let d;
   try {
-    d = await getJSON("/admin/logs?limit=" + limit + "&q=" + q + "&outcome=" + logOutcome, true);
+    d = await getJSON("/admin/logs?limit=" + limit + "&offset=" + logOffset +
+      "&q=" + q + "&outcome=" + logOutcome, true);
   } catch (e) {
     return;
   }
-  $("reqNote").textContent = "缓冲 " + d.buffered + " 条 · 当前 " + d.count;
+  const durable = d.source === "sqlite";
+  $("logHint").textContent = durable ? "落盘保留 · 重启不清" : "仅内存 · 重启清空";
+  $("reqNote").textContent = durable ? "磁盘历史" : "仅本进程";
+  const from = d.count ? d.offset + 1 : 0;
+  const to = d.offset + d.count;
+  $("logPage").textContent = "第 " + from + "–" + to + " 条 / 共 " + num(d.total) + " 条" +
+    (durable ? "" : "（本进程）");
+  $("logPrev").disabled = d.offset <= 0;
+  $("logNext").disabled = d.offset + d.count >= d.total;
+  if (logOffset !== d.offset) logOffset = d.offset;
   if (!d.rows.length) {
     $("logBody").innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">没有记录</div>' +
       "打一次对话或生成请求就会出现在这里</div></td></tr>";

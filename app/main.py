@@ -36,7 +36,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import admin, media, metrics as metrics_mod, probe, security
+from . import admin, media, metrics as metrics_mod, probe, security, store as store_mod
 from .auth import CredentialError, token_manager
 from .security import UI_COOKIE, UI_COOKIE_MAX_AGE, authorized as _authorized, is_loopback as _is_loopback
 from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
@@ -60,6 +60,10 @@ log = logging.getLogger("minimax.gateway")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Durable request history first: everything below writes into it, and it is
+    # what makes a redeploy legible instead of a fresh zero.
+    store_mod.open_default()
+    metrics_mod.metrics.attach(store_mod.store)
     await upstream.startup()
     try:
         await token_manager.get()
@@ -77,6 +81,7 @@ async def lifespan(_: FastAPI):
         if pending is not None:
             pending.cancel()
     await upstream.shutdown()
+    store_mod.store.close()
 
 
 def _pool_watch_enabled() -> bool:

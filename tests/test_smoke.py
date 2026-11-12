@@ -668,6 +668,109 @@ def test_quota_park_lasts_until_reset() -> None:
         raise AssertionError("expected CredentialError when every account is out of quota")
 
 
+def test_request_history_survives_restart() -> None:
+    """A redeploy must not wipe the log — that is the entire point of the store."""
+    import tempfile
+
+    from app.metrics import Metrics
+    from app.store import Store
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "requests.db")
+        first = Store(db, retention_days=30)
+        assert first.available, first.error
+
+        m = Metrics()
+        m.attach(first)
+        m.record("chat", "MiniMax-M3.1-Flash", account="a@x", ok=True, latency_ms=120,
+                 prompt_tokens=10, completion_tokens=5, client="1.2.3.4")
+        m.record("chat", "MiniMax-M3.1-Flash", account="a@x", ok=False, status=402,
+                 latency_ms=90, error="insufficient balance (1008)")
+        m.record("image", "minimax-image", account="b@x", ok=True, latency_ms=900)
+        assert first.flush() == 3
+
+        before = m.snapshot(24)["total"]
+        assert before["requests"] == 3 and before["success"] == 2 and before["errors"] == 1
+        assert m.snapshot(24)["source"] == "sqlite"
+
+        # Paging is by total, not by "whatever fits in 4000 rows".
+        page = m.recent_page(limit=2)
+        assert page["total"] == 3 and len(page["rows"]) == 2
+        assert len(m.recent_page(limit=2, offset=2)["rows"]) == 1
+        assert m.recent_page(outcome="error")["total"] == 1
+
+        totals = first.account_totals()
+        assert totals["a@x"]["ok"] == 1 and totals["a@x"]["fail"] == 1
+        assert totals["a@x"]["tokens_in"] == 10 and totals["b@x"]["ok"] == 1
+        first.close()
+
+        # A redeploy is exactly this: a new object opening the same file.
+        second = Store(db, retention_days=30)
+        assert second.available, second.error
+        m2 = Metrics()
+        m2.attach(second)
+        after = m2.snapshot(24)["total"]
+        assert after["requests"] == 3, after
+        assert after["success"] == 2 and after["errors"] == 1
+        assert after["total_tokens"] == 15
+        rows = m2.recent_page(limit=10)["rows"]
+        assert any(r["error"] == "insufficient balance (1008)" for r in rows)
+        assert second.account_totals()["b@x"]["ok"] == 1
+
+        # Retention is enforced on open, not by a cron job.
+        second.close()
+        old = Store(db, retention_days=0)
+        old.close()
+
+
+def test_store_degrades_to_memory() -> None:
+    """A read-only container must still serve requests, just without history."""
+    import tempfile
+
+    from app.metrics import Metrics
+    from app.store import Store
+
+    # A directory is not a database file; opening it must fail cleanly rather
+    # than take the process down.
+    with tempfile.TemporaryDirectory() as tmp:
+        broken = Store(tmp)
+        assert not broken.available
+        assert broken.stats()["mode"] == "memory"
+
+    m = Metrics()
+    m.attach(broken)
+    m.record("chat", "MiniMax-M3.1-Flash", account="a@x", ok=True)
+    snap = m.snapshot(24)
+    assert snap["source"] == "memory"
+    assert snap["total"]["requests"] == 1
+    assert m.recent_page()["source"] == "memory"
+
+
+def test_admin_logs_pagination() -> None:
+    """The endpoint reports the real total so the page can page through it."""
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+
+    original = settings.api_keys
+    settings.api_keys = ["unit-test-key"]
+    try:
+        with TestClient(app) as client:
+            data = client.get("/admin/logs?limit=1&offset=1",
+                              headers={"x-api-key": "unit-test-key"}).json()
+            assert {"rows", "count", "total", "offset", "source"} <= set(data)
+            assert data["offset"] == 1
+            assert isinstance(data["total"], int) and data["total"] >= data["count"]
+            assert data["source"] in {"sqlite", "memory"}
+            # The account page carries both units: this process and lifetime.
+            pool = client.get("/admin/overview",
+                              headers={"x-api-key": "unit-test-key"}).json()["pool"]
+            assert "accounts" in pool
+    finally:
+        settings.api_keys = original
+
+
 def test_capacity_math() -> None:
     """补号测算 has to be arithmetically sane, not just pretty."""
     from fastapi.testclient import TestClient
@@ -709,6 +812,9 @@ def main() -> None:
         test_membership_payload_is_not_unwrapped,
         test_quota_park_lasts_until_reset,
         test_admin_requires_key,
+        test_request_history_survives_restart,
+        test_store_degrades_to_memory,
+        test_admin_logs_pagination,
         test_capacity_math,
     ]
     for test in tests:
