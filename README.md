@@ -73,7 +73,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY
 
 | 能力 | 上游工具 | 网关端点 | 实测状态 |
 |---|---|---|---|
-| 文生图 / 图生图 | `image_synthesize` | `POST /v1/images/generations` | ✅ 200，1 张 1K 约 20 秒 |
+| 文生图 / 图生图 | `image_synthesize` | `POST /v1/images/generations` | ✅ 200，1 张 1K 实测 27–94 秒（随上游负载波动） |
 | 文生视频 / 图生视频 | `submit_video_generation` + `query_video_generation` | `POST /v1/videos/generations` | ✅ 提交成功（202 + task_id），查询状态流转 `running → succeeded`；**文件交付环节见 §3.7** |
 | 语音合成 | `synthesize_speech` | `POST /v1/audio/speech` | 端点与参数已验证；实测时余额已耗尽（402） |
 | 音色列表 | `get_voice_list` | `GET /v1/audio/voices` | ✅ 200，332 个音色 |
@@ -591,6 +591,26 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 但**实际字节是 JPEG**（`ff d8 ff e1`，带 AIGC 水印 Exif）。这是上游工具的行为，网关无法改。
 按扩展名或 Content-Type 判断格式的程序会被误导——**靠文件头判断**。
 
+#### 这里的「模型名」是什么
+
+`minimax-image` 只是网关给这条链路起的**别名**，不是上游模型。整条链路没有模型选择：
+
+| 层 | 实际名字 |
+|---|---|
+| 网关对外（`/v1/models` 里的 id） | `minimax-image` |
+| 上游 MCP 工具 | `matrix_generate_image`（`endpoint: "image_synthesize"`） |
+| 上游入参 | 只有 `prompt` / `input_files` / `input_urls` / `aspect_ratio` / `resolution`，**没有 `model`** |
+
+上游工具清单（`GET {mcp_base}/tools`）里 `matrix_generate_image` 的 `input_schema_json` 是
+`additionalProperties: false`，压根没有模型字段；出图返回里也没有模型标识，`clean_oss_key`
+一律是 `.../image_tool/output/...`。所以：
+
+- 请求体里的 `model` **完全被忽略**——传 `minimax-image`、`h3-image` 还是随便什么，结果一样；
+  响应里的 `"model"` 只是把客户端传的名字回显，没传就填 `"image"`；
+- **`h3-image` 在这条通道不存在**。`H3` 是**视频**模型（`MiniMax-H3` → `matrix_gen_videos`），
+  和图像无关；
+- 图像风格/画质只能通过 `prompt`、`aspect_ratio`、`resolution` 控制，选不了具体图像模型。
+
 ### 3.5 文生视频 / 图生视频
 
 视频是**异步**的：提交拿 `task_id`，再轮询。上游没有 OpenAI 式的视频协议，这里用 REST 风格自定义。
@@ -735,7 +755,7 @@ flowchart LR
 | `404 ... no longer available (2069)` | 模型已下线（M2 / M2.1） | 换 M2.5 及以上 |
 | `503` on `/healthz` | 没有可用凭证 | 用 `python -m app.login` 登录，或挂载 `auth.json` |
 | 流式到一半断 | 反代缓冲或读超时 | nginx 关 `proxy_buffering`，`proxy_read_timeout` 拉长 |
-| 生图 / TTS 返回 `402` | 账号额度耗尽，文案里会写 `plan balance has run out` | 桌面端充值；**重试无效** |
+| 生图 / TTS 返回 `402` | 账号额度耗尽，文案里会写 `plan balance has run out` | 桌面端充值；**重试无效**。注意这条**与 credits 余额无关**：实测一个余额 184.69 的号生图照样 402——媒体走的是 plan 的日额度，控制台那个积分数字看不出它还剩几张图 |
 | 视频查询 `503` 但 `status: succeeded` | 任务渲染完成，服务端没备好文件交付 | 隔几分钟轮询同一 `task_id`；不要重新提交（会再扣一次） |
 | 视频提交 `503 temporarily unavailable` | **该账号没有视频权限**，不是上游故障 | 仓库池里有别的号能提交就行，网关会自动换号；全池都没有就充 M Plan |
 | 视频查询 `404 does not belong to the current caller` | 提交和查询用到了不同账号；或网关重启丢了映射 | 用同一个网关实例查；重启后再查只能重新提交 |
