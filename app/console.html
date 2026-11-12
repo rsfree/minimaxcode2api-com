@@ -770,8 +770,9 @@ function finishFoot(footEl, usage, started) {
   if (usage) {
     const inTok = usage.prompt_tokens != null ? usage.prompt_tokens : usage.input_tokens;
     const outTok = usage.completion_tokens != null ? usage.completion_tokens : usage.output_tokens;
-    if (inTok != null) parts.push("in " + inTok);
-    if (outTok != null) parts.push("out " + outTok);
+    // 流式分片里上游常把 prompt_tokens 填 0，显示「in 0」会被当成 bug，直接略过。
+    if (inTok) parts.push("in " + inTok);
+    if (outTok) parts.push("out " + outTok);
   }
   footEl.hidden = false;
   footEl.textContent = parts.join(" · ");
