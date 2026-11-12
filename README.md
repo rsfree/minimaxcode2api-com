@@ -6,7 +6,7 @@
 
 - 一个进程，两个协议：`/v1/chat/completions`（OpenAI）、`/v1/messages`（Anthropic）
 - 流式、工具调用（function calling）、思考内容（`reasoning_content`）全支持
-- 6 个可用模型，**含 100 万上下文**的 M3 / M3.1-Flash
+- 13 个模型一次性列全（8 对话 + 5 多模态），M3 / M3.1-Flash 是 **512K 上下文 / 128K 输出**
 - **多模态同一条通道**：文生图、文/图生视频、TTS、音乐，一起变成 HTTP 接口
 - 无状态、单容器、可 Docker 部署；token 到期自动续期
 
@@ -26,19 +26,48 @@
 | Token 有效期 | 12 小时，带 refresh token 可续 | `auth.json` 的 `expiresAtMs` |
 | 计费 | 走账号 Credits，**不是按 token 计费的 API 额度** | 桌面端左下角 Credits 余额 |
 
-### 可用模型（2026-11-11 逐个实测）
+### 可用模型（清单直接取自上游 provider config）
 
-| 模型 | 上下文 | 最大输出 | 视觉 | 思考 |
-|---|---|---|---|---|
-| `MiniMax-M3.1-Flash` | 1,000,000 | 524,288 | ✅ | 强制开启 |
-| `MiniMax-M3` | 1,000,000 | 524,288 | ✅ | 可切换 |
-| `MiniMax-M2.7` | 204,800 | 131,072 | — | 可切换 |
-| `MiniMax-M2.7-highspeed` | 204,800 | 131,072 | — | 可切换 |
-| `MiniMax-M2.5` | 204,800 | 131,072 | — | 可切换 |
-| `MiniMax-M2.5-highspeed` | 204,800 | 131,072 | — | 可切换 |
-| ~~`MiniMax-M2`~~ / ~~`MiniMax-M2.1`~~ | — | — | — | 上游已下线（错误码 2069） |
+`GET https://agent.minimax.io/mavis/api/v1/models` 是这个通道自己的权威清单，白名单里只有
+`MiniMax-M3.1-Flash` 和 `MiniMax-M3`（512K 上下文 / 128K 输出，输入支持文本 + 图片 + 视频）。
+M2.5 / M2.7 / M2 / M2.1 已不在白名单，但上游仍然服务（实测都能出结果），所以保留为 `legacy`。
 
-别名可用：`m3`、`m3.1`、`m2.7`、`m2.5`、`minimax`、`default`。
+| 模型 | 类型 | 上下文 | 最大输出 | 输入 | 思考 | 备注 |
+|---|---|---|---|---|---|---|
+| `MiniMax-M3.1-Flash` | 对话 | 512,000 | 128,000 | 文本/图片/视频 | **强制开启** | 默认模型、客户端首选 |
+| `MiniMax-M3` | 对话 | 512,000 | 128,000 | 文本/图片/视频 | 可切换 | 唯一能关思考的大上下文模型 |
+| `MiniMax-M2.7` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | legacy，上游仍可用 |
+| `MiniMax-M2.5` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | legacy，上游仍可用 |
+| `MiniMax-M2` / `M2.1` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | legacy，上游仍可用 |
+| `minimax-image` | 图像 | — | — | 文本/图片 | — | `POST /v1/images/generations` |
+| `minimax-speech` / `minimax-music` | 语音 | — | — | 文本 | — | `/v1/audio/speech`、`/v1/music/generations` |
+| `MiniMax-H3` / `MiniMax-Hailuo-2.3` | 视频 | — | — | 文本/图片 | — | `POST /v1/videos/generations` |
+
+`GET /v1/models` 默认就把 **13 个** 全列出来（8 对话 + 5 多模态），每条带 `type`、`context_length`、
+`capabilities`、`legacy`；只要对话模型就加 `?include_media=0`。
+
+**调试时怎么选**：
+
+| 场景 | 选它 | 原因 |
+|---|---|---|
+| 通用对话、写代码、长文档 | `MiniMax-M3.1-Flash` | 默认值，512K 上下文，思考强制开 |
+| 要低延迟 / 省钱 | `MiniMax-M3` + `"thinking":{"type":"disabled"}` | 唯一允许关思考的大上下文模型（M3.1-Flash 关掉会被上游 2013 拒绝） |
+| 高并发小任务（分类、抽取） | `MiniMax-M2.5-highspeed` | 快，204K 够用 |
+| 看图 / 看视频 | `MiniMax-M3.1-Flash` 或 `MiniMax-M3` | 只有这两个收图，输入模态含 `video` |
+
+```bash
+# 模型清单 + 元数据（上下文、模态、是否支持关思考）
+curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/models | python -m json.tool
+
+# 同一个请求换模型：只改 model 一行
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"MiniMax-M3","thinking":{"type":"disabled"},"max_tokens":64,
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+别名可用：`m3`、`m3.1`、`m2.7`、`m2.5`、`minimax`、`default`。不在表里的 id 会**原样转发**给上游
+（例如 `MiniMax-M3.1`、`MiniMax-M3-flash` 实测也能出结果），所以新模型上线不必等网关发版。
 
 ### 多模态能力（同一条通道，另一组端点）
 
@@ -144,7 +173,7 @@ python -m app.provision --email new@mail.example --password 'secret'
 #      -m app.provision --email new@mail.example --password 'secret' --out /data/tokens
 
 # 2) 10 秒后看池子（不用重启）
-curl -s http://127.0.0.1:8080/healthz |
+curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/healthz |
   python -c "import json,sys;d=json.load(sys.stdin);print(d['pool_size'],[a['label'] for a in d['accounts']])"
 ```
 
@@ -156,10 +185,11 @@ curl -s http://127.0.0.1:8080/healthz |
 
 ### 看池状态
 
-`GET /healthz` 不返回任何 token，只报每个账号是否可用、用了几次、冷却多久：
+`GET /healthz` 不返回任何 token，但**会列出每个账号的 label（邮箱）**，所以它和业务接口一样要带密钥；
+只有容器本机的健康检查（`127.0.0.1`）免鉴权：
 
 ```bash
-curl -s http://127.0.0.1:8080/healthz | python -m json.tool
+curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/healthz | python -m json.tool
 ```
 
 ```json
@@ -230,23 +260,27 @@ bbb@mail.example.com            day 1 claimable cycle=4000 pts
 
 ## 二点七、内置控制台
 
-浏览器打开 **`http://<host>:8080/ui`** 即可，不需要另外部署前端容器：
+浏览器打开 **`http://<host>:8080/ui`** 即可，不需要另外部署前端容器。**页面本身也要鉴权**：
+没登录时返回一个登录页，输入 `.env` 里的 `GATEWAY_API_KEY`，服务端种 30 天 cookie，之后直接进。
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/ui          # 401 + 登录页
+curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/ui?key=sk-local'  # 200 并种 cookie
+```
 
 | 页面 | 做什么 |
 |---|---|
 | 对话 | 流式输出、思考过程折叠、耗时与 token 用量 |
 | 图像 | 文生图，结果直接预览并给 CDN 链接 |
 | 语音 | TTS，音色从 `/v1/audio/voices` 拉（332 个），合成后直接播放 |
-| 账号池 | 每个账号的可用状态、已用次数、冷却剩余、最近错误 |
-| 模型 | `/v1/models` 的清单与上下文长度 |
+| 账号池 | 每个账号的可用状态、已用次数、冷却剩余、最近错误；标注新账号几秒内自动进池 |
+| 模型 | `/v1/models` 的全部 13 个模型，按类型分组，带上下文长度与能力标记 |
 
 设计令牌与 [WorkBuddy2API](https://wb2api.1task.cn/panel/) 控制台同一套（冷石墨底 + 靛蓝强调、
 等宽数字、明暗双主题），两个面板观感一致。
 
-页面本身是静态 HTML，**不含任何密钥**：首次调用返回 `401` 时它会弹框索要
-`GATEWAY_API_KEY`，存进本机 `localStorage`，之后所有请求照常走网关注权。
-所以把 `/ui` 公开出去也不会泄露凭证——但控制台能直接花钱生图/生视频，
-**别把它挂到公网无鉴权的路径上**。
+鉴权用同一个 api key：cookie（页面）和 `Authorization: Bearer` / `X-API-Key`（接口）等价，
+`/ui/logout` 清掉 cookie。静态 HTML 里不含任何密钥。
 
 ---
 
@@ -345,10 +379,11 @@ export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3.1-Flash
 | 端点 | 说明 |
 |---|---|
 | `GET /` | 名称、端点清单、模型列表（不需要 key） |
-| `GET /ui` | **内置控制台**（对话 / 图像 / 语音 / 账号池 / 模型），单文件、无外部依赖 |
-| `GET /healthz` | 200 = 有可用凭证；503 = 缺凭证，附原因 |
-| `GET /v1/models` | OpenAI 格式模型列表；加 `?include_media=true` 连多模态一起列 |
-| `GET /v1/models/meta` | 带上下文长度、能力标记 |
+| `GET /ui` | **内置控制台**（对话 / 图像 / 语音 / 账号池 / 模型），单文件；需要 key（登录页种 cookie） |
+| `POST /ui/login` | 控制台登录，`key=…` 表单；`GET /ui?key=…` 也能一次性登录 |
+| `GET /healthz` | 200 = 有可用凭证；503 = 缺凭证；**需要 key**，仅容器本机 127.0.0.1 免鉴权 |
+| `GET /v1/models` | 全部 13 个模型（8 对话 + 5 多模态，带 `type`）；`?include_media=0` 只要对话模型 |
+| `GET /v1/models/meta` | 带上下文长度、能力标记、模态 |
 | `GET /v1/media/models` | 多模态能力清单（参数范围、对应端点） |
 | `POST /v1/messages/count_tokens` | 粗估 token 数（上游不开放 tokenizer） |
 

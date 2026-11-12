@@ -26,8 +26,47 @@ def test_model_aliases() -> None:
     assert resolve_model("MiniMax-M3.1-Flash") == "MiniMax-M3.1-Flash"
     assert resolve_model("minimax-m3.1-flash") == "MiniMax-M3.1-Flash"
     assert resolve_model(None) == DEFAULT_MODEL
-    ids = {model.id for model in visible_models()}
-    assert "MiniMax-M3" in ids and "MiniMax-M2" not in ids
+    # Unknown ids are forwarded verbatim so a new upstream model works unlisted.
+    assert resolve_model("MiniMax-M9") == "MiniMax-M9"
+    assert DEFAULT_MODEL in {model.id for model in visible_models()}
+
+
+def test_model_catalogue_complete() -> None:
+    """Every endpoint the gateway serves should be enumerable from /v1/models."""
+    from app import media
+    from app.catalog import visible_media_models
+
+    chat = {model.id: model for model in visible_models()}
+    media_models = {model.id: model for model in visible_media_models()}
+
+    # Whitelisted by the channel's own provider config (512K context / 128K out).
+    for name in ("MiniMax-M3.1-Flash", "MiniMax-M3"):
+        assert name in chat, f"{name} missing from the catalogue"
+        assert chat[name].context_window == 512_000
+        assert chat[name].max_output == 128_000
+        assert chat[name].vision
+    assert chat["MiniMax-M3.1-Flash"].thinking == "forced_on"
+
+    # Legacy but still served upstream — must stay visible so clients do not break.
+    for name in (
+        "MiniMax-M2.7",
+        "MiniMax-M2.7-highspeed",
+        "MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2",
+        "MiniMax-M2.1",
+    ):
+        assert name in chat and chat[name].legacy
+
+    # Multimodal entries exist for every media endpoint, with the right kind.
+    assert {"minimax-image", "minimax-speech", "minimax-music"} <= set(media_models)
+    assert {m.id for m in media_models.values() if m.kind == "video"} == set(media.VIDEO_MODELS)
+    assert media_models["minimax-image"].kind == "image"
+
+    # /v1/models carries the fields a picker needs.
+    row = chat["MiniMax-M3"].to_openai()
+    assert row["type"] == "chat" and row["context_length"] == 512_000
+    assert row["capabilities"]["vision"] is True
 
 
 def test_system_and_text() -> None:
@@ -242,6 +281,7 @@ def test_pool_hot_reload() -> None:
 def main() -> None:
     tests = [
         test_model_aliases,
+        test_model_catalogue_complete,
         test_system_and_text,
         test_tool_roundtrip,
         test_response_translation,

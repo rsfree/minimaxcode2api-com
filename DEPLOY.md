@@ -220,7 +220,7 @@ docker compose run --rm --entrypoint python minimax-code2api \
   -m app.provision --email new@mail.example.com --password 'Pa55word1' --out /data/tokens
 
 # 等 10 秒，看池子变大（不要 restart）
-curl -s http://127.0.0.1:39600/healthz |
+curl -s -H "X-API-Key: $KEY" http://127.0.0.1:39600/healthz |
   python3 -c "import json,sys;d=json.load(sys.stdin);print(d['pool_size'],[a['label'] for a in d['accounts']])"
 
 docker compose logs --tail 20 | grep pool
@@ -338,7 +338,7 @@ KEY=你的GATEWAY_API_KEY
 **① 健康检查：有凭证**
 
 ```bash
-curl -s $BASE/healthz
+curl -s -H "X-API-Key: $KEY" $BASE/healthz
 # 单 token：
 # {"status":"ok","region":"en","source":"auth_file","cached":true,"expires_at_ms":...,"base_url":"...","proxy":true}
 # 账号池：
@@ -575,6 +575,8 @@ docker compose logs -f --tail=100 | grep -E 'kind=|WARNING|ERROR'
 - [ ] 容器不以 root 运行（镜像默认 uid `10001`）
 - [ ] 只监听内网或已上反代 + TLS，不要裸 `0.0.0.0:8080` 暴露公网
 - [ ] `data/token.json` 权限 `600`，不进备份的公开位置
+- [ ] `/ui`、`/healthz` 都要 key：`/ui` 走登录页种 cookie，`/healthz` 只有容器本机 127.0.0.1 免鉴权
+      （外部探活记得带 `-H "X-API-Key: $KEY"`，否则拿到 401）
 - [ ] 出问题先想「谁在用这个 token」——它等价于账号登录态
 - [ ] 定期看 `/healthz` 的 `expires_at_ms`，确认续期正常
 

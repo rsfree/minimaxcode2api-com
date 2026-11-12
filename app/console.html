@@ -254,6 +254,7 @@ audio { width: 100%; margin-top: 10px; }
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
       <div class="row" style="margin-top:5px"><span id="navRegion">-</span> · <span id="navPool">-</span></div>
+      <div class="row" style="margin-top:5px"><a href="/ui/logout" onclick="document.cookie='mmx_ui=;max-age=0;path=/';localStorage.removeItem('mmx.key.v1')" class="dim" style="font-size:11.5px">退出登录</a></div>
     </div>
   </nav>
 
@@ -385,8 +386,8 @@ audio { width: 100%; margin-top: 10px; }
       <div class="box">
         <header><h3>可用模型 <span class="hint">GET /v1/models</span></h3></header>
         <div class="tbl-wrap"><table class="tbl" id="mdTable">
-          <thead><tr><th>ID</th><th>归属</th><th>上下文</th></tr></thead>
-          <tbody id="mdBody"><tr><td colspan="3"><div class="empty">加载中…</div></td></tr></tbody>
+          <thead><tr><th>ID</th><th>类型</th><th>上下文</th><th>能力</th></tr></thead>
+          <tbody id="mdBody"><tr><td colspan="4"><div class="empty">加载中…</div></td></tr></tbody>
         </table></div>
       </div>
     </section>
@@ -420,7 +421,13 @@ const $ = (id) => document.getElementById(id);
 const KEY_STORE = "mmx.key.v1";
 const THEME_STORE = "mmx.theme.v1";
 
-let apiKey = localStorage.getItem(KEY_STORE) || "";
+function cookieValue(name) {
+  const hit = document.cookie.split("; ").find((part) => part.startsWith(name + "="));
+  return hit ? decodeURIComponent(hit.slice(name.length + 1)) : "";
+}
+
+// 页面本身也走 api key 鉴权：登录后服务端会种 cookie，省得再输一次。
+let apiKey = localStorage.getItem(KEY_STORE) || cookieValue("mmx_ui") || "";
 let models = [];
 let chatHistory = [];
 let voicesLoaded = false;
@@ -521,7 +528,7 @@ if (!TITLES[(location.hash || "").slice(1)]) show("chat");
 /* ── 账号池 / 状态 ────────────────────────────────────────────────── */
 async function refreshAll() {
   try {
-    const res = await fetch("/healthz");
+    const res = await api("/healthz", {}, true);
     const data = await res.json();
     renderHealth(data, res.ok);
   } catch (e) {
@@ -574,16 +581,23 @@ function renderHealth(d, ok) {
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 async function loadModels() {
   try {
-    const res = await fetch("/v1/models");
+    const res = await api("/v1/models", {}, true);
     const data = await res.json();
     models = data.data || [];
-    $("model").innerHTML = models.map((m) => '<option value="' + esc(m.id) + '">' + esc(m.id) + "</option>").join("");
-    $("mdBody").innerHTML = models.map((m) =>
-      '<tr><td class="mono">' + esc(m.id) + '</td><td class="dim">' + esc(m.owned_by || "—") + '</td>' +
-      '<td class="mono">' + (m.context_length ? m.context_length.toLocaleString() : "—") + '</td></tr>'
-    ).join("") || '<tr><td colspan="3"><div class="empty">没有模型</div></td></tr>';
+    const chat = models.filter((m) => !m.type || m.type === "chat");
+    $("model").innerHTML = chat.map((m) => '<option value="' + esc(m.id) + '">' + esc(m.id) + "</option>").join("");
+    const KIND = { chat: "对话", image: "图像", audio: "语音/音乐", video: "视频" };
+    $("mdBody").innerHTML = models.map((m) => {
+      const caps = m.capabilities || {};
+      const bits = [caps.vision ? "视觉" : "", caps.reasoning ? "思考" : "", caps.thinking === "forced_on" ? "思考强制" : ""];
+      if (m.legacy) bits.push("旧版");
+      return '<tr><td class="mono">' + esc(m.id) + '</td>' +
+        '<td class="dim">' + esc(KIND[m.type] || m.type || "对话") + '</td>' +
+        '<td class="mono">' + (m.context_length ? m.context_length.toLocaleString() : "—") + '</td>' +
+        '<td class="dim">' + esc(bits.filter(Boolean).join(" · ") || "—") + '</td></tr>';
+    }).join("") || '<tr><td colspan="4"><div class="empty">没有模型</div></td></tr>';
   } catch (e) {
-    $("mdBody").innerHTML = '<tr><td colspan="3"><div class="empty">读取模型失败</div></td></tr>';
+    $("mdBody").innerHTML = '<tr><td colspan="4"><div class="empty">读取模型失败</div></td></tr>';
   }
 }
 
@@ -672,7 +686,7 @@ async function send() {
   if (!text) return;
   // 下拉框可能还没被 /v1/models 填上（打开页面立刻回车），此时退回第一个可用模型，
   // 否则会用空模型名发请求，回复气泡上也就没有模型标签。
-  let model = $("model").value || (models[0] && models[0].id) || "";
+  let model = $("model").value || (models.filter((m) => !m.type || m.type === "chat")[0] || {}).id || "";
   const stream = $("stream").checked;
 
   $("prompt").value = "";

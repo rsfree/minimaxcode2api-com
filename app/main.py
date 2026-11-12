@@ -23,20 +23,22 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     FileResponse,
+    HTMLResponse,
     JSONResponse,
     PlainTextResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
 
 from . import media
 from .auth import CredentialError, token_manager
-from .catalog import DEFAULT_MODEL, resolve_model, visible_models
+from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
 from .config import settings
 from .convert import (
     ConversionError,
@@ -195,16 +197,36 @@ def media_error_response(exc: MediaError) -> JSONResponse:
     return JSONResponse(status_code=exc.status, content=body)
 
 
+def _supplied_key(request: Request) -> str:
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    for name in ("x-api-key", "api-key"):
+        value = (request.headers.get(name) or "").strip()
+        if value:
+            return value
+    cookie = (request.cookies.get(UI_COOKIE) or "").strip()
+    if cookie:
+        return cookie
+    return (request.query_params.get("key") or "").strip()
+
+
 def _authorized(request: Request) -> bool:
     if not settings.api_keys:
         return True
-    token = ""
-    header = request.headers.get("authorization") or ""
-    if header.lower().startswith("bearer "):
-        token = header[7:].strip()
-    if not token:
-        token = (request.headers.get("x-api-key") or "").strip()
-    return bool(token) and token in settings.api_keys
+    return _supplied_key(request) in settings.api_keys
+
+
+def _is_loopback(request: Request) -> bool:
+    """True only for a direct, un-proxied call from the container itself.
+
+    A reverse proxy in front of the gateway also arrives from 127.0.0.1, so any
+    forwarding header means the caller is really remote and must send the key.
+    """
+    if request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip"):
+        return False
+    host = (request.client.host if request.client else "") or ""
+    return host in {"127.0.0.1", "::1", "localhost"}
 
 
 async def _read_json(request: Request) -> dict:
@@ -265,26 +287,130 @@ async def root() -> dict:
 
 CONSOLE_HTML = Path(__file__).with_name("console.html")
 
+# Cookie set by the login form so the console page itself is behind the same
+# key as the API. Readable by JS on purpose: the console needs the key for
+# `Authorization` on every fetch (localStorage is the other copy).
+UI_COOKIE = "mmx_ui"
+UI_COOKIE_MAX_AGE = 30 * 24 * 3600
+
+LOGIN_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>minimax-code2api · 登录</title>
+<style>
+  :root{color-scheme:dark light}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e8ecf2;
+       font:14px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  @media (prefers-color-scheme:light){body{background:#f6f7f9;color:#1a1d23}
+    .card{background:#fff;border-color:#e3e6eb;box-shadow:0 8px 30px rgba(15,17,21,.08)}
+    input{background:#f6f7f9;border-color:#dfe3e9;color:#1a1d23}}
+  .card{width:min(380px,92vw);padding:26px 24px;border:1px solid #242a34;border-radius:14px;
+        background:#14171d;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+  h1{margin:0 0 4px;font-size:16px;letter-spacing:.2px}
+  p{margin:0 0 18px;font-size:12.5px;color:#8b93a1}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  input{width:100%;padding:10px 12px;border-radius:9px;border:1px solid #2b323d;background:#0f1216;
+        color:inherit;font:inherit;outline:none}
+  input:focus{border-color:#3b82f6}
+  button{margin-top:12px;width:100%;padding:10px 12px;border:0;border-radius:9px;cursor:pointer;
+         background:#3b82f6;color:#fff;font:600 14px/1.4 inherit}
+  button:hover{background:#2f74e0}
+  .err{margin-top:12px;font-size:12.5px;color:#ef4444}
+  .foot{margin-top:16px;font-size:11.5px;color:#78808e}
+</style></head>
+<body><form class="card" method="post" action="/ui/login">
+  <h1>minimax-code2api</h1>
+  <p>输入部署时设置的 <code>GATEWAY_API_KEY</code></p>
+  <input type="password" name="key" placeholder="sk-..." autocomplete="current-password" autofocus required>
+  <button type="submit">进入控制台</button>
+  __ERROR__
+  <div class="foot">登录状态保存在 cookie，30 天有效。</div>
+</form></body></html>
+"""
+
+
+def _login_page(error: str = "") -> HTMLResponse:
+    markup = LOGIN_HTML.replace("__ERROR__", f'<div class="err">{error}</div>' if error else "")
+    return HTMLResponse(markup, status_code=401, headers={"cache-control": "no-store"})
+
 
 @app.get("/ui", include_in_schema=False)
 @app.get("/console", include_in_schema=False)
-async def console() -> FileResponse:
+async def console(request: Request):
     """Single-file console (chat / image / speech / pool / models).
 
-    No auth on the page itself: it is static HTML and every call it makes goes
-    through the same X-API-Key guard as any other client, so serving it openly
-    leaks nothing. Served with no-store so an upgraded image is picked up on the
-    next reload instead of sitting behind a cached copy.
+    Behind the same key as the API: the HTML itself is static, but the page
+    names the pool, shows every account label and spends the account credits,
+    so it is not something to leave open on a public IP. ``/ui?key=…`` logs in
+    once and plants the cookie; ``/ui/login`` is the form.
     """
-    return FileResponse(
+    if not _authorized(request):
+        return _login_page()
+    response = FileResponse(
         CONSOLE_HTML,
         media_type="text/html; charset=utf-8",
         headers={"cache-control": "no-store"},
     )
+    key = (request.query_params.get("key") or "").strip()
+    if key and key in settings.api_keys:
+        response.set_cookie(
+            UI_COOKIE,
+            key,
+            max_age=UI_COOKIE_MAX_AGE,
+            httponly=False,
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
+@app.post("/ui/login", include_in_schema=False)
+async def ui_login(request: Request):
+    """Form login. Accepts ``application/x-www-form-urlencoded`` or JSON."""
+    raw = (await request.body()).decode("utf-8", "ignore").strip()
+    key = ""
+    if raw.startswith("{"):
+        try:
+            key = str(json.loads(raw).get("key") or "").strip()
+        except json.JSONDecodeError:
+            key = ""
+    elif raw:
+        key = (parse_qs(raw).get("key") or [""])[0].strip()
+    if not key:
+        key = _supplied_key(request)
+    if key not in settings.api_keys and settings.api_keys:
+        return _login_page("密钥不对，检查 .env 里的 GATEWAY_API_KEY")
+    response = RedirectResponse(url="/ui", status_code=303)
+    if key:
+        response.set_cookie(
+            UI_COOKIE,
+            key,
+            max_age=UI_COOKIE_MAX_AGE,
+            httponly=False,
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
+@app.api_route("/ui/logout", methods=["GET", "POST"], include_in_schema=False)
+async def ui_logout() -> RedirectResponse:
+    response = RedirectResponse(url="/ui", status_code=303)
+    response.delete_cookie(UI_COOKIE, path="/")
+    return response
 
 
 @app.get("/healthz")
-async def healthz() -> JSONResponse:
+async def healthz(request: Request) -> JSONResponse:
+    # The body names every account label, so it is not public. The container
+    # healthcheck calls it over loopback and therefore needs no key.
+    if not (_authorized(request) or _is_loopback(request)):
+        return JSONResponse(
+            status_code=401,
+            content={"status": "unauthorized", "error": "send the gateway api key"},
+        )
     body: dict[str, Any] = {"status": "ok", "region": settings.region}
     body.update(token_manager.describe())
     body["base_url"] = settings.base_url
@@ -311,26 +437,25 @@ async def healthz() -> JSONResponse:
 
 @app.get("/v1/models")
 @app.get("/models")
-async def list_models(include_media: bool = False) -> dict:
+async def list_models(include_media: bool = True) -> dict:
+    """Every model the gateway can serve, chat models first.
+
+    Multimodal ids (`minimax-image`, `MiniMax-H3`, …) are included by default —
+    clients enumerate one list and a picker that silently hides half the
+    gateway is worse than an extra id — and carry ``type`` so they can be
+    filtered. ``?include_media=0`` gives the chat-only list.
+    """
     data = [model.to_openai() for model in visible_models()]
     if include_media:
-        data.extend(
-            [
-                {"id": "minimax-image", "object": "model", "owned_by": "minimax", "type": "image"},
-                {"id": "minimax-speech", "object": "model", "owned_by": "minimax", "type": "audio"},
-                {"id": "minimax-music", "object": "model", "owned_by": "minimax", "type": "audio"},
-                *[
-                    {"id": model, "object": "model", "owned_by": "minimax", "type": "video"}
-                    for model in media.VIDEO_MODELS
-                ],
-            ]
-        )
+        data.extend(model.to_openai() for model in visible_media_models())
     return {"object": "list", "data": data}
 
 
 @app.get("/v1/models/meta")
 async def list_models_meta() -> dict:
-    return {"object": "list", "data": [model.to_meta() for model in visible_models()]}
+    data = [model.to_meta() for model in visible_models()]
+    data.extend(model.to_meta() for model in visible_media_models())
+    return {"object": "list", "data": data}
 
 
 # ---------------------------------------------------------------------------
