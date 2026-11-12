@@ -399,28 +399,32 @@ def test_pool_adopts_rotated_credentials_from_file() -> None:
             settings.token_pool = original
 
 
-def test_refresh_recovers_when_the_file_is_ahead() -> None:
-    """A failed exchange retries once with the credential the file holds.
+def test_a_spent_refresh_token_is_never_presented() -> None:
+    """When the file already holds a newer pair, use it instead of refreshing.
 
-    This is the exact production sequence: the check-in thread rotates the pair
-    and writes it out, the gateway's renewal still presents the old refresh
-    token, upstream answers ``invalid_grant``. Parking the account there would
-    take a healthy account out of rotation for ten minutes at a time.
+    Measured on the live account host: reusing a rotated refresh token answers
+    ``invalid_grant`` *and* kills the access token that was minted moments
+    before — upstream reads a reused value as a leaked session. So the gateway
+    must check the file before exchanging anything; a stale in-memory copy (the
+    check-in thread rotated it first) is not evidence that a refresh is needed.
     """
     import tempfile
 
-    from app.auth import CredentialError, TokenPool
+    from app.auth import TokenPool
     from app.config import settings
+
+    def record(access: str, refresh: str, expires: int) -> str:
+        return json.dumps({
+            "email": "aaa@mail.example.com",
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAtMs": expires,
+        })
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         path = root / "aaa.json"
-        path.write_text(json.dumps({
-            "email": "aaa@mail.example.com",
-            "accessToken": "tok-old",
-            "refreshToken": "rt-old",
-            "expiresAtMs": 1_800_000_000_000,
-        }), encoding="utf-8")
+        path.write_text(record("tok-old", "rt-old", 1_800_000_000_000), encoding="utf-8")
 
         original = settings.token_pool
         settings.token_pool = str(root)
@@ -429,27 +433,63 @@ def test_refresh_recovers_when_the_file_is_ahead() -> None:
             live = pool.find("tok-old")
             assert live is not None
 
-            # The thread rotates and writes the file, then the gateway renews.
-            path.write_text(json.dumps({
-                "email": "aaa@mail.example.com",
-                "accessToken": "tok-new",
-                "refreshToken": "rt-new",
-                "expiresAtMs": 1_800_043_200_000,
-            }), encoding="utf-8")
+            # The check-in thread rotated and wrote the file, then the gateway
+            # hits a 401 and asks for a renewal.
+            path.write_text(record("tok-new", "rt-new", 1_800_043_200_000), encoding="utf-8")
 
             seen: list[str] = []
 
             async def fake_refresh(token) -> None:
                 seen.append(token.refresh_token or "")
-                if len(seen) == 1:
-                    raise CredentialError(f"refresh failed for {token.label}: invalid_grant")
                 token.access_token = "tok-refreshed"
                 return token
 
             pool._refresh = fake_refresh  # type: ignore[method-assign]
 
             assert asyncio.run(pool.renew(live)) is True
-            assert seen == ["rt-old", "rt-new"], seen
+            assert seen == [], "the spent refresh token reached the network"
+            assert live.access_token == "tok-new"
+            assert live.refresh_token == "rt-new"
+        finally:
+            settings.token_pool = original
+
+
+def test_expired_token_refreshes_once() -> None:
+    """A token that is genuinely spent (and not newer on disk) does refresh."""
+    import tempfile
+    import time
+
+    from app.auth import TokenPool
+    from app.config import settings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "aaa.json").write_text(json.dumps({
+            "email": "aaa@mail.example.com",
+            "accessToken": "tok-old",
+            "refreshToken": "rt-old",
+            "expiresAtMs": int(time.time() * 1000) - 60_000,
+        }), encoding="utf-8")
+
+        original = settings.token_pool
+        settings.token_pool = str(root)
+        try:
+            pool = TokenPool()
+            live = pool.find("tok-old")
+            assert live is not None and live.is_expired()
+
+            seen: list[str] = []
+
+            async def fake_refresh(token) -> None:
+                seen.append(token.refresh_token or "")
+                token.access_token = "tok-refreshed"
+                token.expires_at_ms = int(time.time() * 1000) + 43_200_000
+                return token
+
+            pool._refresh = fake_refresh  # type: ignore[method-assign]
+
+            assert asyncio.run(pool._refresh_once(live)) is not None
+            assert seen == ["rt-old"], seen
             assert live.access_token == "tok-refreshed"
         finally:
             settings.token_pool = original
@@ -1014,7 +1054,8 @@ def main() -> None:
         test_pool_hot_reload,
         test_pool_reload_survives_write_race,
         test_pool_adopts_rotated_credentials_from_file,
-        test_refresh_recovers_when_the_file_is_ahead,
+        test_a_spent_refresh_token_is_never_presented,
+        test_expired_token_refreshes_once,
         test_quota_errors_rotate,
         test_metrics_rollup,
         test_account_import_flow,

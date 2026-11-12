@@ -409,21 +409,30 @@ class TokenPool:
         return candidate is not None and self._adopt(token, candidate, force=True)
 
     async def _refresh_once(self, token: Token) -> Token:
-        """Refresh, retrying once with the on-disk value when that one was rotated.
+        """Make sure the live token carries a usable credential.
 
-        The check-in loop refreshes tokens in a worker thread and writes the new
-        pair straight to the file, so the in-memory refresh token can be spent
-        by the time a request needs it. Refreshing again with the stale value
-        earns ``invalid_grant`` and would park a perfectly healthy account.
+        The check-in loop refreshes in a worker thread and writes the new pair
+        straight to the file, so the in-memory refresh token can already be
+        spent by the time a request needs it. Upstream treats a *reused* refresh
+        token as a leak and revokes the whole session, not just that exchange —
+        observed on the live host: the second exchange with an old value answers
+        ``invalid_grant`` and the access token minted moments earlier stops
+        working too. So the file is checked *first*; a spent value must never be
+        presented just to find out.
         """
+        if self._resync(token) and not token.is_expired():
+            log.info("account %s: using the credential written to disk",
+                     token.label or token.short)
+            return token
         try:
             return await self._refresh(token)
         except CredentialError:
-            if not self._resync(token) or not token.refresh_token:
-                raise
-            log.info("account %s: adopted rotated credentials from disk, retrying",
-                     token.label or token.short)
-            return await self._refresh(token)
+            # Nothing newer on disk and the exchange was rejected: the refresh
+            # token itself is dead, so parking is correct. Re-check anyway —
+            # a writer may have landed a pair during the round trip.
+            if self._resync(token) and token.access_token:
+                return token
+            raise
 
     async def _refresh(self, token: Token) -> Token:
         if not token.refresh_token:
