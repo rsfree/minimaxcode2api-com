@@ -51,12 +51,28 @@ def _number(value) -> float | None:
 
 
 def summarize_membership(payload: dict) -> dict:
-    """Fold ``get_membership_info`` into the few numbers the console shows."""
+    """Fold ``get_membership_info`` into the few numbers the console shows.
+
+    The spendable figure is the ``op_credit_summary`` total (free + purchased).
+    ``total_remains_credit`` — the obvious-looking field — reads 0 on every
+    account we have ever probed, including ones holding 400 free credits, so it
+    is kept only as a last-resort fallback and reported separately for debugging.
+    """
     summary = payload.get("op_credit_summary") or {}
-    credit = _number(payload.get("total_remains_credit"))
+    op_total = _number(summary.get("total_remaining_amount"))
+    legacy = _number(payload.get("total_remains_credit"))
+    op_balance = _number(payload.get("opcredit_balance"))
+    if op_total is not None:
+        total = op_total
+    elif legacy is not None:
+        total = legacy
+    else:
+        total = op_balance
     return {
-        "credit": credit,
-        "op_credit": _number(payload.get("opcredit_balance")),
+        "total": total,
+        "credit": total,          # console-facing alias for the headline number
+        "legacy_credit": legacy,  # total_remains_credit, for troubleshooting only
+        "op_credit": op_balance,
         "free": _number(summary.get("free_remaining_amount")),
         "purchased": _number(summary.get("purchased_remaining_amount")),
         "gift": _number(payload.get("daily_login_gift_credit_remaining")),

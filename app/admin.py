@@ -323,22 +323,22 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
             "text": "探针尚未采到会员余额，有偿积分台账也没有在用批次（免费号本来就没有）。"
                     "点「刷新探针」拉一次余额；在此之前请按请求量和成功率判断供给。",
         })
-    elif balance_known and (balance or 0) < 0:
+    elif balance_known and (balance or 0) > 0:
         advice.append({
-            "level": "warn",
-            "title": f"积分余额合计 {round(remaining)}（已为负）",
-            "text": f"{totals.get('balance_negative', 0)} 个号把额度用成了负数，"
-                    f"{totals.get('balance_zero', 0)} 个号是 0。Free 计划的额度按日发、不累计成积分，"
-                    "负数不会拦请求，但它是「这批号确实在欠着用」的信号："
-                    "真跑空的时候上游回 402 insufficient balance，网关会冷却换号。",
+            "level": "ok",
+            "title": f"可用积分合计 {round(remaining)}",
+            "text": f"{totals.get('balance_accounts', 0)} 个号采到余额，"
+                    f"其中 {totals.get('balance_zero', 0)} 个是 0（今天已花完或还没签到）。"
+                    "余额只统计显式可花的积分（免费 + 付费）；免费额度按天另算，"
+                    "所以 0 的号仍可能在跑，真跑空时回 402 并冷却到次日重置。",
         })
     elif balance_known:
         advice.append({
             "level": "info",
-            "title": f"积分余额合计 {round(remaining)}",
-            "text": f"{totals.get('balance_accounts', 0)} 个号采到余额，计划分布 "
-                    + "、".join(f"{k} {v}" for k, v in (totals.get("plans") or {}).items())
-                    + "。免费计划的日额度不折算成积分，所以 0 是常态。",
+            "title": "所有号的可用积分都是 0",
+            "text": "要么今天的 400 分还没领（点「全部签到」），要么已经花完。"
+                    "0 不等于不能用：免费额度与积分分开计，真跑空时上游回 402，网关冷却到次日重置。",
+            "action": "signin",
         })
     if drain_per_day <= 0:
         advice.append({

@@ -457,7 +457,7 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
         <div class="stat"><div class="v" id="sInflight">-</div><div class="k">在途</div></div>
         <div class="stat warn"><div class="v" id="sClaimable">-</div><div class="k">今日可签积分</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k"
-          title="上游会员接口 total_remains_credit 的池内汇总。可正可负：负数=用超了授予的积分包；Free 计划的日额度按天发、不折算成积分，所以 0 是常态，不代表不能用。真跑空时上游回 402 insufficient balance，网关会冷却换号。">积分余额 <span class="dim" id="sCreditsNote"></span></div></div>
+          title="上游会员接口的可用积分（免费 + 付费）汇总，每 PROBE_INTERVAL 秒采一次。400 = 今天签到到账还没花；0 = 花完了或者还没签到。它不等于「能不能用」：免费额度按天另算，真跑空时上游回 402，网关会冷却到次日重置。">积分余额 <span class="dim" id="sCreditsNote"></span></div></div>
       </div>
 
       <div class="alertbar" id="alertBar" hidden></div>
@@ -989,14 +989,14 @@ async function loadOverview() {
   $("sDisabled").textContent = p.disabled;
   $("sInflight").textContent = p.in_flight;
   $("sClaimable").textContent = t.claimable_today || 0;
-  // 真实余额来自会员接口（可正可负）；None 才是「还没采到」。0 是 Free 计划的常态，
-  // 不能像旧版那样当成「没有数据」——这正是之前一直显示破折号的原因。
+  // 真实余额来自会员接口（免费 + 付费）；None 才是「还没采到」。0 是有效值：
+  // 要么今天的分花完了，要么还没签到。旧版把 0 当成「没有数据」画破折号，正是它看着像坏了的原因。
   const bal = t.balance;
   const balKnown = bal != null;
   $("sCredits").textContent = balKnown ? num(bal) : "—";
-  $("sCredits").parentElement.className = "stat " + (balKnown ? (bal < 0 ? "bad" : bal > 0 ? "good" : "") : "");
+  $("sCredits").parentElement.className = "stat " + (balKnown ? (bal > 0 ? "good" : bal < 0 ? "bad" : "") : "");
   $("sCreditsNote").textContent = balKnown
-    ? (t.balance_negative ? t.balance_negative + " 个号为负" : (t.balance_zero ? "全部为 0（Free）" : "汇总"))
+    ? (t.balance_zero ? t.balance_zero + "/" + t.balance_accounts + " 个为 0" : "")
     : "待采样";
   $("accHint").textContent = p.pool_watch_seconds
     ? "新账号 " + p.pool_watch_seconds + " 秒内自动进池"

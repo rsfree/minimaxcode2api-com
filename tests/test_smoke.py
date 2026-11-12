@@ -527,16 +527,23 @@ def test_balance_surfacing() -> None:
         "total_remains_credit": -72,
         "opcredit_balance": 0,
         "op_credit_summary": {
-            "total_remaining_amount": "0",
+            "total_remaining_amount": "400",
             "purchased_remaining_amount": "0",
-            "free_remaining_amount": "0",
+            "free_remaining_amount": "400",
         },
         "daily_login_gift_credit_remaining": 0,
         "has_token_plan": False,
         "expires_at": 0,
     })
-    assert info["credit"] == -72 and info["plan"] == "Free"
-    assert info["free"] == 0 and info["purchased"] == 0
+    # The spendable number is the op_credit total; total_remains_credit is a
+    # decoy that reads 0 (or stale negatives) on these accounts.
+    assert info["total"] == 400 and info["credit"] == 400
+    assert info["legacy_credit"] == -72
+    assert info["free"] == 400 and info["purchased"] == 0
+
+    # No op_credit_summary → fall back to the legacy field rather than showing 0.
+    legacy_only = summarize_membership({"total_remains_credit": -72})
+    assert legacy_only["total"] == -72 and legacy_only["free"] is None
 
     # A sparse payload must not explode, and absent decimals stay None (not 0):
     # "unknown" and "zero" are different answers.
