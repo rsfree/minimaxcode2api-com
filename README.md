@@ -58,7 +58,7 @@
 ## 二、30 秒跑起来（本机已登录桌面端）
 
 ```bash
-git clone <this-repo> && cd minimax-code2api
+git clone https://github.com/rsfree/minimaxcode2api-com.git && cd minimaxcode2api-com
 python -m venv .venv && .venv/bin/pip install -r requirements.txt   # Windows: .venv\Scripts\pip
 
 GATEWAY_API_KEY=sk-local .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
@@ -74,6 +74,16 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 服务器部署请看 **[DEPLOY.md](DEPLOY.md)**（含出口网络要求、Docker、反代、排障）。
+
+不想自己构建就用现成镜像，每次 push 自动构建并跑过冒烟才推上去：
+
+```bash
+docker pull ghcr.io/rsfree/minimaxcode2api-com:latest
+```
+
+tag 有三个：`latest`、`master`、`sha-<7位>`（打 `v*` 标签时另有 semver）。
+镜像页在仓库右侧 **Packages**，或直接访问
+[ghcr.io/rsfree/minimaxcode2api-com](https://github.com/rsfree/minimaxcode2api-com/pkgs/container/minimaxcode2api-com)。
 
 ---
 

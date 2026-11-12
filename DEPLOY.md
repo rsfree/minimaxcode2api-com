@@ -72,14 +72,15 @@ UPSTREAM_PROXY=socks5://10.0.0.5:1080
 
 **方式 A：直接拉 GHCR（推荐）**
 
-镜像发布在仓库右侧 **Packages** 页面。
+镜像发布在仓库右侧 **Packages** 页面，**公开可拉，不需要登录**：
 
 ```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
 docker pull ghcr.io/rsfree/minimaxcode2api-com:latest
 ```
 
-> 包是私有的，`GHCR_TOKEN` 需要一个带 `read:packages` 的 PAT。
+> 若你把包改成了私有，才需要先登录：
+> `echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin`
+> （`GHCR_TOKEN` 需要一个带 `read:packages` 的 PAT）
 
 **方式 B：离线包**（CI 每次构建都会产出，保留 7 天）
 

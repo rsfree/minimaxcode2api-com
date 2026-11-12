@@ -8,6 +8,7 @@ ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="minimax-code2api" \
       org.opencontainers.image.description="OpenAI/Anthropic compatible gateway for the MiniMax Code managed channel" \
+      org.opencontainers.image.source="https://github.com/rsfree/minimaxcode2api-com" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${VCS_REF}" \
