@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 
+from . import curl_transport
 from .auth import CredentialError, token_manager
 from .config import API_KEY_PLACEHOLDER, settings
 
@@ -68,9 +69,57 @@ def _mcp_headers(token: str) -> dict[str, str]:
     }
 
 
+class UpstreamResponse:
+    """Uniform view over an httpx response and a curl stream."""
+
+    def __init__(self, httpx_response=None, curl_stream=None) -> None:
+        self._h = httpx_response
+        self._c = curl_stream
+
+    @property
+    def status_code(self) -> int:
+        return self._h.status_code if self._h is not None else self._c.status
+
+    @property
+    def headers(self):
+        return self._h.headers if self._h is not None else self._c.headers
+
+    async def aread(self) -> bytes:
+        if self._h is not None:
+            return await self._h.aread()
+        return await self._c.read()
+
+    async def aclose(self) -> None:
+        if self._h is not None:
+            await self._h.aclose()
+        elif self._c is not None:
+            await self._c.close()
+
+    async def aiter_lines(self):
+        if self._h is not None:
+            async for line in self._h.aiter_lines():
+                yield line
+        else:
+            async for raw in self._c.lines():
+                yield raw.decode("utf-8", "ignore").rstrip("\r\n")
+
+    async def aiter_bytes(self):
+        if self._h is not None:
+            async for chunk in self._h.aiter_bytes():
+                yield chunk
+        else:
+            stdout = self._c.proc.stdout
+            while True:
+                chunk = await stdout.read(16384)
+                if not chunk:
+                    break
+                yield chunk
+
+
 class Upstream:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._force_curl = settings.upstream_transport == "curl"
 
     async def startup(self) -> None:
         if self._client is not None:
@@ -82,10 +131,11 @@ class Upstream:
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
         )
         log.info(
-            "upstream ready base_url=%s proxy=%s region=%s",
+            "upstream ready base_url=%s proxy=%s region=%s transport=%s",
             settings.base_url,
             settings.upstream_proxy or "-",
             settings.region,
+            "curl" if self._force_curl else settings.upstream_transport,
         )
 
     async def shutdown(self) -> None:
@@ -99,28 +149,58 @@ class Upstream:
             raise RuntimeError("upstream client not started")
         return self._client
 
-    async def _send(self, payload: dict, stream: bool) -> httpx.Response:
-        await self.startup()
-        token = await token_manager.get()
+    async def _dispatch(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict[str, str],
+        stream: bool,
+        timeout: float | None = None,
+    ) -> UpstreamResponse:
+        """POST through httpx, falling back to curl when the egress rejects OpenSSL."""
+        if not self._force_curl:
+            try:
+                kwargs = {"timeout": timeout} if timeout else {}
+                request = self.client.build_request("POST", url, json=payload, headers=headers, **kwargs)
+                response = await self.client.send(request, stream=stream)
+                return UpstreamResponse(httpx_response=response)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+                if settings.upstream_transport == "httpx":
+                    raise
+                log.warning(
+                    "httpx egress failed (%s); switching to the curl transport", type(exc).__name__
+                )
+                self._force_curl = True
+        curl_stream = await curl_transport.open_post(
+            url,
+            headers,
+            payload,
+            timeout or settings.request_timeout,
+            settings.upstream_proxy or None,
+        )
+        return UpstreamResponse(curl_stream=curl_stream)
 
-        attempt = 0
-        while True:
-            attempt += 1
-            request = self.client.build_request(
-                "POST",
-                settings.messages_url,
-                json=payload,
-                headers=_headers(token),
+    async def _send(self, payload: dict, stream: bool) -> UpstreamResponse:
+        await self.startup()
+
+        tried: set[str] = set()
+        last: UpstreamError | None = None
+        attempts = max(1, len(getattr(token_manager, "_tokens", []) or [1]))
+
+        for _ in range(attempts + 1):
+            try:
+                token = await token_manager.acquire(exclude=tried)
+            except CredentialError as exc:
+                raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
+            tried.add(token.access_token or token.label)
+
+            response = await self._dispatch(
+                settings.messages_url, payload, _headers(token.access_token), stream
             )
-            response = await self.client.send(request, stream=stream)
 
             if response.status_code in {301, 302, 307, 308}:
                 location = response.headers.get("location", "?")
-                if stream:
-                    await response.aclose()
-                else:
-                    await response.aread()
-                    await response.aclose()
+                await response.aclose()
                 raise UpstreamError(
                     502,
                     REDIRECT_HINT.format(
@@ -128,20 +208,46 @@ class Upstream:
                     ),
                 )
 
-            if response.status_code == 401 and attempt == 1:
-                if stream:
-                    await response.aclose()
-                else:
-                    await response.aread()
-                    await response.aclose()
-                log.warning("upstream rejected the token; refreshing once")
-                try:
-                    token = await token_manager.get(force=True)
-                except CredentialError as exc:
-                    raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
+            if response.status_code == 400:
+                # An account may simply lack the requested model. Try the next
+                # account before surfacing the error; only give up when every
+                # account has been tried.
+                body = await response.aread()
+                await response.aclose()
+                err = _error_from(400, body)
+                if "unknown model" in err.message.lower() and len(tried) < attempts:
+                    log.warning(
+                        "account %s lacks this model; trying next", token.label or token.short
+                    )
+                    last = err
+                    continue
+                raise err
+
+            if response.status_code in {401, 402, 403, 429}:
+                body = await response.aread()
+                await response.aclose()
+                last = _error_from(response.status_code, body)
+
+                # A 401 may just be a rotated token: refresh once, then keep it.
+                if response.status_code == 401 and await token_manager.renew(token):
+                    retry = await self._dispatch(
+                        settings.messages_url, payload, _headers(token.access_token), stream
+                    )
+                    if retry.status_code == 200:
+                        return retry
+                    body = await retry.aread()
+                    await retry.aclose()
+                    last = _error_from(retry.status_code, body)
+
+                token_manager.park(token, response.status_code, last.message)
+                log.warning(
+                    "account %s failed (%s); trying next", token.label or token.short, response.status_code
+                )
                 continue
 
             return response
+
+        raise last or UpstreamError(502, "no account could serve the request")
 
     async def messages(self, payload: dict) -> dict:
         response = await self._send(payload, stream=False)
@@ -154,7 +260,7 @@ class Upstream:
         except ValueError as exc:  # pragma: no cover - upstream contract change
             raise UpstreamError(502, f"upstream returned non-JSON: {body[:300]!r}") from exc
 
-    async def messages_stream(self, payload: dict) -> httpx.Response:
+    async def messages_stream(self, payload: dict) -> UpstreamResponse:
         response = await self._send(payload, stream=True)
         if response.status_code != 200:
             body = await response.aread()
@@ -170,43 +276,47 @@ class Upstream:
         check.
         """
         await self.startup()
-        token = await token_manager.get()
         url = f"{settings.mcp_url}/{tool}"
 
-        attempt = 0
-        while True:
-            attempt += 1
-            request = self.client.build_request(
-                "POST",
-                url,
-                json=payload,
-                headers=_mcp_headers(token),
-                timeout=timeout,
-            )
-            response = await self.client.send(request)
+        tried: set[str] = set()
+        last: UpstreamError | None = None
+        attempts = max(1, len(getattr(token_manager, "_tokens", []) or [1]))
+
+        for _ in range(attempts + 1):
+            try:
+                token = await token_manager.acquire(exclude=tried)
+            except CredentialError as exc:
+                raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
+            tried.add(token.access_token or token.label)
+
+            response = await self._dispatch(url, payload, _mcp_headers(token.access_token), False, timeout)
             body = await response.aread()
+            status = response.status_code
+            location = response.headers.get("location", "?")
             await response.aclose()
 
-            if response.status_code in {301, 302, 307, 308}:
+            if status in {301, 302, 307, 308}:
                 raise UpstreamError(
                     502,
                     REDIRECT_HINT.format(
-                        location=response.headers.get("location", "?"),
-                        region=settings.region,
-                        base_url=settings.base_url,
+                        location=location, region=settings.region, base_url=settings.base_url
                     ),
                 )
 
-            if response.status_code == 401 and attempt == 1:
-                log.warning("mcp %s rejected the token; refreshing once", tool)
-                try:
-                    token = await token_manager.get(force=True)
-                except CredentialError as exc:
-                    raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
-                continue
+            if status in {401, 402, 403, 429}:
+                last = _error_from(status, body)
+                if status == 401 and await token_manager.renew(token):
+                    retry = await self._dispatch(url, payload, _mcp_headers(token.access_token), False, timeout)
+                    body = await retry.aread()
+                    status = retry.status_code
+                    await retry.aclose()
+                if status != 200:
+                    token_manager.park(token, status, last.message if last else f"HTTP {status}")
+                    log.warning("mcp %s: account %s failed (%s)", tool, token.label or token.short, status)
+                    continue
 
-            if response.status_code != 200:
-                raise _error_from(response.status_code, body)
+            if status != 200:
+                raise _error_from(status, body)
 
             import json
 
@@ -217,6 +327,8 @@ class Upstream:
             if not isinstance(decoded, dict):
                 raise UpstreamError(502, f"unexpected upstream payload: {body[:300]!r}")
             return decoded
+
+        raise last or UpstreamError(502, "no account could serve the request")
 
 
 def _error_from(status: int, body: bytes) -> UpstreamError:

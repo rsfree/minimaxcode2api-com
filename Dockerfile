@@ -18,9 +18,16 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     APP_VERSION="${VERSION}" \
+    TOKEN_POOL=/data/tokens \
     TOKEN_STORE=/data/token.json
 
 WORKDIR /app
+
+# curl backs the optional curl transport (UPSTREAM_TRANSPORT=curl) and the
+# provisioning CLI. It is small and only pulled in for these two jobs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

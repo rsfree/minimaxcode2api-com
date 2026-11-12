@@ -66,12 +66,17 @@ class Settings:
 
     # Egress. Required on networks whose IP gets a 307 to the legacy CN origin.
     upstream_proxy: str = field(default_factory=lambda: _env("UPSTREAM_PROXY"))
+    # httpx | curl | auto. ``curl`` is for egress proxies that reset Python's
+    # TLS handshake but accept the system curl (Windows schannel).
+    upstream_transport: str = field(default_factory=lambda: _env("UPSTREAM_TRANSPORT", "auto").lower())
 
     # Credentials, in priority order.
     access_token: str = field(default_factory=lambda: _env("MINIMAX_ACCESS_TOKEN"))
     refresh_token: str = field(default_factory=lambda: _env("MINIMAX_REFRESH_TOKEN"))
     auth_file: str = field(default_factory=lambda: _env("MINIMAX_AUTH_FILE"))
     token_store: str = field(default_factory=lambda: _env("TOKEN_STORE", "/data/token.json"))
+    # Directory of ``*.json`` account files (or a single JSON file / array).
+    token_pool: str = field(default_factory=lambda: _env("TOKEN_POOL"))
 
     # Gateway side.
     api_keys: list[str] = field(default_factory=list)

@@ -21,6 +21,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -63,6 +64,41 @@ app = FastAPI(
     description="OpenAI/Anthropic compatible gateway for the MiniMax Code managed channel.",
     lifespan=lifespan,
 )
+
+
+class AbsoluteTargetMiddleware:
+    """Accept absolute-form request targets.
+
+    Any client built on httpx obeys ``HTTP_PROXY`` for *every* host, localhost
+    included. When a proxy sits in the environment the request line becomes
+    ``POST http://127.0.0.1:8099/v1/chat/completions`` instead of an origin-form
+    path, Starlette matches the whole URL as the path, and every endpoint
+    answers 404. Rewriting the target back to origin-form keeps those clients
+    working without asking the user to unset proxy variables.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            path = _origin_form(scope.get("path", ""))
+            if path is not None:
+                scope = dict(scope)
+                scope["path"] = path
+                scope["raw_path"] = path.encode()
+        await self.inner(scope, receive, send)
+
+
+def _origin_form(path: str) -> str | None:
+    candidate = unquote(path) if "%" in path else path
+    if not candidate.lower().startswith(("http://", "https://")):
+        return None
+    parsed = urlsplit(candidate)
+    return parsed.path or "/"
+
+
+app.add_middleware(AbsoluteTargetMiddleware)
 
 
 # ---------------------------------------------------------------------------

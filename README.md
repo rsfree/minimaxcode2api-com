@@ -77,6 +77,83 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ---
 
+## 二点五、多账号池（多份额度轮着用）
+
+一个账号的额度有限。网关支持把多个账号放进 `TOKEN_POOL`，请求按轮询分摊，
+某个号 401/402/429 就自动停用一段时间再换下一个，不会把整个网关拖死。
+
+### 建池
+
+邮箱 + 密码即可，**不需要浏览器、不需要验证码、不需要邮箱收信**：
+
+```bash
+# 单个账号
+python -m app.provision --email someone@mail.example --password 'secret'
+
+# 批量：accounts.txt 每行 "邮箱<tab>密码"（空格分隔也行）
+python -m app.provision --file accounts.txt
+
+# 手工续期池里所有 token（平时不用跑，网关会自己续）
+python -m app.provision --refresh
+```
+
+生成的文件长这样，一个账号一个文件：
+
+```json
+{
+  "region": "en",
+  "email": "someone@mail.example",
+  "username": "MiniMax322212",
+  "user_id": "576841688080293888",
+  "group_id": "2120731921469153576",
+  "accessToken": "mmoat_...",
+  "refreshToken": "mmort_...",
+  "expiresAtMs": 1794511512549
+}
+```
+
+> `refreshToken` 每次续期都会轮换，网关会就地写回文件，**不要手工拷贝旧值**。
+
+### 启动
+
+```bash
+TOKEN_POOL=./data/tokens UPSTREAM_PROXY=http://127.0.0.1:7890 \
+GATEWAY_API_KEY=sk-local python -m uvicorn app.main:app --port 8080
+```
+
+### 看池状态
+
+`GET /healthz` 不返回任何 token，只报每个账号是否可用、用了几次、冷却多久：
+
+```bash
+curl -s http://127.0.0.1:8080/healthz | python -m json.tool
+```
+
+```json
+{
+  "status": "ok",
+  "pool_size": 8,
+  "accounts": [
+    {"label": "someone@mail.example", "usable": true, "uses": 12,
+     "cooling_for": 0, "last_error": null}
+  ]
+}
+```
+
+### 失效行为
+
+| 上游返回 | 网关动作 |
+|---|---|
+| `401` | 先尝试刷新一次；仍失败则停用该账号 10 分钟，换下一个 |
+| `402` / `429` | 停用 15 分钟 / 1 分钟，换下一个 |
+| `400 unknown model` | 该号没有这个模型的权限，换下一个账号重试 |
+| `307` 跳转 | 直接报配置错误，提示换出口代理（跳转会丢 Authorization） |
+
+全池都不可用时才返回 `502`。所有账号的 `accessToken` 12 小时过期，但有
+`refreshToken` 兜底，长期不用管。
+
+---
+
 ## 三、接口
 
 ### 3.1 OpenAI 协议
@@ -302,6 +379,8 @@ flowchart LR
 | `GATEWAY_API_KEY` | 空 | 调用方要带的 key，逗号分隔多个。**公网部署必须设** |
 | `MINIMAX_REGION` | `en` | `en`（国际站）或 `cn`（国内站） |
 | `UPSTREAM_PROXY` | 空 | 上游出口代理。**国内网络必须设**，见 DEPLOY.md 第一节 |
+| `UPSTREAM_TRANSPORT` | `auto` | `auto` / `httpx` / `curl`。出口代理会重置 Python TLS 握手时用 `curl` |
+| `TOKEN_POOL` | 空 | **多账号池目录**，一个账号一个 json。设了就优先用它轮询 |
 | `MINIMAX_ACCESS_TOKEN` | 空 | 直接给一个 access token（约 12h 失效） |
 | `MINIMAX_REFRESH_TOKEN` | 空 | 只给 refresh token，网关自己续期 |
 | `TOKEN_STORE` | `/data/token.json` | 网关自己管理的 token 文件，会就地刷新 |
@@ -329,6 +408,9 @@ flowchart LR
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单 | 充值，或换 `MiniMax-Hailuo-2.3`（比 H3 便宜） |
 | `reference_images` 不生效 | 参考图必须是**公网可达 URL**，本地路径网关读不到 | 先上传到图床 / OSS 再传 URL |
 | Credits 用完 | 这是账号额度，不是 API 配额 | 桌面端充值，或换官方开放平台 Key |
+| SDK 报 `404` + `{"detail":"Not Found"}`，但 `curl` 同一条 URL 正常 | 环境里有 `HTTP_PROXY`，httpx 连 `127.0.0.1` 也走代理，请求行变成 `POST http://127.0.0.1:8099/v1/...`，框架把整串当路径 | 已内置中间件把它还原成 origin-form；旧版本请给客户端设 `NO_PROXY=127.0.0.1,localhost` |
+| 池子里某个号一直不被使用 | 该号没有对应模型的权限，`400 unknown model` 后被自动跳过 | 正常，看 `/healthz` 的 `last_error` |
+| 日志里 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF_WHILE_READING` | 出口代理只放行 Windows schannel 指纹，拒绝 Python/OpenSSL 握手 | 保持 `UPSTREAM_TRANSPORT=auto`，会自动退回 curl（镜像已装 curl） |
 
 ---
 

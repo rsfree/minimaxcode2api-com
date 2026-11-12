@@ -160,6 +160,57 @@ MINIMAX_AUTH_FILE=/host-minimax/auth.json
 
 网关每次请求都会重读该文件，桌面端刷新 token 后自动生效。
 
+### 3.4 邮箱 + 密码批量开户（多账号池，一份额度不够时用这个）
+
+一台机器挂多个账号，请求按轮询摊到各账号的额度上。**不需要浏览器、不需要验证码、
+不需要进邮箱**——密码登录协议由 `app/account_api.py` 直接实现（RSA 加密密码 +
+签名头），设备授权那一段也一并走完。
+
+准备一个账号文件，一行一个，用 Tab 或空格分隔：
+
+```text
+# accounts.txt
+aaa@mail.example.com   Pa55word1
+bbb@mail.example.com   Pa55word1
+```
+
+逐条开户，token 落进 `/data/tokens/<label>.json`：
+
+```bash
+docker run --rm -v "$PWD/data:/data" \
+  ghcr.io/jushenzhidao/minimax-code2api:latest \
+  python -m app.provision --file /data/accounts.txt --out /data/tokens
+```
+
+```
+aaa@mail.example.com  OK   expires_in=43200  groups=1
+bbb@mail.example.com  OK   expires_in=43200  groups=1
+2/2 provisioned
+```
+
+单条也可以：
+
+```bash
+python -m app.provision --email aaa@mail.example.com --password 'Pa55word1' --out /data/tokens
+```
+
+已有的 token 续期（refresh token 会轮换，就地覆盖原文件）：
+
+```bash
+python -m app.provision --refresh --out /data/tokens
+```
+
+然后把 `.env` 里的凭证来源换成池子：
+
+```dotenv
+TOKEN_POOL=/data/tokens
+```
+
+不带 `TOKEN_POOL` 时仍走 `TOKEN_STORE` 单 token，两者不冲突，池子优先。
+
+> **一个账号没有某个模型的权限是正常的**（例如个别号没有 M3.1）。网关收到
+> `400 unknown model` 会自动换下一个账号重试，不会把错误抛给客户端。
+
 ---
 
 ## 4. 配置 `.env`
@@ -180,6 +231,8 @@ UPSTREAM_PROXY=http://10.0.0.5:7890      # 第 0 节判定需要时才填
 ```dotenv
 MINIMAX_REGION=en                 # 账号注册在国际站就填 en
 TOKEN_STORE=/data/token.json
+TOKEN_POOL=/data/tokens           # 多账号池目录，设了就优先轮询它
+UPSTREAM_TRANSPORT=auto           # auto / httpx / curl，出口代理重置 Python TLS 时用 curl
 DEFAULT_MAX_TOKENS=8192
 GATEWAY_PORT=8080
 ```
@@ -225,8 +278,14 @@ KEY=你的GATEWAY_API_KEY
 
 ```bash
 curl -s $BASE/healthz
+# 单 token：
 # {"status":"ok","region":"en","source":"auth_file","cached":true,"expires_at_ms":...,"base_url":"...","proxy":true}
+# 账号池：
+# {"status":"ok","region":"en","pool_size":8,"accounts":[{"label":"aaa@mail.example.com","usable":true,...}]}
 ```
+
+池子里 `usable:true` 的条数就是还能用的账号数；`cooling_for` 是剩余冷却秒数，
+`last_error` 是上次被摘下来的原因。
 
 **② 鉴权生效：无 key 必须 401**
 
@@ -420,6 +479,9 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | 视频查询 `503` + `status: succeeded` | 上游渲染完成但未能交付文件 | 隔几分钟轮询同一 `task_id`，**别重新提交** |
 | 多模态全部 `502`，日志里有 `307` | 出口不行（和聊天是同一个根因） | 配 `UPSTREAM_PROXY`，MCP 走同一个出口 |
 | `reference_images` 没效果 | 传的是本地路径，上游只认公网 URL | 先上传图床/OSS 再传链接 |
+| SDK 报 `404` + `{"detail":"Not Found"}`，curl 却正常 | 环境里有 `HTTP_PROXY`，httpx 对 localhost 也走代理，请求行变成绝对 URL，Starlette 把它当路径 | 已由内置中间件兼容；1.0.0 之前的版本请给客户端设 `NO_PROXY=127.0.0.1,localhost` |
+| `pool_size` 有值但总是不用某个号 | 该号缺对应模型权限，`400 unknown model` 后被自动跳过 | 正常行为，看 `/healthz` 的 `last_error` |
+| 日志 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF` | 出口代理只放行 Windows schannel 指纹，拒 Python/OpenSSL 握手 | 留着 `UPSTREAM_TRANSPORT=auto` 让它自动退回 curl（镜像已装 curl） |
 
 看实时日志定位：
 
