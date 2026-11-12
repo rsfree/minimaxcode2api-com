@@ -153,6 +153,10 @@ class TokenPool:
     def _load(self) -> None:
         self._tokens = []
         index = 0
+        # Snapshot first. If a file lands while we are reading, the stored
+        # signature stays stale and the next watcher tick reloads again — the
+        # other order silently forgets a file that appeared mid-read.
+        signature = self._pool_signature()
 
         if settings.access_token:
             self._tokens.append(Token(access_token=settings.access_token, label="env", index=index))
@@ -203,7 +207,7 @@ class TokenPool:
             )
 
         self._loaded = True
-        self._signature = self._pool_signature()
+        self._signature = signature
         log.info("token pool loaded: %d account(s) %s",
                  len(self._tokens), [t.label or t.short for t in self._tokens] if self._tokens else "")
 
@@ -247,6 +251,11 @@ class TokenPool:
             if not settings.token_pool:
                 return {"added": 0, "removed": 0, "pool_size": len(self._tokens)}
             root = Path(settings.token_pool).expanduser()
+            # Same ordering rule as _load: the signature describes the state we
+            # are about to read, not the state after it. A file written during
+            # the read then leaves the signature stale, so the next scan retries
+            # instead of believing it already loaded everything.
+            signature = self._pool_signature()
             fresh: list[tuple[str, Token]] = []
             for path in _pool_files(root):
                 try:
@@ -282,7 +291,7 @@ class TokenPool:
             for position, token in enumerate(merged):
                 token.index = position
             self._tokens = merged
-            self._signature = self._pool_signature()
+            self._signature = signature
             if added or removed:
                 log.info("pool reloaded: %d account(s) (+%d/-%d)", len(self._tokens), added, removed)
             return {"added": added, "removed": removed, "pool_size": len(self._tokens)}

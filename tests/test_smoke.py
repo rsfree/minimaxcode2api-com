@@ -285,6 +285,58 @@ def test_pool_hot_reload() -> None:
             settings.token_pool = original
 
 
+def test_pool_reload_survives_write_race() -> None:
+    """A file that lands while the pool is being read must not be lost forever.
+
+    This actually happened in production: 12 accounts were provisioned in a loop,
+    the watcher read the directory just before the last file was written, then
+    recorded the *post-write* signature — so the account never joined the pool
+    until something else touched the directory. Snapshotting the signature
+    before the read makes the next tick retry.
+    """
+    import tempfile
+
+    from app import auth as auth_module
+    from app.auth import TokenPool
+    from app.config import settings
+
+    def record(name: str) -> str:
+        return json.dumps(
+            {"email": f"{name}@mail.example.com", "accessToken": f"tok-{name}", "expiresAtMs": 4102444800000}
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "aaa.json").write_text(record("aaa"), encoding="utf-8")
+
+        original_pool = settings.token_pool
+        original_files = auth_module._pool_files
+        settings.token_pool = str(root)
+        try:
+            pool = TokenPool()
+            assert pool.describe()["pool_size"] == 1
+
+            # Simulate the race: the directory listing is taken, then a file
+            # appears before that listing is read.
+            def racing_files(path: Path) -> list[Path]:
+                listed = original_files(path)
+                (path / "late.json").write_text(record("late"), encoding="utf-8")
+                return listed
+
+            auth_module._pool_files = racing_files
+            merged = asyncio.run(pool.reload())
+            assert merged["added"] == 0, "the racing file is not in this listing"
+            auth_module._pool_files = original_files
+
+            # ...so the pool must still consider itself stale and pick it up.
+            assert asyncio.run(pool.reload_if_changed()) is True
+            assert pool.describe()["pool_size"] == 2
+            assert pool.find("tok-late") is not None
+        finally:
+            settings.token_pool = original_pool
+            auth_module._pool_files = original_files
+
+
 def test_quota_errors_rotate() -> None:
     """An empty account must not fail the request; it must be skipped.
 
@@ -491,6 +543,7 @@ def main() -> None:
         test_signin_panel,
         test_console_asset,
         test_pool_hot_reload,
+        test_pool_reload_survives_write_race,
         test_quota_errors_rotate,
         test_metrics_rollup,
         test_account_import_flow,
