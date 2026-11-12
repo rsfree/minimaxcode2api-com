@@ -1467,14 +1467,11 @@ async function loadCapacity() {
   const hasBalance = !!b.balance_known;
   $("capDays").textContent = b.days_left != null ? b.days_left : "—";
   document.querySelector(".hero .unit").hidden = b.days_left == null;
-  // 天数算不出来时把大数字藏掉，但余额本身要如实显示：0 和负数都是真实值，
-  // 换成破折号反而让人以为坏了。
-  document.querySelector(".hero").hidden = !hasBalance && b.days_left == null;
-  $("capHeroNote").textContent = b.days_left != null
-    ? "按实测消耗速率估算 · 余额 " + num(b.credits_remaining) + " 积分"
-    : hasBalance
-      ? "余额 " + num(b.credits_remaining) + " 积分 · 还没有消耗速率（需要两次间隔 ≥30 分钟、余额真的变化过的采样）"
-      : "探针还没采到余额，点「刷新探针」拉一次";
+  // 算不出天数就别留一个孤零零的大破折号 —— 余额已经在下面的统计条里，这里只放预测。
+  document.querySelector(".hero").hidden = b.days_left == null;
+  $("capHeroNote").textContent = hasBalance
+    ? "余额 " + num(b.credits_remaining) + " 积分 · 还没有消耗速率（需要两次间隔 ≥30 分钟、余额真的变化过的采样）"
+    : "探针还没采到余额，点「刷新探针」拉一次";
   $("capRemain").textContent = hasBalance ? num(b.credits_remaining) : "—";
   $("capDrain").textContent = r.credits_per_day ? num(r.credits_per_day) : "—";
   $("capSupply").textContent = num(r.supply_per_day);

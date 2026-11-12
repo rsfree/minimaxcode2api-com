@@ -433,11 +433,13 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
         "forecast": forecast,
         "advice": advice,
         "method": [
-            "余额取上游会员接口的 total_remains_credit（可正可负）；有偿积分台账只记买过/发过的包，"
-            "免费号恒为空，两者不叠加。",
+            "余额取会员接口的 op_credit_summary.total_remaining_amount（免费 + 付费）；"
+            "同响应里的 total_remains_credit 恒为 0，不采用。有偿积分台账只记买过/发过的包，"
+            "免费号恒为空，三者不叠加。",
             "消耗速率取「余额合计」的实测差值，不按 token 折算 —— 不同模型单价不同，折算会给出假精度。",
             f"补给按每号每天签到 {SIGNIN_DAILY} 积分计（第 4、7 天为 1000，这里取保守值）。",
-            "Free 计划的日额度上游不暴露剩余量，所以余额为 0 的号照样能跑，真跑空时表现为 402 insufficient balance。",
+            "余额为 0 的号仍可能在跑：免费额度与积分分开计。真跑空时上游回 402 insufficient balance，"
+            "网关把该号冷却到次日重置，签到后自动解除。",
             "所有数字来自本进程内存 + 探针缓存；容器重启后从零开始采样。",
         ],
     }
