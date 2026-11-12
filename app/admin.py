@@ -255,6 +255,10 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
             drain_per_day = (first["remaining"] - last["remaining"]) / span_hours * 24
 
     remaining = totals.get("credits_remaining") or 0.0
+    # The paid-credit ledger only lists packs that were granted. Free check-in
+    # points do not appear there at all, so an all-zero ledger means "nothing to
+    # measure here", not "the pool is broke".
+    ledger_empty = not totals.get("credit_batches")
     elapsed_hours = max(0.01, (time.time() - metrics.started_at) / 3600)
     window_days = hours / 24
     tokens_per_day = round(total["total_tokens"] / window_days) if total["total_tokens"] else 0
@@ -264,6 +268,13 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
     supply_per_day = SIGNIN_DAILY * max(1, pool["pool_size"])
 
     advice: list[dict] = []
+    if ledger_empty:
+        advice.append({
+            "level": "info",
+            "title": "积分台账里没有在用批次",
+            "text": "上游台账只记录「有偿积分包」的授予与消耗；签到送的额度不记在这里，"
+                    "所以余额显示 0 不代表号不能用。容量判断改看下面的请求量、成功率和签到供给。",
+        })
     if drain_per_day <= 0:
         advice.append({
             "level": "info",
@@ -324,6 +335,7 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
         })
 
     return {
+        "ledger_empty": ledger_empty,
         "generated_at": time.time(),
         "window_hours": hours,
         "horizon_days": days,
@@ -337,6 +349,8 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
         },
         "balance": {
             "credits_remaining": round(remaining, 1),
+            "credit_batches": totals.get("credit_batches", 0),
+            "ledger_empty": ledger_empty,
             "days_left": days_left,
             "accounts": pool["pool_size"],
             "usable": pool["usable"],

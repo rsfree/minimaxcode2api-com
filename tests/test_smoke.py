@@ -284,6 +284,21 @@ def test_pool_hot_reload() -> None:
             settings.token_pool = original
 
 
+def test_quota_errors_rotate() -> None:
+    """An empty account must not fail the request; it must be skipped.
+
+    Upstream answers 400 with "not enough credits" for a spent account while its
+    siblings still work, so the message — not the status code — decides whether
+    the pool rotates.
+    """
+    from app.upstream import _quota_exhausted
+
+    for text in ("not enough credits", "Insufficient balance (1008)", "quota exceeded"):
+        assert _quota_exhausted(text), text
+    for text in ("unknown model: MiniMax-M9", "invalid request body", ""):
+        assert not _quota_exhausted(text), text
+
+
 def test_metrics_rollup() -> None:
     """The console's counters have to add up; a broken rollup misleads quietly."""
     from app.metrics import Metrics
@@ -367,6 +382,7 @@ def main() -> None:
         test_signin_panel,
         test_console_asset,
         test_pool_hot_reload,
+        test_quota_errors_rotate,
         test_metrics_rollup,
         test_admin_requires_key,
         test_capacity_math,

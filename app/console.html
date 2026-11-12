@@ -440,7 +440,7 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sInflight">-</div><div class="k">在途</div></div>
         <div class="stat warn"><div class="v" id="sClaimable">-</div><div class="k">今日可签积分</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分余额</div></div>
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k" title="上游只记有偿积分包的授予与消耗，签到额度不在此台账">台账余额</div></div>
       </div>
 
       <div class="alertbar" id="alertBar" hidden></div>
@@ -944,7 +944,8 @@ async function loadOverview() {
   $("sDisabled").textContent = p.disabled;
   $("sInflight").textContent = p.in_flight;
   $("sClaimable").textContent = t.claimable_today || 0;
-  $("sCredits").textContent = num(t.credits_remaining || 0);
+  // 台账里一条批次都没有时显示「—」：那是「没有可统计的对象」，不是「余额 0」。
+  $("sCredits").textContent = t.credit_batches ? num(t.credits_remaining || 0) : "—";
   $("accHint").textContent = p.pool_watch_seconds
     ? "新账号 " + p.pool_watch_seconds + " 秒内自动进池"
     : "GET /admin/overview";
@@ -1008,7 +1009,8 @@ function renderAccounts() {
       : a.usable ? '<span class="tag ok">可用</span>'
       : cooling ? '<span class="tag warn">冷却 ' + dur(a.cooling_for) + "</span>"
       : '<span class="tag bad">不可用</span>';
-    const cr = a.credits ? num(a.credits.remaining) : "—";
+    // 「没有批次」和「余额 0」是两件事，前者显示 —，否则整列都是 0 会误导。
+    const cr = a.credits && a.credits.batches ? num(a.credits.remaining) : "—";
     const tokens = (a.tokens_in || 0) + (a.tokens_out || 0);
     const sign = a.signin
       ? (a.signin.claimable
@@ -1027,7 +1029,8 @@ function renderAccounts() {
       "<td>" + sign + "</td>" +
       '<td class="dim" style="font-size:12px">' + ago(a.last_success) + "</td>" +
       '<td style="white-space:nowrap">' +
-        '<button class="xs ghost" data-signin="' + esc(a.label) + '">签到</button> ' +
+        '<button class="xs ghost" data-signin="' + esc(a.label) + '"' +
+        (a.signin && a.signin.claimable === false ? ' disabled title="今天已经签过"' : "") + ">签到</button> " +
         '<button class="xs ghost" data-toggle="' + esc(a.label) + '" data-disabled="' + (a.disabled ? "0" : "1") + '">' +
         (a.disabled ? "启用" : "禁用") + "</button></td></tr>";
   }).join("");
@@ -1261,10 +1264,12 @@ async function loadCapacity() {
   const b = d.balance, r = d.run_rate;
   $("capDays").textContent = b.days_left != null ? b.days_left : "—";
   document.querySelector(".hero .unit").hidden = b.days_left == null;
-  $("capHeroNote").textContent = b.days_left != null
-    ? "按实测消耗速率估算 · 余额 " + num(b.credits_remaining) + " 积分"
-    : "积分台账还测不出消耗速率（需要两次间隔 ≥30 分钟的采样）";
-  $("capRemain").textContent = num(b.credits_remaining);
+  $("capHeroNote").textContent = d.ledger_empty
+    ? "上游积分台账里没有在用批次（签到额度不计入），余额不可用于预测"
+    : b.days_left != null
+      ? "按实测消耗速率估算 · 余额 " + num(b.credits_remaining) + " 积分"
+      : "台账还测不出消耗速率（需要两次间隔 ≥30 分钟的采样）";
+  $("capRemain").textContent = b.ledger_empty ? "—" : num(b.credits_remaining);
   $("capDrain").textContent = r.credits_per_day ? num(r.credits_per_day) : "—";
   $("capSupply").textContent = num(r.supply_per_day);
   $("capReq").textContent = num(r.requests_per_day);

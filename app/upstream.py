@@ -50,6 +50,24 @@ class UpstreamError(RuntimeError):
         self.status = status
         self.message = message
         self.payload = payload
+        # Filled in by ``_send`` so the console can attribute a failure to the
+        # account that produced it instead of showing a bare "-".
+        self.account = ""
+
+
+# A 400 is usually the caller's fault, but these messages mean the *account*
+# is empty. Retrying on the next account is the difference between "that one
+#号 is spent" and "the whole gateway is down" — observed as a ~1-in-8 failure
+# before this branch existed.
+QUOTA_HINTS = (
+    "not enough credit", "insufficient balance", "insufficient credit",
+    "credit not enough", "quota exceeded", "1008",
+)
+
+
+def _quota_exhausted(message: str) -> bool:
+    text = (message or "").lower()
+    return any(hint in text for hint in QUOTA_HINTS)
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -202,6 +220,7 @@ class Upstream:
         tried: set[str] = set()
         last: UpstreamError | None = None
         attempts = max(1, len(getattr(token_manager, "_tokens", []) or [1]))
+        current = ""
 
         for _ in range(attempts + 1):
             try:
@@ -209,6 +228,7 @@ class Upstream:
             except CredentialError as exc:
                 raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
             tried.add(token.access_token or token.label)
+            current = token.label or token.short
 
             token.in_flight += 1
             try:
@@ -229,16 +249,29 @@ class Upstream:
                 )
 
             if response.status_code == 400:
-                # An account may simply lack the requested model. Try the next
+                # An account may simply lack the requested model, or be out of
+                # credits. Both are per-account conditions, so try the next
                 # account before surfacing the error; only give up when every
                 # account has been tried.
                 body = await response.aread()
                 await response.aclose()
                 err = _error_from(400, body)
-                if "unknown model" in err.message.lower() and len(tried) < attempts:
-                    log.warning(
-                        "account %s lacks this model; trying next", token.label or token.short
-                    )
+                retriable = (
+                    "unknown model" in err.message.lower() or _quota_exhausted(err.message)
+                )
+                if retriable and len(tried) < attempts:
+                    if _quota_exhausted(err.message):
+                        token_manager.park(token, 402, err.message)
+                        token_manager.note_failure(token, err.message)
+                        log.warning(
+                            "account %s is out of credits (%s); trying next",
+                            token.label or token.short, err.message,
+                        )
+                    else:
+                        log.warning(
+                            "account %s lacks this model; trying next",
+                            token.label or token.short,
+                        )
                     last = err
                     continue
                 raise err
@@ -273,7 +306,10 @@ class Upstream:
                 token_manager.note_success(token)
             return response
 
-        raise last or UpstreamError(502, "no account could serve the request")
+        if last is not None:
+            last.account = last.account or current
+            raise last
+        raise UpstreamError(502, "no account could serve the request")
 
     async def messages(self, payload: dict) -> dict:
         body, _ = await self.messages_ex(payload)
@@ -395,7 +431,10 @@ class Upstream:
                 continue
             return decoded, token.access_token or token.label
 
-        raise last or UpstreamError(502, "no account could serve the request")
+        if last is not None:
+            last.account = last.account or current
+            raise last
+        raise UpstreamError(502, "no account could serve the request")
 
 
 def _error_from(status: int, body: bytes) -> UpstreamError:

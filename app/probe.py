@@ -150,6 +150,7 @@ class ProbeCache:
         owed = 0
         claimable = 0
         claimable_accounts = 0
+        batches = 0
         remaining = 0.0
         for item in items:
             panel = item.signin or {}
@@ -157,6 +158,7 @@ class ProbeCache:
                 claimable += int(panel.get("today_points") or 0) + int(panel.get("bonus_points") or 0)
                 claimable_accounts += 1
             owed += int(panel.get("cycle_pending_points") or 0)
+            batches += len(item.credits)
             remaining += sum(float(b.get("remaining_amount") or 0) for b in item.credits)
         return {
             "updated_at": self._updated_at,
@@ -167,6 +169,7 @@ class ProbeCache:
                 "claimable_accounts": claimable_accounts,
                 "cycle_pending": owed,
                 "credits_remaining": round(remaining, 2),
+                "credit_batches": batches,
             },
             "history": [{"ts": ts, "remaining": round(value, 2)} for ts, value in self._history],
             "accounts": {item.label: item.dump() for item in items},

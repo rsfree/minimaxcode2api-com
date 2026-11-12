@@ -484,7 +484,8 @@ async def chat_completions(request: Request):
             response = await upstream.messages_stream(anthropic_payload)
         except UpstreamError as exc:
             metrics_mod.metrics.record(
-                "chat.stream", model, ok=False, status=exc.status,
+                "chat.stream", model, account=getattr(exc, "account", "") or "-",
+                ok=False, status=exc.status,
                 latency_ms=(time.time() - started) * 1000, error=exc.message, client=client,
             )
             return error_response(exc.status, exc.message)
@@ -534,7 +535,8 @@ async def chat_completions(request: Request):
         payload, account = await upstream.messages_ex(anthropic_payload)
     except UpstreamError as exc:
         metrics_mod.metrics.record(
-            "chat", model, ok=False, status=exc.status,
+            "chat", model, account=getattr(exc, "account", "") or "-",
+            ok=False, status=exc.status,
             latency_ms=(time.time() - started) * 1000, error=exc.message, client=client,
         )
         return error_response(exc.status, exc.message)
