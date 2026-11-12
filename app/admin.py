@@ -115,8 +115,8 @@ def _alerts(pool: dict, usage: dict, probe_totals: dict) -> list[dict]:
 @router.get("/summary")
 async def summary() -> dict:
     """Light payload for the 5-second nav pulse."""
-    pool = _with_totals(token_manager.describe())
-    snap = metrics.snapshot(24)
+    pool = await asyncio.to_thread(lambda: _with_totals(token_manager.describe()))
+    snap = await asyncio.to_thread(metrics.snapshot, 24)
     probe = probes.snapshot()
     return {
         "service": {
@@ -144,8 +144,8 @@ async def summary() -> dict:
 
 @router.get("/overview")
 async def overview() -> dict:
-    pool = _with_totals(token_manager.describe())
-    snap = metrics.snapshot(24)
+    pool = await asyncio.to_thread(lambda: _with_totals(token_manager.describe()))
+    snap = await asyncio.to_thread(metrics.snapshot, 24)
     probe = probes.snapshot()
     return {
         "service": {
@@ -172,13 +172,15 @@ async def overview() -> dict:
 @router.get("/usage")
 async def usage(hours: float = 24) -> dict:
     hours = max(0.5, min(hours, 720))
-    return metrics.snapshot(hours)
+    return await asyncio.to_thread(metrics.snapshot, hours)
 
 
 @router.get("/logs")
 async def logs(limit: int = 200, offset: int = 0, q: str = "", outcome: str = "") -> dict:
     limit = max(1, min(limit, 1000))
-    page = metrics.recent_page(limit=limit, offset=max(0, offset), query=q, outcome=outcome)
+    page = await asyncio.to_thread(
+        metrics.recent_page, limit, max(0, offset), q, outcome
+    )
     return {
         "rows": page["rows"],
         "count": len(page["rows"]),
@@ -317,7 +319,7 @@ async def import_status() -> dict:
 async def capacity(hours: float = 24, days: int = 7) -> dict:
     hours = max(1.0, min(hours, 720))
     days = max(1, min(days, 90))
-    snap = metrics.snapshot(hours)
+    snap = await asyncio.to_thread(metrics.snapshot, hours)
     total = snap["total"]
     pool = token_manager.describe()
     probe = probes.snapshot()

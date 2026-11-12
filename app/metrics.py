@@ -174,7 +174,9 @@ class Metrics:
         current process, which is precisely the question this exists to answer.
         """
         if hours and self._durable():
-            self._store.flush()
+            # No forced flush here: the writer thread commits every second, and
+            # a status page that is one second stale is worth far more than a
+            # request that waits on a disk sync.
             return [Call.from_row(row) for row in self._store.window(hours)]
         with self._lock:
             rows = list(self._rows)
@@ -187,7 +189,6 @@ class Metrics:
                     outcome: str = "") -> dict:
         """Newest-first page plus the number of rows matching the filter."""
         if self._durable():
-            self._store.flush()
             rows, total = self._store.tail(limit, offset, query, outcome)
             return {
                 "rows": [self._dump_row(row) for row in rows],
