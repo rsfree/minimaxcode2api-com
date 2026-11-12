@@ -248,6 +248,22 @@ audio { width: 100%; margin-top: 10px; }
 .veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
 .modal { width: 100%; max-width: 420px; background: var(--surface); border: 1px solid var(--line);
   border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+.modal.wide { max-width: 620px; }
+.modal.wide textarea { min-height: 170px; font: 12px/1.65 var(--mono); }
+/* 导入进度：一行一个账号，状态只靠左侧色条 + 小标签，不刷整表重排 */
+.addlist { margin-top: 12px; max-height: 230px; overflow: auto; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--surface-2); }
+.addlist:empty { display: none; }
+.addlist .r { display: flex; align-items: center; gap: 9px; padding: 5px 10px;
+  border-left: 3px solid transparent; font: 11.5px var(--mono); }
+.addlist .r + .r { border-top: 1px solid var(--line-soft); }
+.addlist .r .em { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addlist .r .msg { color: var(--ink-3); font-family: var(--sans); font-size: 11.5px;
+  max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addlist .r.ok { border-left-color: var(--ok); }
+.addlist .r.upd { border-left-color: var(--accent); }
+.addlist .r.run { border-left-color: var(--warn); }
+.addlist .r.fail { border-left-color: var(--bad); }
 .modal > header { padding: 16px 18px 12px; border-bottom: 1px solid var(--line-soft); }
 .modal > header h3 { font-size: 14px; font-weight: 620; margin-bottom: 4px; }
 .modal > header .hint { font-size: 12px; color: var(--ink-3); }
@@ -450,6 +466,7 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
           <h3>账号池 <span class="hint" id="accHint">GET /admin/overview</span></h3>
           <div class="grow"></div>
           <span class="note" id="accNote"></span>
+          <button class="xs primary" id="btnAdd">＋ 添加账号</button>
           <button class="xs" id="btnSigninAll">全部签到</button>
           <button class="xs" id="btnProbe">刷新探针</button>
         </header>
@@ -723,8 +740,32 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
   </div>
 </div>
 
-<div id="toasts"></div>
+<!-- 添加账号 -->
+<div class="veil" id="addVeil">
+  <div class="modal wide">
+    <header>
+      <h3>添加账号 <span class="hint" id="addHint">POST /admin/accounts/import</span></h3>
+      <div class="hint">每行一个 <code>邮箱 密码</code>，空格 / Tab / 逗号分隔都可以，一次粘一整段。
+        凭据只用来向上游换 token，密码不落盘；同邮箱重复提交等于重新授权并覆盖旧 token。</div>
+    </header>
+    <div class="body">
+      <textarea id="addText" rows="8" spellcheck="false" autocomplete="off"
+        placeholder="someone@mail.example  password123"></textarea>
+      <div class="inline" style="justify-content:space-between;margin-top:9px">
+        <span class="note dim" id="addCount">识别 0 个账号</span>
+        <span class="note" id="addStage"></span>
+      </div>
+      <div class="addlist" id="addList"></div>
+    </div>
+    <footer>
+      <button class="ghost" id="addClose">关闭</button>
+      <div class="grow"></div>
+      <button class="primary" id="addGo">开始导入</button>
+    </footer>
+  </div>
+</div>
 
+<div id="toasts"></div>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -999,7 +1040,7 @@ function renderAccounts() {
 
   if (!rows.length) {
     $("accBody").innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">没有账号</div>' +
-      "在服务器上运行 <code>python -m app.provision --file accounts.txt --out /data/tokens</code></div></td></tr>";
+      '点右上角「＋ 添加账号」，粘贴 <code>邮箱 密码</code> 列表即可自动开通并进池</div></td></tr>';
     return;
   }
   $("accBody").innerHTML = slice.map((a) => {
@@ -1133,6 +1174,131 @@ $("btnProbe").addEventListener("click", async () => {
     btn.textContent = "刷新探针";
   }
 });
+
+/* ── 添加账号 ─────────────────────────────────────────────────────── */
+// 后端按「一个任务一次」跑：登录上游是有速率限制的，并发多了看起来就像撞库。
+let addPoll = 0;
+let addBusy = false;
+
+function parseLines(text) {
+  const rows = [];
+  const seen = new Set();
+  (text || "").split("\n").forEach((raw) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) return;
+    const m = line.match(/^([^\s,;:]+@[^\s,;:]+)[\s,;:]+\s*(\S.*)$/);
+    if (!m) return;
+    const email = m[1].toLowerCase();
+    const password = m[2].trim();
+    if (!password || seen.has(email)) return;
+    seen.add(email);
+    rows.push({ email, password });
+  });
+  return rows;
+}
+
+function updateAddCount() {
+  const n = parseLines($("addText").value).length;
+  $("addCount").textContent = "识别 " + n + " 个账号" + (n > 200 ? "（上限 200，请分批）" : "");
+  $("addGo").disabled = addBusy || !n || n > 200;
+}
+
+function openAdd() {
+  $("addVeil").classList.add("on");
+  $("addText").focus();
+  updateAddCount();
+  // 打开时拉一次状态：可能是上次没看完的任务，也可能正在跑
+  getJSON("/admin/accounts/import", true)
+    .then((d) => {
+      if (!d.job) return;
+      renderImport(d.job);
+      if (d.job.state === "running") { addBusy = true; schedulePoll(); }
+    })
+    .catch(() => {});
+}
+
+function closeAdd() {
+  $("addVeil").classList.remove("on");
+}
+
+function renderImport(job) {
+  const running = job.state === "running";
+  $("addStage").textContent = running
+    ? "进行中 " + job.done + " / " + job.total + " · 成功 " + job.ok + (job.failed ? " · 失败 " + job.failed : "")
+    : "完成：" + job.ok + " 成功" + (job.failed ? "，" + job.failed + " 失败" : "") +
+      " · 耗时 " + dur((job.finished_at || job.started_at) - job.started_at);
+  $("addHint").textContent = "任务 " + job.id + " · " + job.concurrency + " 并发 → " + job.pool_dir;
+  $("addList").innerHTML = (job.rows || []).map((r) => {
+    const cls = r.state === "fail" ? "fail" : r.state === "running" ? "run"
+      : r.state === "updated" ? "upd" : r.state === "ok" ? "ok" : "";
+    const tag = r.state === "fail" ? '<span class="tag bad">失败</span>'
+      : r.state === "running" ? '<span class="tag warn">授权中</span>'
+      : r.state === "updated" ? '<span class="tag accent">已更新</span>'
+      : r.state === "ok" ? '<span class="tag ok">已加入</span>'
+      : '<span class="tag mute">排队</span>';
+    return '<div class="r ' + cls + '"><span class="em">' + esc(r.email) + "</span>" + tag +
+      (r.error ? '<span class="msg" title="' + esc(r.error) + '">' + esc(r.error) + "</span>" : "") + "</div>";
+  }).join("");
+  $("addGo").textContent = running ? "导入中…" : "开始导入";
+  $("addGo").disabled = running;
+}
+
+function schedulePoll() {
+  clearTimeout(addPoll);
+  addPoll = setTimeout(pollImport, 1200);
+}
+
+async function pollImport() {
+  let job = null;
+  try {
+    const d = await getJSON("/admin/accounts/import", true);
+    job = d.job;
+    if (!job) { addBusy = false; updateAddCount(); return; }
+    renderImport(job);
+  } catch (e) {
+    addBusy = false;
+    updateAddCount();
+    toast(e.message || String(e), "bad");
+    return;
+  }
+  if (job.state === "running") { schedulePoll(); return; }
+  addBusy = false;
+  updateAddCount();
+  $("addText").value = "";
+  updateAddCount();
+  toast("导入完成：" + job.ok + " 个账号进池" + (job.failed ? "，" + job.failed + " 个失败" : ""),
+    job.failed ? "bad" : "ok");
+  loadOverview();
+  refreshNav();
+}
+
+async function startAdd() {
+  const rows = parseLines($("addText").value);
+  if (!rows.length) return;
+  if (rows.length > 200) { toast("一次最多 200 个账号，请分批粘贴", "bad"); return; }
+  addBusy = true;
+  $("addGo").disabled = true;
+  $("addGo").textContent = "提交中…";
+  try {
+    const d = await postJSON("/admin/accounts/import", { text: $("addText").value });
+    renderImport(d.job);
+    schedulePoll();
+  } catch (e) {
+    addBusy = false;
+    $("addGo").textContent = "开始导入";
+    updateAddCount();
+    toast(e.message || String(e), "bad");
+  }
+}
+
+$("btnAdd").addEventListener("click", openAdd);
+$("addClose").addEventListener("click", closeAdd);
+$("addGo").addEventListener("click", startAdd);
+$("addText").addEventListener("input", updateAddCount);
+$("addText").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") startAdd();
+});
+$("addVeil").addEventListener("click", (e) => { if (e.target === $("addVeil")) closeAdd(); });
 
 /* ── 用量 ─────────────────────────────────────────────────────────── */
 async function loadUsage() {

@@ -233,7 +233,8 @@ def test_console_asset() -> None:
     # ...and the console's own backend. A typo here renders an empty page with no
     # visible error, so the endpoints are pinned by name.
     for endpoint in ("/admin/summary", "/admin/overview", "/admin/usage", "/admin/logs",
-                     "/admin/capacity", "/admin/config", "/admin/signin"):
+                     "/admin/capacity", "/admin/config", "/admin/signin",
+                     "/admin/accounts/import"):
         assert endpoint in html, f"console does not call {endpoint}"
 
 
@@ -325,6 +326,114 @@ def test_metrics_rollup() -> None:
     assert models["MiniMax-M3.1-Flash"]["avg_latency_ms"] == 0
 
 
+def test_account_import_flow() -> None:
+    """The console's「＋ 添加账号」must mint, write and surface accounts in one go.
+
+    Provisioning talks to the account host, so the network call is replaced by a
+    fake here; everything around it — line parsing, per-account isolation, the
+    single-job guard, token-file writing and the pool pick-up — is the real code.
+    """
+    import tempfile
+    import threading
+
+    from app import onboard
+    from app.account_api import AccountError
+    from app.auth import token_manager
+    from app.config import settings
+
+    gate = threading.Event()
+    gate.set()
+    calls: list[str] = []
+
+    def fake_provision(email: str, password: str, proxy=None) -> dict:
+        gate.wait(5)
+        calls.append(email)
+        if email.startswith("bad"):
+            raise AccountError("wrong password", code=1001)
+        return {
+            "region": "en",
+            "email": email,
+            "accessToken": f"tok-{email}",
+            "refreshToken": "refresh",
+            "expiresAtMs": 4102444800000,
+        }
+
+    async def run(imp: "onboard.Importer", text: str) -> dict:
+        await imp.start(text, concurrency=2)
+        for _ in range(400):
+            if not imp.running:
+                break
+            await asyncio.sleep(0.01)
+        snap = imp.snapshot()
+        assert snap is not None
+        return snap
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_pool = settings.token_pool
+        original_provision = onboard.provision
+        settings.token_pool = tmp
+        onboard.provision = fake_provision
+        try:
+            # Parsing: space, tab and comma all separate; duplicates collapse;
+            # prose without an email is reported rather than smuggled through.
+            rows, bad = onboard.parse_accounts(
+                "a@x.com  pw1\nb@x.com,\tpw2\nA@X.com  again\nc@x.com;pw3\n# comment\nnot a line\n"
+            )
+            assert [r[0] for r in rows] == ["a@x.com", "b@x.com", "c@x.com"], rows
+            assert bad == ["not a line"], bad
+            assert rows[1][1] == "pw2"
+
+            imp = onboard.Importer()
+            job = asyncio.run(run(imp, "a@x.com pw1\nbad@x.com pw2\nc@x.com pw3"))
+            assert job["state"] == "done"
+            assert job["total"] == 3 and job["ok"] == 2 and job["failed"] == 1
+            states = {row["email"]: row["state"] for row in job["rows"]}
+            assert states["a@x.com"] == "ok" and states["c@x.com"] == "ok"
+            assert states["bad@x.com"] == "fail"
+            assert "登录被拒" in next(r["error"] for r in job["rows"] if r["email"] == "bad@x.com")
+
+            written = Path(tmp) / "a.json"
+            assert written.exists()
+            text = written.read_text(encoding="utf-8")
+            assert "tok-a@x.com" in text and "password" not in text
+            # A partially written token must never be picked up as an account.
+            assert not list(Path(tmp).glob("*.tmp"))
+
+            # Newly minted accounts are in rotation straight away.
+            assert token_manager.find("a@x.com") is not None
+
+            # Re-importing the same address refreshes the file instead of
+            # creating a twin, and says so.
+            again = asyncio.run(run(imp, "a@x.com pw1"))
+            assert again["ok"] == 1 and again["updated"] == 1
+            assert again["rows"][0]["state"] == "updated"
+
+            # One job at a time: the login endpoint rate-limits.
+            async def contention() -> bool:
+                gate.clear()
+                try:
+                    await imp.start("d@x.com pw")
+                    try:
+                        await imp.start("e@x.com pw")
+                    except RuntimeError:
+                        refused = True
+                    else:
+                        refused = False
+                finally:
+                    gate.set()
+                for _ in range(400):
+                    if not imp.running:
+                        break
+                    await asyncio.sleep(0.01)
+                return refused
+
+            assert asyncio.run(contention()) is True
+            assert calls  # sanity: the fake actually ran
+        finally:
+            settings.token_pool = original_pool
+            onboard.provision = original_provision
+
+
 def test_admin_requires_key() -> None:
     """Every /admin route sits behind the same key as the API surface."""
     from fastapi.testclient import TestClient
@@ -384,6 +493,7 @@ def main() -> None:
         test_pool_hot_reload,
         test_quota_errors_rotate,
         test_metrics_rollup,
+        test_account_import_flow,
         test_admin_requires_key,
         test_capacity_math,
     ]

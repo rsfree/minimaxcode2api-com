@@ -23,6 +23,7 @@ from . import catalog, media, signin
 from .auth import Token, token_manager
 from .config import settings
 from .metrics import metrics
+from .onboard import importer
 from .probe import probes
 from .security import authorized
 
@@ -233,6 +234,39 @@ async def disable_account(request: Request) -> dict:
     if token is None:
         raise HTTPException(status_code=404, detail=f"unknown account: {label}")
     return {"label": token.label or token.short, "disabled": token.disabled}
+
+
+@router.post("/accounts/import")
+async def import_accounts(request: Request) -> dict:
+    """Mint tokens for pasted email/password pairs and drop them into the pool.
+
+    Runs in the background (one job at a time); poll ``GET /admin/accounts/import``
+    for per-account progress. Passwords are used once and never stored.
+    """
+    body: dict = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - body is required in practice
+        body = {}
+    text = (body or {}).get("text") or ""
+    accounts = (body or {}).get("accounts")
+    if not text and isinstance(accounts, list):
+        text = "\n".join(
+            f"{a.get('email', '')} {a.get('password', '')}" for a in accounts if isinstance(a, dict)
+        )
+    concurrency = (body or {}).get("concurrency")
+    try:
+        job = await importer.start(text, concurrency)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"job": job}
+
+
+@router.get("/accounts/import")
+async def import_status() -> dict:
+    return {"job": importer.snapshot()}
 
 
 @router.get("/capacity")

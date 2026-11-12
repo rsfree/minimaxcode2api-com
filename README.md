@@ -153,6 +153,29 @@ python -m app.provision --refresh
 
 > `refreshToken` 每次续期都会轮换，网关会就地写回文件，**不要手工拷贝旧值**。
 
+### 网页加号：在控制台里贴账号
+
+`/ui → 账号池 → ＋ 添加账号`，把 `邮箱 密码` 一行一个贴进去就行（空格 / Tab / 逗号都认），
+一次最多 200 个。后台串行分组去换 token，逐个回显「已加入 / 已更新 / 失败 + 原因」，
+写完立刻进池，不用重启、不用 SSH。
+
+背后就是同一套流程，也有接口：
+
+```bash
+curl -s -H "X-API-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"text":"a@mail.example pw1\nb@mail.example pw2"}' \
+  http://127.0.0.1:8080/admin/accounts/import
+# → {"job": {"state": "running", "total": 2, "rows": [...]}}
+
+curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/admin/accounts/import   # 轮询进度
+```
+
+- **一次只跑一个导入任务**（登录接口有速率限制，并发开多像撞库），并发数默认 3，
+  用 `PROVISION_CONCURRENCY` 调；
+- 密码只在内存里过一遍，**不落盘、不进日志**，写进目录的只有 access/refresh token；
+- 同一邮箱再提交一次等于重新授权并覆盖旧 token 文件（回显「已更新」），不会出现两个同号；
+- 失败原因会区分「登录被拒 / 没有可授权分组 / 超时」，一个号失败不影响整批。
+
 ### 启动
 
 ```bash
@@ -273,7 +296,7 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/ui?key=sk-local'
 | 使用 | 对话 | 流式输出、思考过程折叠、耗时与 token 用量 |
 | 使用 | 图像 | 文生图，结果直接预览并给 CDN 链接 |
 | 使用 | 语音 | TTS，音色从 `/v1/audio/voices` 拉（332 个），合成后直接播放 |
-| 运营 | 账号池 | 7 项池状态 + 异常汇总条；每号积分、成功/失败、在途、token、签到状态；搜索 / 状态筛选 / 排序 / 分页；单号签到与禁用开关；批量签到 |
+| 运营 | 账号池 | 7 项池状态 + 异常汇总条；每号积分、成功/失败、在途、token、签到状态；搜索 / 状态筛选 / 排序 / 分页；**＋ 添加账号**（贴邮箱密码批量开通，逐行回显结果）；单号签到与禁用开关；批量签到 |
 | 运营 | 用量 | 请求数、成功率、失败、输入/输出 token、P95 延迟；token 时序图；按账号 / 按模型明细 |
 | 运营 | 容量规划 | 余额可撐天数、日均消耗与签到日供给、行动建议、1/3/7/14 天补号测算 |
 | 观测 | 请求日志 | 每个请求的时间、结果、类型、模型、账号、耗时、token、来源 IP + UA、请求 ID；5 秒自动刷新 |
@@ -421,6 +444,8 @@ export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3.1-Flash
 | `GET /admin/probes?refresh=0` / `POST /admin/probes/refresh` | 签到面板 + 积分批次缓存 / 立刻重采 |
 | `POST /admin/signin` | `{"label": "..."}` 签一个号，`{}` 签全部 |
 | `POST /admin/accounts/disable` | `{"label": "...", "disabled": true}` 单号停/启用（不删文件） |
+| `POST /admin/accounts/import` | `{"text": "邮箱 密码\n..."}` 批量开通并进池（后台任务，一次一个）；密码不落盘 |
+| `GET /admin/accounts/import` | 当前 / 上次导入任务的分账号进度（控制台轮询这个） |
 
 ### 3.4 文生图
 
@@ -573,6 +598,7 @@ flowchart LR
 | `UPSTREAM_TRANSPORT` | `auto` | `auto` / `httpx` / `curl`。出口代理会重置 Python TLS 握手时用 `curl` |
 | `TOKEN_POOL` | 空 | **多账号池目录**，一个账号一个 json。设了就优先用它轮询 |
 | `TOKEN_POOL_WATCH` | `10` | 号池目录扫描间隔（秒）。新账号自动进池，`0` 关闭热加载 |
+| `PROVISION_CONCURRENCY` | `3` | 控制台「＋ 添加账号」同时开通几个号（登录接口会限流，别开大） |
 | `SIGNIN_AUTO` | `1` | 有 `TOKEN_POOL` 时每次启动 + 每 6 小时自动签到领积分 |
 | `SIGNIN_TIMEZONE` | `Asia/Shanghai` | 签到时区，必须是 IANA 名字，不能是 `480` 这种偏移 |
 | `SIGNIN_INTERVAL_HOURS` | `6` | 自动签到的检查间隔（最小 10 分钟） |

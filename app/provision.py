@@ -35,22 +35,36 @@ from .account_api import AccountError, provision, refresh
 from .config import settings
 
 
-def _pool_dir() -> Path:
+def pool_dir() -> Path:
     return Path(settings.token_pool or "data/tokens").expanduser()
 
 
-def _write(directory: Path, record: dict) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    stem = (record.get("email") or record.get("username") or "account").split("@")[0]
+def record_path(directory: Path, email: str) -> Path:
+    """Where one account's token file lives. Shared with the console importer."""
+    stem = (email or "account").split("@")[0]
     stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)
-    path = directory / f"{stem}.json"
+    return directory / f"{stem}.json"
+
+
+def write_record(directory: Path, record: dict) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = record_path(directory, record.get("email") or record.get("username") or "")
     payload = {k: v for k, v in record.items() if k != "password"}
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # Atomic swap: the pool watcher stats mtimes, and a half-written file would
+    # make it drop the account on the next reload.
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
     try:
         path.chmod(0o600)
     except OSError:
         pass
     return path
+
+
+# Back-compat aliases for the CLI paths below.
+_pool_dir = pool_dir
+_write = write_record
 
 
 def _read_accounts(path: Path) -> list[tuple[str, str]]:
