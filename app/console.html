@@ -903,6 +903,9 @@ function show(view) {
 document.querySelectorAll(".nav a").forEach((a) => {
   a.addEventListener("click", (e) => { e.preventDefault(); show(a.dataset.view); });
 });
+// 直接粘 #accounts 这类链接、或者用浏览器前进后退，也要能切页。点击走上面的 show()。
+// show() 只在 hash 不一致时 replaceState，所以这里不会自激。
+window.addEventListener("hashchange", () => show(location.hash.slice(1) || "chat"));
 
 /* ── 通用格式化 ───────────────────────────────────────────────────── */
 function esc(s) {
@@ -1182,24 +1185,28 @@ let addBusy = false;
 
 function parseLines(text) {
   const rows = [];
+  const bad = [];
   const seen = new Set();
   (text || "").split("\n").forEach((raw) => {
     const line = raw.trim();
     if (!line || line.startsWith("#")) return;
     const m = line.match(/^([^\s,;:]+@[^\s,;:]+)[\s,;:]+\s*(\S.*)$/);
-    if (!m) return;
+    if (!m) { bad.push(line); return; }
     const email = m[1].toLowerCase();
     const password = m[2].trim();
-    if (!password || seen.has(email)) return;
+    if (!password || seen.has(email)) { bad.push(line); return; }
     seen.add(email);
     rows.push({ email, password });
   });
-  return rows;
+  return { rows, bad };
 }
 
 function updateAddCount() {
-  const n = parseLines($("addText").value).length;
-  $("addCount").textContent = "识别 " + n + " 个账号" + (n > 200 ? "（上限 200，请分批）" : "");
+  const parsed = parseLines($("addText").value);
+  const n = parsed.rows.length;
+  $("addCount").textContent = "识别 " + n + " 个账号" +
+    (parsed.bad.length ? " · 跳过 " + parsed.bad.length + " 行（没有邮箱或密码）" : "") +
+    (n > 200 ? "（上限 200，请分批）" : "");
   $("addGo").disabled = addBusy || !n || n > 200;
 }
 
@@ -1223,10 +1230,11 @@ function closeAdd() {
 
 function renderImport(job) {
   const running = job.state === "running";
-  $("addStage").textContent = running
+  const skipped = (job.invalid || []).length ? " · 跳过 " + job.invalid.length + " 行" : "";
+  $("addStage").textContent = (running
     ? "进行中 " + job.done + " / " + job.total + " · 成功 " + job.ok + (job.failed ? " · 失败 " + job.failed : "")
     : "完成：" + job.ok + " 成功" + (job.failed ? "，" + job.failed + " 失败" : "") +
-      " · 耗时 " + dur((job.finished_at || job.started_at) - job.started_at);
+      " · 耗时 " + dur((job.finished_at || job.started_at) - job.started_at)) + skipped;
   $("addHint").textContent = "任务 " + job.id + " · " + job.concurrency + " 并发 → " + job.pool_dir;
   $("addList").innerHTML = (job.rows || []).map((r) => {
     const cls = r.state === "fail" ? "fail" : r.state === "running" ? "run"
@@ -1273,7 +1281,7 @@ async function pollImport() {
 }
 
 async function startAdd() {
-  const rows = parseLines($("addText").value);
+  const rows = parseLines($("addText").value).rows;
   if (!rows.length) return;
   if (rows.length > 200) { toast("一次最多 200 个账号，请分批粘贴", "bad"); return; }
   addBusy = true;
