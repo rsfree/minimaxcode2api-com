@@ -2,7 +2,7 @@
 
 面向「在一台 Linux 服务器上长期跑」的场景。生产形态是**单个容器 + 一个可写目录 `/data`**。
 
-- 镜像：`ghcr.io/jushenzhidao/minimax-code2api:latest`
+- 镜像：`ghcr.io/rsfree/minimaxcode2api-com:latest`
 - 端口：容器内 `8080`
 - 持久化：`/data`（存 `token.json`，会自动刷新）
 
@@ -76,7 +76,7 @@ UPSTREAM_PROXY=socks5://10.0.0.5:1080
 
 ```bash
 echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
-docker pull ghcr.io/jushenzhidao/minimax-code2api:latest
+docker pull ghcr.io/rsfree/minimaxcode2api-com:latest
 ```
 
 > 包是私有的，`GHCR_TOKEN` 需要一个带 `read:packages` 的 PAT。
@@ -105,7 +105,7 @@ docker build -t minimax-code2api:local .
 
 ```bash
 docker run --rm -it -v "$PWD/data:/data" \
-  ghcr.io/jushenzhidao/minimax-code2api:latest \
+  ghcr.io/rsfree/minimaxcode2api-com:latest \
   python -m app.login --out /data/token.json
 ```
 
@@ -178,7 +178,7 @@ bbb@mail.example.com   Pa55word1
 
 ```bash
 docker run --rm -v "$PWD/data:/data" \
-  ghcr.io/jushenzhidao/minimax-code2api:latest \
+  ghcr.io/rsfree/minimaxcode2api-com:latest \
   python -m app.provision --file /data/accounts.txt --out /data/tokens
 ```
 
@@ -493,7 +493,7 @@ ai.example.com {
 docker compose pull && docker compose up -d
 
 # 回滚到指定版本（每次构建都有 sha-<7位> 和 <分支名> 标签）
-MINIMAX_IMAGE=ghcr.io/jushenzhidao/minimax-code2api:sha-1a2b3c4 docker compose up -d
+MINIMAX_IMAGE=ghcr.io/rsfree/minimaxcode2api-com:sha-1a2b3c4 docker compose up -d
 
 # 看当前版本
 docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \

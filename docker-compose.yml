@@ -1,6 +1,6 @@
 services:
   minimax-code2api:
-    image: ${MINIMAX_IMAGE:-ghcr.io/jushenzhidao/minimax-code2api:latest}
+    image: ${MINIMAX_IMAGE:-ghcr.io/rsfree/minimaxcode2api-com:latest}
     # For a local build instead of the registry image:
     # build: .
     container_name: minimax-code2api
