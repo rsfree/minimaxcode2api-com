@@ -88,6 +88,12 @@ class Settings:
     signin_interval_hours: float = field(
         default_factory=lambda: float(_env("SIGNIN_INTERVAL_HOURS", "6") or 6)
     )
+    # Console probes (sign-in panel + credit ledger per account). One GET per
+    # account per sweep, so the interval is minutes, not seconds. 0 = manual only.
+    probe_auto: bool = field(default_factory=lambda: _env_bool("PROBE_AUTO", True))
+    probe_interval: float = field(
+        default_factory=lambda: float(_env("PROBE_INTERVAL", "300") or 300)
+    )
 
     # Gateway side.
     api_keys: list[str] = field(default_factory=list)

@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any
 
+from .auth import token_manager
+from .metrics import metrics
 from .upstream import UpstreamError, upstream
 
 log = logging.getLogger("minimax.media")
@@ -88,19 +91,42 @@ async def call(tool: str, payload: dict, timeout: float, account: str | None = N
     return data
 
 
+def _account_label(served: str) -> str:
+    """Map the token that served a call back to its account label."""
+    token = token_manager.find(served)
+    return (token.label or token.short) if token else "-"
+
+
 async def call_ex(
     tool: str, payload: dict, timeout: float, account: str | None = None
 ) -> tuple[dict, str]:
     """Same as :func:`call`, but also returns the account that served it."""
+    started = time.time()
     try:
         data, served = await upstream.mcp_ex(tool, payload, timeout=timeout, account=account)
     except UpstreamError as exc:
+        metrics.record(
+            f"mcp:{tool}", tool, account=account or "-", ok=False, status=exc.status,
+            latency_ms=(time.time() - started) * 1000, error=exc.message,
+        )
         raise MediaError(exc.status, exc.message, payload=exc.payload) from exc
 
+    label = _account_label(served)
     code = data.get("code", 0)
     if isinstance(code, int) and code != 0:
         message = data.get("message") or f"upstream tool {tool} failed (code {code})"
+        # A business code on an HTTP 200 is still a failed call; the console
+        # would otherwise show a 100% success rate while generation never works.
+        metrics.record(
+            f"mcp:{tool}", tool, account=label, ok=False, status=_status_for(code),
+            latency_ms=(time.time() - started) * 1000, error=str(message)[:200],
+        )
         raise MediaError(_status_for(code), str(message), code=code, payload=data)
+
+    metrics.record(
+        f"mcp:{tool}", tool, account=label, ok=True, status=200,
+        latency_ms=(time.time() - started) * 1000,
+    )
     return data, served
 
 

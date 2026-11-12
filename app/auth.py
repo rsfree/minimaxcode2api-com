@@ -58,6 +58,15 @@ class Token:
     cooldown_until: float = 0.0
     last_error: str = ""
     uses: int = 0
+    # Console-facing counters. They live on the token so the pool page can show
+    # per-account success/failure without a second data structure to keep in sync.
+    disabled: bool = False          # operator took it out of rotation by hand
+    ok_count: int = 0
+    fail_count: int = 0
+    last_success: float = 0.0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    in_flight: int = 0
 
     def is_expired(self, skew_ms: int = EXPIRY_SKEW_MS) -> bool:
         if not self.expires_at_ms:
@@ -346,6 +355,8 @@ class TokenPool:
         return response.status_code, response.content
 
     async def _usable(self, token: Token) -> Token | None:
+        if token.disabled:
+            return None
         if token.is_cooling():
             return None
         if token.is_expired() and token.refresh_token:
@@ -422,6 +433,31 @@ class TokenPool:
         token.last_error = reason[:200] or f"HTTP {status}"
         log.warning("parked %s for %.0fs: %s", token.label or token.short, delay, token.last_error)
 
+    # -- console-facing bookkeeping ----------------------------------------
+    def note_success(self, token: Token, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+        token.ok_count += 1
+        token.last_success = time.time()
+        token.tokens_in += max(0, int(prompt_tokens or 0))
+        token.tokens_out += max(0, int(completion_tokens or 0))
+        token.last_error = ""
+
+    def note_failure(self, token: Token, reason: str = "") -> None:
+        token.fail_count += 1
+        if reason:
+            token.last_error = reason[:200]
+
+    def set_disabled(self, key: str, disabled: bool) -> Token | None:
+        """Take one account out of rotation (or put it back) by label or token."""
+        token = self.find(key)
+        if token is None:
+            return None
+        token.disabled = disabled
+        if not disabled:
+            token.cooldown_until = 0.0
+            token.last_error = ""
+        log.info("%s account %s", "disabled" if disabled else "enabled", token.label or token.short)
+        return token
+
     def peek(self) -> Token | None:
         """Return a credential without ever going to the network."""
         self._ensure()
@@ -446,16 +482,30 @@ class TokenPool:
 
     def describe(self) -> dict:
         self._ensure()
+        now = time.time()
+        total = len(self._tokens)
+        usable = sum(1 for t in self._tokens if t.access_token and not t.disabled and not t.is_cooling())
         return {
-            "pool_size": len(self._tokens),
+            "pool_size": total,
+            "usable": usable,
+            "disabled": sum(1 for t in self._tokens if t.disabled),
+            "cooling": sum(1 for t in self._tokens if (not t.disabled) and t.is_cooling()),
+            "in_flight": sum(t.in_flight for t in self._tokens),
             "pool_watch_seconds": settings.pool_watch if settings.token_pool else 0,
             "accounts": [
                 {
                     "label": t.label or t.short,
-                    "usable": bool(t.access_token) and not t.is_cooling(),
+                    "usable": bool(t.access_token) and not t.disabled and not t.is_cooling(),
+                    "disabled": t.disabled,
                     "expires_at_ms": t.expires_at_ms,
-                    "cooling_for": round(max(0.0, t.cooldown_until - time.time())),
+                    "cooling_for": round(max(0.0, t.cooldown_until - now)),
                     "uses": t.uses,
+                    "ok": t.ok_count,
+                    "fail": t.fail_count,
+                    "in_flight": t.in_flight,
+                    "tokens_in": t.tokens_in,
+                    "tokens_out": t.tokens_out,
+                    "last_success": t.last_success,
                     "last_error": t.last_error or None,
                 }
                 for t in self._tokens

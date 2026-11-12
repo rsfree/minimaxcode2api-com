@@ -222,12 +222,18 @@ def test_console_asset() -> None:
 
     assert "<title>minimax-code2api" in html
     # Every view the nav can switch to must exist, or the tab silently does nothing.
-    for view in ("chat", "image", "speech", "accounts", "models"):
+    for view in ("chat", "image", "speech", "accounts", "usage", "capacity", "logs", "models", "config"):
         assert f'data-view="{view}"' in html, f"nav missing {view}"
         assert f'id="view-{view}"' in html, f"section missing {view}"
 
     # The console talks to the same endpoints the rest of the gateway exposes.
-    for endpoint in ("/v1/chat/completions", "/v1/images/generations", "/v1/audio/speech", "/healthz"):
+    for endpoint in ("/v1/chat/completions", "/v1/images/generations", "/v1/audio/speech"):
+        assert endpoint in html, f"console does not call {endpoint}"
+
+    # ...and the console's own backend. A typo here renders an empty page with no
+    # visible error, so the endpoints are pinned by name.
+    for endpoint in ("/admin/summary", "/admin/overview", "/admin/usage", "/admin/logs",
+                     "/admin/capacity", "/admin/config", "/admin/signin"):
         assert endpoint in html, f"console does not call {endpoint}"
 
 
@@ -278,6 +284,78 @@ def test_pool_hot_reload() -> None:
             settings.token_pool = original
 
 
+def test_metrics_rollup() -> None:
+    """The console's counters have to add up; a broken rollup misleads quietly."""
+    from app.metrics import Metrics
+
+    m = Metrics(limit=50)
+    m.record("chat", "MiniMax-M3", account="a@mail.example.com", ok=True, latency_ms=800,
+             prompt_tokens=100, completion_tokens=40)
+    m.record("chat", "MiniMax-M3", account="a@mail.example.com", ok=True, latency_ms=1200,
+             prompt_tokens=50, completion_tokens=10)
+    m.record("chat.stream", "MiniMax-M3.1-Flash", account="b@mail.example.com", ok=False,
+             status=429, latency_ms=200, error="rate limited")
+
+    snap = m.snapshot(24)
+    total = snap["total"]
+    assert total["requests"] == 3 and total["success"] == 2 and total["errors"] == 1
+    assert total["prompt_tokens"] == 150 and total["completion_tokens"] == 50
+    assert abs(total["success_rate"] - 66.7) < 0.2
+    assert total["p95_latency_ms"] >= 800
+    models = {row["model"]: row for row in snap["by_model"]}
+    assert models["MiniMax-M3"]["total_tokens"] == 200
+    assert models["MiniMax-M3.1-Flash"]["errors"] == 1
+    assert sum(p["requests"] for p in snap["series"]["points"]) == 3
+    # A failed call must not borrow the latency of the good ones.
+    assert models["MiniMax-M3.1-Flash"]["avg_latency_ms"] == 0
+
+
+def test_admin_requires_key() -> None:
+    """Every /admin route sits behind the same key as the API surface."""
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+
+    original = settings.api_keys
+    settings.api_keys = ["unit-test-key"]
+    try:
+        client = TestClient(app)
+        assert client.get("/admin/summary").status_code == 401
+        assert client.get("/admin/summary", headers={"x-api-key": "wrong"}).status_code == 401
+        ok = client.get("/admin/summary", headers={"x-api-key": "unit-test-key"})
+        assert ok.status_code == 200
+        body = ok.json()
+        assert "pool" in body and "usage" in body and "alerts" in body
+        # The console page must never carry the key itself.
+        page = client.get("/ui")
+        assert page.status_code in {200, 401}
+    finally:
+        settings.api_keys = original
+
+
+def test_capacity_math() -> None:
+    """补号测算 has to be arithmetically sane, not just pretty."""
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+
+    original = settings.api_keys
+    settings.api_keys = ["unit-test-key"]
+    try:
+        client = TestClient(app)
+        data = client.get("/admin/capacity?hours=24&days=7",
+                          headers={"x-api-key": "unit-test-key"}).json()
+        for row in data["forecast"]:
+            assert row["consume"] >= 0 and row["gap"] >= 0
+            if row["gap"] > 0:
+                assert row["accounts_needed"] >= 1
+        assert data["method"], "the page explains its own method; keep it non-empty"
+    finally:
+        settings.api_keys = original
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
@@ -289,6 +367,9 @@ def main() -> None:
         test_signin_panel,
         test_console_asset,
         test_pool_hot_reload,
+        test_metrics_rollup,
+        test_admin_requires_key,
+        test_capacity_math,
     ]
     for test in tests:
         test()

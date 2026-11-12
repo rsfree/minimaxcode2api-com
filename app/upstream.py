@@ -88,6 +88,9 @@ class UpstreamResponse:
     def __init__(self, httpx_response=None, curl_stream=None) -> None:
         self._h = httpx_response
         self._c = curl_stream
+        # Set by ``_send`` once an account actually served the request; the
+        # console attributes calls to it.
+        self.account = ""
 
     @property
     def status_code(self) -> int:
@@ -207,9 +210,13 @@ class Upstream:
                 raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
             tried.add(token.access_token or token.label)
 
-            response = await self._dispatch(
-                settings.messages_url, payload, _headers(token.access_token), stream
-            )
+            token.in_flight += 1
+            try:
+                response = await self._dispatch(
+                    settings.messages_url, payload, _headers(token.access_token), stream
+                )
+            finally:
+                token.in_flight -= 1
 
             if response.status_code in {301, 302, 307, 308}:
                 location = response.headers.get("location", "?")
@@ -247,29 +254,41 @@ class Upstream:
                         settings.messages_url, payload, _headers(token.access_token), stream
                     )
                     if retry.status_code == 200:
+                        retry.account = token.label or token.short
+                        token_manager.note_success(token)
                         return retry
                     body = await retry.aread()
                     await retry.aclose()
                     last = _error_from(retry.status_code, body)
 
                 token_manager.park(token, response.status_code, last.message)
+                token_manager.note_failure(token, last.message)
                 log.warning(
                     "account %s failed (%s); trying next", token.label or token.short, response.status_code
                 )
                 continue
 
+            response.account = token.label or token.short
+            if response.status_code == 200:
+                token_manager.note_success(token)
             return response
 
         raise last or UpstreamError(502, "no account could serve the request")
 
     async def messages(self, payload: dict) -> dict:
+        body, _ = await self.messages_ex(payload)
+        return body
+
+    async def messages_ex(self, payload: dict) -> tuple[dict, str]:
+        """Same as :meth:`messages`, plus the account label that served it."""
         response = await self._send(payload, stream=False)
+        account = response.account
         body = await response.aread()
         await response.aclose()
         if response.status_code != 200:
             raise _error_from(response.status_code, body)
         try:
-            return httpx.Response(200, content=body).json()
+            return httpx.Response(200, content=body).json(), account
         except ValueError as exc:  # pragma: no cover - upstream contract change
             raise UpstreamError(502, f"upstream returned non-JSON: {body[:300]!r}") from exc
 

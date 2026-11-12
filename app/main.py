@@ -36,8 +36,9 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import media
+from . import admin, media, metrics as metrics_mod, probe, security
 from .auth import CredentialError, token_manager
+from .security import UI_COOKIE, UI_COOKIE_MAX_AGE, authorized as _authorized, is_loopback as _is_loopback
 from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
 from .config import settings
 from .convert import (
@@ -66,8 +67,13 @@ async def lifespan(_: FastAPI):
         log.error("no usable credential at startup: %s", exc)
     task = asyncio.create_task(_signin_loop()) if _signin_enabled() else None
     watcher = asyncio.create_task(_pool_watch_loop()) if _pool_watch_enabled() else None
+    probes_task = (
+        asyncio.create_task(probe.probe_loop(settings.probe_interval))
+        if settings.probe_auto and settings.probe_interval > 0
+        else None
+    )
     yield
-    for pending in (task, watcher):
+    for pending in (task, watcher, probes_task):
         if pending is not None:
             pending.cancel()
     await upstream.shutdown()
@@ -132,6 +138,7 @@ app = FastAPI(
     description="OpenAI/Anthropic compatible gateway for the MiniMax Code managed channel.",
     lifespan=lifespan,
 )
+app.include_router(admin.router)
 
 
 class AbsoluteTargetMiddleware:
@@ -197,38 +204,6 @@ def media_error_response(exc: MediaError) -> JSONResponse:
     return JSONResponse(status_code=exc.status, content=body)
 
 
-def _supplied_key(request: Request) -> str:
-    header = request.headers.get("authorization") or ""
-    if header.lower().startswith("bearer "):
-        return header[7:].strip()
-    for name in ("x-api-key", "api-key"):
-        value = (request.headers.get(name) or "").strip()
-        if value:
-            return value
-    cookie = (request.cookies.get(UI_COOKIE) or "").strip()
-    if cookie:
-        return cookie
-    return (request.query_params.get("key") or "").strip()
-
-
-def _authorized(request: Request) -> bool:
-    if not settings.api_keys:
-        return True
-    return _supplied_key(request) in settings.api_keys
-
-
-def _is_loopback(request: Request) -> bool:
-    """True only for a direct, un-proxied call from the container itself.
-
-    A reverse proxy in front of the gateway also arrives from 127.0.0.1, so any
-    forwarding header means the caller is really remote and must send the key.
-    """
-    if request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip"):
-        return False
-    host = (request.client.host if request.client else "") or ""
-    return host in {"127.0.0.1", "::1", "localhost"}
-
-
 async def _read_json(request: Request) -> dict:
     raw = await request.body()
     if len(raw) > settings.request_body_limit:
@@ -244,6 +219,36 @@ async def _read_json(request: Request) -> dict:
     if not isinstance(payload, dict):
         raise ConversionError("request body must be a JSON object")
     return payload
+
+
+def _client_tag(request: Request) -> str:
+    """Short caller identity for the request log: forwarded IP, else peer."""
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    host = forwarded or (request.client.host if request.client else "") or "-"
+    agent = (request.headers.get("user-agent") or "")[:40]
+    return f"{host} {agent}".strip()
+
+
+def _usage_from_chunk(chunk: str) -> dict | None:
+    """Pull the usage block out of one SSE write.
+
+    ``stream_openai`` emits the upstream's final frame verbatim, so the usage
+    object arrives as part of a ``data:`` line rather than through a callback.
+    """
+    for line in chunk.splitlines():
+        if not line.startswith("data:"):
+            continue
+        text = line[5:].strip()
+        if not text or text == "[DONE]":
+            continue
+        try:
+            event = json.loads(text)
+        except ValueError:
+            continue
+        usage = event.get("usage") if isinstance(event, dict) else None
+        if isinstance(usage, dict):
+            return usage
+    return None
 
 
 def _log_usage(kind: str, model: str, payload: dict, elapsed: float) -> None:
@@ -290,9 +295,6 @@ CONSOLE_HTML = Path(__file__).with_name("console.html")
 # Cookie set by the login form so the console page itself is behind the same
 # key as the API. Readable by JS on purpose: the console needs the key for
 # `Authorization` on every fetch (localStorage is the other copy).
-UI_COOKIE = "mmx_ui"
-UI_COOKIE_MAX_AGE = 30 * 24 * 3600
-
 LOGIN_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -475,26 +477,48 @@ async def chat_completions(request: Request):
 
     model = anthropic_payload["model"]
     started = time.time()
+    client = _client_tag(request)
 
     if body.get("stream"):
         try:
             response = await upstream.messages_stream(anthropic_payload)
         except UpstreamError as exc:
+            metrics_mod.metrics.record(
+                "chat.stream", model, ok=False, status=exc.status,
+                latency_ms=(time.time() - started) * 1000, error=exc.message, client=client,
+            )
             return error_response(exc.status, exc.message)
 
+        account = response.account
+
         async def relay():
+            usage: dict = {}
+            failed = ""
             try:
                 events = iter_sse_events(response.aiter_lines())
                 async for chunk in stream_openai(events, model):
+                    # Usage rides on the final SSE frame; grabbing it here is the
+                    # only way the console can report tokens for streamed calls.
+                    if '"usage"' in chunk:
+                        usage = _usage_from_chunk(chunk) or usage
                     yield chunk
             except Exception as exc:  # noqa: BLE001 - surface to the client
+                failed = str(exc)
                 log.warning("stream aborted: %s", exc)
                 payload = {"error": {"message": str(exc), "type": "upstream_error"}}
                 yield f"data: {json.dumps(payload)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 await response.aclose()
-                _log_usage("chat.stream", model, {}, time.time() - started)
+                _log_usage("chat.stream", model, {"usage": usage}, time.time() - started)
+                metrics_mod.metrics.record(
+                    "chat.stream", model, account=account, ok=not failed,
+                    status=200 if not failed else 502,
+                    latency_ms=(time.time() - started) * 1000,
+                    prompt_tokens=usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
+                    completion_tokens=usage.get("completion_tokens") or usage.get("output_tokens") or 0,
+                    error=failed, client=client,
+                )
 
         return StreamingResponse(
             relay(),
@@ -507,11 +531,23 @@ async def chat_completions(request: Request):
         )
 
     try:
-        payload = await upstream.messages(anthropic_payload)
+        payload, account = await upstream.messages_ex(anthropic_payload)
     except UpstreamError as exc:
+        metrics_mod.metrics.record(
+            "chat", model, ok=False, status=exc.status,
+            latency_ms=(time.time() - started) * 1000, error=exc.message, client=client,
+        )
         return error_response(exc.status, exc.message)
 
     _log_usage("chat", model, payload, time.time() - started)
+    usage = payload.get("usage") or {}
+    metrics_mod.metrics.record(
+        "chat", model, account=account, ok=True, status=200,
+        latency_ms=(time.time() - started) * 1000,
+        prompt_tokens=usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
+        completion_tokens=usage.get("output_tokens") or usage.get("completion_tokens") or 0,
+        client=client,
+    )
     return JSONResponse(content=build_openai_response(payload, model))
 
 
