@@ -667,14 +667,16 @@ function setBusy(busy) {
 async function send() {
   const text = $("prompt").value.trim();
   if (!text) return;
-  const model = $("model").value;
+  // 下拉框可能还没被 /v1/models 填上（打开页面立刻回车），此时退回第一个可用模型，
+  // 否则会用空模型名发请求，回复气泡上也就没有模型标签。
+  let model = $("model").value || (models[0] && models[0].id) || "";
   const stream = $("stream").checked;
 
   $("prompt").value = "";
   addMsg("user", null, text);
   chatHistory.push({ role: "user", content: text });
 
-  const bubble = addMsg("assistant", model);
+  const bubble = addMsg("assistant", model || "默认模型");
   const bodyEl = bubble.querySelector(".body");
   const footEl = bubble.querySelector(".foot");
   const thinkEl = bubble.querySelector(".think");
