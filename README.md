@@ -329,12 +329,29 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/ui?key=sk-local'
 
 | 来源 | 内容 | 存活 |
 |---|---|---|
-| `Token` 计数器 | 每号成功 / 失败 / 在途 / token 累加 | 进程内，重启归零 |
-| `app/metrics.py` | 每个请求一行（环形缓冲 4000 条）+ 聚合 | 进程内，重启归零 |
+| `app/store.py` + `/data/metrics.db` | **每个请求一行**（时间、账号、结果、耗时、token、错误、来源 IP） | 落盘，默认留 3 天，**重启不清** |
+| `Token` 计数器 | 每号「本进程」成功 / 失败 / 在途 | 进程内，重启归零（累计值由上一行聚合） |
 | `app/probe.py` | 每号签到面板 + 积分批次（`credit/details`）+ **真实余额**（`get_membership_info`） | 缓存，每 `PROBE_INTERVAL` 秒刷一次 |
 
-**刻意不落库**：网关的职责是转发，为了画图给它挂一个数据库不划算。页面自己写着「重启清空」，
-不假装这些数字是历史账。
+请求历史落 SQLite（标准库，WAL，后台线程批量写，单条延迟 1 秒内），落在 token 文件旁边
+的 `/data` 卷上。`METRICS_DB` 可以改路径，`off` 退回纯内存；打不开时网关照常跑，
+页面会写「仅内存」而不是假装有历史。
+
+**两种计数口径不一样，这是特性不是 bug**：
+
+| 数字 | 单位 | 在哪看 |
+|---|---|---|
+| 用量页「请求数 / 成功率」 | **一次客户端请求** | 一次请求重试 3 个号算 1 条 |
+| 账号行「成功 / 失败」 | **一次账号尝试** | 同一个请求会同时记 A 号失败、B 号成功，所以尝试数总和 > 请求数 |
+
+账号行的小字「累计 N · 失败 M」是含重启前的全量，上面那组是本次进程的。
+
+#### 时间显示用哪个时区
+
+控制台的时间戳按 `SIGNIN_TIMEZONE`（默认 `Asia/Shanghai`）格式化，**不依赖容器 TZ** ——
+容器默认跑在 UTC，早期版本直接用 `time.localtime`，日志比北京时间慢 8 小时，看起来像坏了。
+`docker compose logs` 的时间由 compose 里的 `TZ` 控制（本仓库默认也设成 `Asia/Shanghai`）。
+日志表带日期（`11-12 20:24:44`），因为历史跨天。
 
 #### 探针在做什么，花不花钱
 
@@ -505,8 +522,8 @@ export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3.1-Flash
 |---|---|
 | `GET /admin/summary` | 导航栏轮询用的轻量快照：池状态、24h 用量、签到合计、异常列表 |
 | `GET /admin/overview` | 账号池页：每号状态/计数 + 探针结果 + 异常 |
-| `GET /admin/usage?hours=24` | 聚合：total / 时序 / 按模型 / 按账号 |
-| `GET /admin/logs?limit=200&q=&outcome=` | 请求日志（环形缓冲，最多 4000 条） |
+| `GET /admin/usage?hours=24` | 聚合：total / 时序 / 按模型 / 按账号（窗口含重启前的历史） |
+| `GET /admin/logs?limit=200&offset=0&q=&outcome=` | 请求日志，倒序分页；返回 `total`（匹配总数）与 `source`（`sqlite` / `memory`） |
 | `GET /admin/capacity?hours=24&days=7` | 容量预测、建议、补号测算、口径说明 |
 | `GET /admin/config` | 生效配置，密钥脱敏 |
 | `GET /admin/models` | 模型目录（含视频模型清单） |
@@ -671,6 +688,9 @@ flowchart LR
 | `SIGNIN_AUTO` | `1` | 有 `TOKEN_POOL` 时每次启动 + 每 6 小时自动签到领积分 |
 | `SIGNIN_TIMEZONE` | `Asia/Shanghai` | 签到时区，必须是 IANA 名字，不能是 `480` 这种偏移 |
 | `SIGNIN_INTERVAL_HOURS` | `6` | 自动签到的检查间隔（最小 10 分钟） |
+| `METRICS_DB` | 空 | 请求历史落盘路径，空 = `/data/metrics.db`（容器内）；`off` = 只在内存 |
+| `METRICS_RETENTION_DAYS` | `3` | 请求历史保留天数，超期在启动时和每 6 小时清一次 |
+| `TZ` | `Asia/Shanghai` | 容器时区，只影响 `docker compose logs`；控制台时间按 `SIGNIN_TIMEZONE` |
 | `MINIMAX_ACCESS_TOKEN` | 空 | 直接给一个 access token（约 12h 失效） |
 | `MINIMAX_REFRESH_TOKEN` | 空 | 只给 refresh token，网关自己续期 |
 | `TOKEN_STORE` | `/data/token.json` | 网关自己管理的 token 文件，会就地刷新 |

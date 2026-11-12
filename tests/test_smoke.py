@@ -675,7 +675,9 @@ def test_request_history_survives_restart() -> None:
     from app.metrics import Metrics
     from app.store import Store
 
-    with tempfile.TemporaryDirectory() as tmp:
+    # ignore_cleanup_errors: Windows keeps the sqlite handle for a moment after
+    # close(), and a failure to unlink a temp file must not fail the assertion.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db = str(Path(tmp) / "requests.db")
         first = Store(db, retention_days=30)
         assert first.available, first.error
@@ -771,6 +773,36 @@ def test_admin_logs_pagination() -> None:
         settings.api_keys = original
 
 
+def test_log_clock_uses_console_timezone() -> None:
+    """The container runs on UTC; the log must still read like a local clock."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from app import metrics as metrics_mod
+    from app.config import settings
+
+    original = settings.signin_timezone
+    ts = 1_700_000_000
+    try:
+        settings.signin_timezone = "Asia/Shanghai"
+        metrics_mod._TZ, metrics_mod._TZ_NAME = None, ""
+        got = metrics_mod._clock(ts)
+        want = datetime.fromtimestamp(ts, ZoneInfo("Asia/Shanghai")).strftime("%m-%d %H:%M:%S")
+        assert got == want, (got, want)
+        assert len(got) == 14, "date is included: history spans days"
+
+        settings.signin_timezone = "UTC"
+        metrics_mod._TZ, metrics_mod._TZ_NAME = None, ""
+        assert metrics_mod._clock(ts) != want
+
+        settings.signin_timezone = "Not/AZone"
+        metrics_mod._TZ, metrics_mod._TZ_NAME = None, ""
+        assert metrics_mod._clock(ts), "an unknown zone falls back instead of raising"
+    finally:
+        settings.signin_timezone = original
+        metrics_mod._TZ, metrics_mod._TZ_NAME = None, ""
+
+
 def test_capacity_math() -> None:
     """补号测算 has to be arithmetically sane, not just pretty."""
     from fastapi.testclient import TestClient
@@ -815,6 +847,7 @@ def main() -> None:
         test_request_history_survives_restart,
         test_store_degrades_to_memory,
         test_admin_logs_pagination,
+        test_log_clock_uses_console_timezone,
         test_capacity_math,
     ]
     for test in tests:

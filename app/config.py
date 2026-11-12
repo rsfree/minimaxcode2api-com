@@ -99,7 +99,7 @@ class Settings:
     # elsewhere. Set to "off" to keep the old memory-only behaviour.
     metrics_db: str = field(default_factory=lambda: _env("METRICS_DB", ""))
     metrics_retention_days: float = field(
-        default_factory=lambda: float(_env("METRICS_RETENTION_DAYS", "30") or 30)
+        default_factory=lambda: float(_env("METRICS_RETENTION_DAYS", "3") or 3)
     )
 
     # Gateway side.

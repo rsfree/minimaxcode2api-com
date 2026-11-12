@@ -509,14 +509,21 @@ async def config() -> dict:
         ("号池", [
             ("号池目录", settings.token_pool or "（未设置，用单 token）", "TOKEN_POOL"),
             ("扫描间隔", f"{settings.pool_watch:.0f} 秒", "TOKEN_POOL_WATCH，0 关闭"),
-            ("冷却：401", "600 秒", "凭证失效"),
-            ("冷却：402", "900 秒", "额度耗尽"),
+            ("冷却：401", "600 秒", "凭证失效，等网关自己续期"),
+            ("冷却：402", "到次日 00:10", "额度用尽，签到时自动解除"),
             ("冷却：429", "60 秒", "被限流"),
         ]),
         ("签到", [
             ("自动签到", "开" if settings.signin_auto else "关", "SIGNIN_AUTO"),
             ("时区", settings.signin_timezone, "必须是 IANA 名字，不能写数字偏移"),
             ("间隔", f"{settings.signin_interval_hours:.0f} 小时", "SIGNIN_INTERVAL_HOURS"),
+        ]),
+        ("历史", [
+            ("请求历史", "磁盘" if store.available else "仅内存（重启清空）", "METRICS_DB"),
+            ("落盘位置", store.path or "—", "在 /data 卷上，和 token 文件同一目录"),
+            ("保留天数", f"{settings.metrics_retention_days:.0f} 天", "METRICS_RETENTION_DAYS"),
+            ("已存行数", f"{store.stats()['rows']:,}", "含重启前的全部请求"),
+            ("时间显示时区", settings.signin_timezone, "控制台按这个时区格式化，不依赖容器 TZ"),
         ]),
         ("控制台", [
             ("探针自动刷新", "开" if settings.probe_auto else "关", "PROBE_AUTO"),

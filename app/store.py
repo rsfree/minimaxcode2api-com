@@ -167,9 +167,19 @@ class Store:
             self.dropped += 1
 
     def _flush_loop(self) -> None:
+        last_purge = time.time()
         while not self._stopping:
             time.sleep(1.0)
             self.flush()
+            # Retention has to hold for a long-running container too, not only
+            # across restarts: one sweep every six hours is plenty for a table
+            # that only grows by appends.
+            if time.time() - last_purge > 21_600:
+                removed = self.purge()
+                if removed:
+                    log.info("purged %d row(s) older than %.0f day(s)",
+                             removed, self.retention_days)
+                last_purge = time.time()
 
     def flush(self) -> int:
         """Drain the queue into the database. Returns rows written."""

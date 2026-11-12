@@ -16,6 +16,10 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+from .config import settings
 
 MAX_ROWS = 4000
 
@@ -65,8 +69,42 @@ class Call:
         )
 
 
+_TZ: object | None = None
+_TZ_NAME = ""
+
+
+def _tz():
+    """Display timezone, taken from SIGNIN_TIMEZONE.
+
+    The container runs on UTC, so ``time.localtime`` printed times eight hours
+    behind what the operator sees on their own clock — which reads as "the log
+    is broken", not "the container is in UTC". Formatting explicitly makes the
+    page independent of the host's TZ setting.
+    """
+    global _TZ, _TZ_NAME
+    name = (settings.signin_timezone or "Asia/Shanghai").strip() or "Asia/Shanghai"
+    if _TZ is not None and _TZ_NAME == name:
+        return _TZ
+    _TZ_NAME = name
+    try:
+        _TZ = ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        # No tzdata (a bare Windows box, a stripped image) or a bad name. UTC is
+        # always available and never wrong by a random offset, which a guessed
+        # +08:00 would be for anyone outside China.
+        import logging
+
+        logging.getLogger("minimax.metrics").warning(
+            "timezone %r unavailable; falling back to UTC for log timestamps", name
+        )
+        _TZ = timezone.utc
+    return _TZ
+
+
 def _clock(ts: float) -> str:
-    return time.strftime("%H:%M:%S", time.localtime(ts))
+    # Date included on purpose: history spans days now, and "12:04:11" alone
+    # cannot tell today from the day before yesterday.
+    return datetime.fromtimestamp(ts, _tz()).strftime("%m-%d %H:%M:%S")
 
 
 def _percentile(values: list[int], q: float) -> int:

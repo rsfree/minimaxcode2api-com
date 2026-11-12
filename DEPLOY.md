@@ -306,6 +306,9 @@ TOKEN_POOL=/data/tokens           # 多账号池目录，设了就优先轮询�
 UPSTREAM_TRANSPORT=auto           # auto / httpx / curl，出口代理重置 Python TLS 时用 curl
 SIGNIN_AUTO=1                     # 有池子时自动签到领积分
 SIGNIN_TIMEZONE=Asia/Shanghai     # 必须是 IANA 名字，写 480 会被拒
+TZ=Asia/Shanghai                  # 容器时区，只影响 docker compose logs（控制台按 SIGNIN_TIMEZONE）
+METRICS_DB=                       # 请求历史落盘路径，空 = /data/metrics.db；off = 只在内存
+METRICS_RETENTION_DAYS=3          # 请求历史保留天数，重启不清
 PROBE_AUTO=1                      # 后台探针（控制台的余额/签到状态来源），不花积分
 PROBE_INTERVAL=300                # 探针间隔秒数，最小 60；0 或 PROBE_AUTO=0 = 只手动刷新
 DEFAULT_MAX_TOKENS=8192
@@ -572,6 +575,8 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | 签到报 `1406010011 invalid timezone_id` | `SIGNIN_TIMEZONE` 写成了偏移量 | 改成 IANA 名字，如 `Asia/Shanghai` |
 | 日志 `daily check-in: nothing to claim` | 今天已经签过了（幂等，不是故障） | 正常；次日 0 点后自动再签 |
 | 签到成功但仍 `402` | 签到积分 30 天有效、**仅限 MiniMax Code** 消耗，且一天才 400 | 多账号分摊，或充值；单号靠签到撑不住高并发 |
+| 控制台日志时间比本地慢 8 小时 | 容器在 UTC，旧版本用 `time.localtime` 格式化 | 升级即可（按 `SIGNIN_TIMEZONE` 格式化，带日期）；`docker compose logs` 的时间由 `TZ` 控制 |
+| 升级后日志还是空的 | 历史上一直存在内存里，第一个落盘版本之前的数据补不回来 | 这是预期：新版本从部署那一刻开始记，之后重启不清 |
 | 控制台「积分余额」一直是 `—` / 探针数据不动 | `PROBE_AUTO=0`、`PROBE_INTERVAL=0`，或首轮还没跑完（启动后 8 秒开始，30 个号约 8 秒） | 点「刷新探针」，或 `curl -X POST -H "X-API-Key: $KEY" .../admin/probes/refresh`；**探针不花积分**，可以随便刷 |
 | 某个号探针报 `401` 但业务请求正常 | 探针不主动续期 token；业务请求触发续期后即恢复 | 不用处理，下一轮自动好；持续 401 说明 refresh token 也失效了 |
 | 日志 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF` | 出口代理只放行 Windows schannel 指纹，拒 Python/OpenSSL 握手 | 留着 `UPSTREAM_TRANSPORT=auto` 让它自动退回 curl（镜像已装 curl） |

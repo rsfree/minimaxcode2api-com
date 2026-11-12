@@ -7,6 +7,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # The image has no tzdata default; without this every timestamp in
+      # `docker compose logs` is UTC while the console shows local time.
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${GATEWAY_PORT:-8080}:8080"
     volumes:
