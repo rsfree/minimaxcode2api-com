@@ -21,11 +21,18 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 
 from . import media
 from .auth import CredentialError, token_manager
@@ -227,11 +234,32 @@ async def root() -> dict:
             "POST /v1/music/generations",
             "GET /v1/media/models",
             "GET /healthz",
+            "GET /ui",
         ],
         "default_model": DEFAULT_MODEL,
         "models": [model.id for model in visible_models()],
         "video_models": list(media.VIDEO_MODELS),
     }
+
+
+CONSOLE_HTML = Path(__file__).with_name("console.html")
+
+
+@app.get("/ui", include_in_schema=False)
+@app.get("/console", include_in_schema=False)
+async def console() -> FileResponse:
+    """Single-file console (chat / image / speech / pool / models).
+
+    No auth on the page itself: it is static HTML and every call it makes goes
+    through the same X-API-Key guard as any other client, so serving it openly
+    leaks nothing. Served with no-store so an upgraded image is picked up on the
+    next reload instead of sitting behind a cached copy.
+    """
+    return FileResponse(
+        CONSOLE_HTML,
+        media_type="text/html; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
 
 
 @app.get("/healthz")

@@ -169,6 +169,29 @@ def test_signin_panel() -> None:
     assert summarize(live)["claimable"] is True
 
 
+def test_console_asset() -> None:
+    """The console is a static file copied into the image — Go-style embed-less.
+
+    Nothing in CI would otherwise notice if it were dropped from the build
+    context, and the route would then 500 at runtime.
+    """
+    from pathlib import Path
+
+    html_path = Path(__file__).resolve().parents[1] / "app" / "console.html"
+    assert html_path.is_file(), f"missing {html_path}"
+    html = html_path.read_text(encoding="utf-8")
+
+    assert "<title>minimax-code2api" in html
+    # Every view the nav can switch to must exist, or the tab silently does nothing.
+    for view in ("chat", "image", "speech", "accounts", "models"):
+        assert f'data-view="{view}"' in html, f"nav missing {view}"
+        assert f'id="view-{view}"' in html, f"section missing {view}"
+
+    # The console talks to the same endpoints the rest of the gateway exposes.
+    for endpoint in ("/v1/chat/completions", "/v1/images/generations", "/v1/audio/speech", "/healthz"):
+        assert endpoint in html, f"console does not call {endpoint}"
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
@@ -177,6 +200,7 @@ def main() -> None:
         test_response_translation,
         test_stream_translation,
         test_signin_panel,
+        test_console_asset,
     ]
     for test in tests:
         test()
