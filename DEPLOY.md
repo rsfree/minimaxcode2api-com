@@ -284,6 +284,42 @@ curl -s $BASE/v1/messages -H "Authorization: Bearer $KEY" \
 
 期望 `{"type":"message",...,"stop_reason":"end_turn"}`。
 
+**⑧ 多模态能力清单与音色（不耗额度）**
+
+```bash
+curl -s $BASE/v1/media/models -H "Authorization: Bearer $KEY" | python3 -m json.tool
+curl -s $BASE/v1/audio/voices -H "Authorization: Bearer $KEY" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print('voices:', d['count'])"
+```
+
+期望：能力清单 4 项（image / video / speech / music）；音色数约为 **332**。
+
+**⑨ 文生图（会扣额度，约 20 秒）**
+
+```bash
+curl -s $BASE/v1/images/generations -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"a red apple on a white table","size":"1024x1024"}'
+```
+
+期望 `data[0].url` 是一个 `agent-cdn.minimax.io` 链接，能直接下载。
+返回 `402` 说明账号额度用完了，不是部署问题 —— 看下面 `402` 那行。
+
+**⑩ 文生视频（异步，最省的一档）**
+
+```bash
+curl -s $BASE/v1/videos/generations -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"MiniMax-Hailuo-2.3","prompt":"a cat walking on grass","duration":6,"resolution":"768P"}'
+# 202 + task_id
+
+curl -s "$BASE/v1/videos/generations/<task_id>?model=MiniMax-Hailuo-2.3" \
+  -H "Authorization: Bearer $KEY"
+```
+
+期望轮询到 `status: succeeded` 并带 `video_url`。若看到
+`503 + status: succeeded + retryable: true`，是上游交付环节没备好文件，继续轮询同一 `task_id`。
+
 ### 关于 `/healthz` 返回 503
 
 含义是「服务活着，但没有可用凭证」。容器不会退出（便于你修凭证而不是陷入重启循环），
@@ -324,6 +360,9 @@ server {
     }
 }
 ```
+
+`proxy_read_timeout` 别低于 **900s**：音乐生成上游超时是 600s，生图最长 300s，
+生视频查询虽然快，但提交在余额不足时会等上游串行排队。
 
 ### Caddy
 
@@ -376,6 +415,11 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | 首字很慢（10s+） | M3.1-Flash 强制思考，先出 `thinking` | 正常；或换 `MiniMax-M2.5-highspeed` |
 | `429` / 限流 | 账号额度或并发限制 | 降并发、错峰，或换账号 |
 | `502 upstream error` + 具体 message | 上游返回的业务错误，原文透传 | 按 message 处理 |
+| 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（文案：`plan balance has run out`） | 桌面端充值，重试无效 |
+| 视频提交 `402` + `this task costs N credits` | 余额不够这一单（H3 4s = 320 credits） | 充值，或改用 `MiniMax-Hailuo-2.3` 6s |
+| 视频查询 `503` + `status: succeeded` | 上游渲染完成但未能交付文件 | 隔几分钟轮询同一 `task_id`，**别重新提交** |
+| 多模态全部 `502`，日志里有 `307` | 出口不行（和聊天是同一个根因） | 配 `UPSTREAM_PROXY`，MCP 走同一个出口 |
+| `reference_images` 没效果 | 传的是本地路径，上游只认公网 URL | 先上传图床/OSS 再传链接 |
 
 看实时日志定位：
 

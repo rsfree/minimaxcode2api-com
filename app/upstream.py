@@ -52,6 +52,22 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+def _mcp_headers(token: str) -> dict[str, str]:
+    """Headers for the desktop MCP proxy (image / video / speech tools).
+
+    The proxy wants the desktop client's user agent and nothing else — sending
+    ``x-api-key`` or ``anthropic-version`` here is harmless but pointless, and
+    ``MiniMaxAgent`` is what the client itself sends.
+    """
+    return {
+        "content-type": "application/json",
+        "accept": "application/json",
+        "accept-encoding": "identity",
+        "authorization": f"Bearer {token}",
+        "user-agent": "MiniMaxAgent",
+    }
+
+
 class Upstream:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
@@ -145,6 +161,62 @@ class Upstream:
             await response.aclose()
             raise _error_from(response.status_code, body)
         return response
+
+    async def mcp(self, tool: str, payload: dict, timeout: float = 120.0) -> dict:
+        """POST a desktop MCP tool call and return the decoded JSON body.
+
+        Generation tools answer ``200`` with a business ``code`` inside the
+        envelope, so a 200 here does not mean success — ``media.call`` owns that
+        check.
+        """
+        await self.startup()
+        token = await token_manager.get()
+        url = f"{settings.mcp_url}/{tool}"
+
+        attempt = 0
+        while True:
+            attempt += 1
+            request = self.client.build_request(
+                "POST",
+                url,
+                json=payload,
+                headers=_mcp_headers(token),
+                timeout=timeout,
+            )
+            response = await self.client.send(request)
+            body = await response.aread()
+            await response.aclose()
+
+            if response.status_code in {301, 302, 307, 308}:
+                raise UpstreamError(
+                    502,
+                    REDIRECT_HINT.format(
+                        location=response.headers.get("location", "?"),
+                        region=settings.region,
+                        base_url=settings.base_url,
+                    ),
+                )
+
+            if response.status_code == 401 and attempt == 1:
+                log.warning("mcp %s rejected the token; refreshing once", tool)
+                try:
+                    token = await token_manager.get(force=True)
+                except CredentialError as exc:
+                    raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
+                continue
+
+            if response.status_code != 200:
+                raise _error_from(response.status_code, body)
+
+            import json
+
+            try:
+                decoded = json.loads(body)
+            except ValueError as exc:  # pragma: no cover - upstream contract change
+                raise UpstreamError(502, f"upstream returned non-JSON: {body[:300]!r}") from exc
+            if not isinstance(decoded, dict):
+                raise UpstreamError(502, f"unexpected upstream payload: {body[:300]!r}")
+            return decoded
 
 
 def _error_from(status: int, body: bytes) -> UpstreamError:

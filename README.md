@@ -7,6 +7,7 @@
 - 一个进程，两个协议：`/v1/chat/completions`（OpenAI）、`/v1/messages`（Anthropic）
 - 流式、工具调用（function calling）、思考内容（`reasoning_content`）全支持
 - 6 个可用模型，**含 100 万上下文**的 M3 / M3.1-Flash
+- **多模态同一条通道**：文生图、文/图生视频、TTS、音乐，一起变成 HTTP 接口
 - 无状态、单容器、可 Docker 部署；token 到期自动续期
 
 ---
@@ -38,6 +39,19 @@
 | ~~`MiniMax-M2`~~ / ~~`MiniMax-M2.1`~~ | — | — | — | 上游已下线（错误码 2069） |
 
 别名可用：`m3`、`m3.1`、`m2.7`、`m2.5`、`minimax`、`default`。
+
+### 多模态能力（同一条通道，另一组端点）
+
+| 能力 | 上游工具 | 网关端点 | 实测状态 |
+|---|---|---|---|
+| 文生图 / 图生图 | `image_synthesize` | `POST /v1/images/generations` | ✅ 200，1 张 1K 约 20 秒 |
+| 文生视频 / 图生视频 | `submit_video_generation` + `query_video_generation` | `POST /v1/videos/generations` | ✅ 提交成功（202 + task_id），查询状态流转 `running → succeeded`；**文件交付环节见 §3.7** |
+| 语音合成 | `synthesize_speech` | `POST /v1/audio/speech` | 端点与参数已验证；实测时余额已耗尽（402） |
+| 音色列表 | `get_voice_list` | `GET /v1/audio/voices` | ✅ 200，332 个音色 |
+| 音乐 / BGM | `batch_text_to_music` | `POST /v1/music/generations` | 端点与参数已验证；同上受余额限制 |
+| 图片 / 视频 / 音频理解 | `images_understand` 等 | 暂未封装 | 上游要的是本地 workspace 路径，需先做文件上传，见下方边界 |
+
+视频模型：`MiniMax-H3`、`MiniMax-Hailuo-2.3`。
 
 ---
 
@@ -159,9 +173,107 @@ export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3.1-Flash
 |---|---|
 | `GET /` | 名称、端点清单、模型列表（不需要 key） |
 | `GET /healthz` | 200 = 有可用凭证；503 = 缺凭证，附原因 |
-| `GET /v1/models` | OpenAI 格式模型列表 |
+| `GET /v1/models` | OpenAI 格式模型列表；加 `?include_media=true` 连多模态一起列 |
 | `GET /v1/models/meta` | 带上下文长度、能力标记 |
+| `GET /v1/media/models` | 多模态能力清单（参数范围、对应端点） |
 | `POST /v1/messages/count_tokens` | 粗估 token 数（上游不开放 tokenizer） |
+
+### 3.4 文生图
+
+```
+POST /v1/images/generations
+```
+
+OpenAI 同样式的请求体，只改 `base_url` 就能用现成的图片客户端。
+
+```bash
+curl -s http://127.0.0.1:8080/v1/images/generations \
+  -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
+  -d '{"prompt":"a red apple on a white table, product photo","n":1,"size":"1024x1024"}'
+```
+
+```json
+{
+  "created": 1794452319,
+  "data": [{"url": "https://agent-cdn.minimax.io/mcp/u576.../image_tool/output/1794452319_8d06712a.png"}],
+  "model": "image"
+}
+```
+
+| 参数 | 说明 |
+|---|---|
+| `prompt` | 必填 |
+| `n` | 1–10，一次调用内部批量生成 |
+| `size` | `1024x1024`、`1792x1024` 等。网关把它换算成上游的 `aspect_ratio` + `resolution` |
+| `resolution` | 直接指定 `1K` / `2K` / `4K`（覆盖 `size` 推导结果） |
+| `aspect_ratio` | 直接指定 `16:9`、`1:1`、`9:16` 等（覆盖 `size` 推导结果） |
+| `reference_images` | 参考图 URL 数组，最多 4 张（图生图） |
+| `response_format` | `url`（默认，直接给 CDN 链接）或 `b64_json`（网关下载后转 base64） |
+
+### 3.5 文生视频 / 图生视频
+
+视频是**异步**的：提交拿 `task_id`，再轮询。上游没有 OpenAI 式的视频协议，这里用 REST 风格自定义。
+
+```bash
+# 1) 提交
+curl -s http://127.0.0.1:8080/v1/videos/generations \
+  -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
+  -d '{"model":"MiniMax-Hailuo-2.3","prompt":"a cat walking on grass","duration":6,"resolution":"768P"}'
+# → 202 {"id":"462436026450282","status":"submitted","model":"MiniMax-Hailuo-2.3", ...}
+
+# 2) 轮询（model 必须和提交时一致）
+curl -s "http://127.0.0.1:8080/v1/videos/generations/462436026450282?model=MiniMax-Hailuo-2.3" \
+  -H "Authorization: Bearer sk-local"
+# → {"status":"running", ...} → {"status":"succeeded","video_url":"https://..."}
+```
+
+| 模型 | 时长 | 分辨率 | 特点 |
+|---|---|---|---|
+| `MiniMax-H3` | 4–15 秒（整数） | `768P` / `2K` | 原生同步音频，支持首尾帧 + 多模态参考（图 1-9、视频 1-3、音频 1-3） |
+| `MiniMax-Hailuo-2.3` | 仅 `6` 或 `10` 秒 | `768P` / `1080P` | 只吃一张首帧图，便宜 |
+
+请求字段：
+
+| 字段 | 说明 |
+|---|---|
+| `prompt` | 必填，≤7000 字符 |
+| `image` | 首帧图（公网 URL）。MiniMax-Hailuo-2.3 只接受一张 |
+| `last_frame_image` | 尾帧图，**仅 H3** |
+| `reference_images` / `reference_videos` / `reference_audios` | **仅 H3**，公网 URL 数组 |
+| `ratio` | `21:9 16:9 4:3 1:1 3:4 9:16 adaptive`；H3 纯文本模式不接受 `adaptive` |
+| `resolution` | H3 默认 `2K`；Hailuo 默认 `768P`（10 秒只能 768P） |
+
+### 3.6 语音合成 / 音乐
+
+```bash
+# 音色列表（332 个）
+curl -s http://127.0.0.1:8080/v1/audio/voices -H "Authorization: Bearer sk-local"
+
+# TTS，直接返回 mp3 字节流（OpenAI /v1/audio/speech 同样式）
+curl -s http://127.0.0.1:8080/v1/audio/speech \
+  -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
+  -d '{"input":"hello world","voice":"English_expressive_narrator","speed":1.0}' > out.mp3
+
+# 音乐 / BGM（prompt 长度 10–300 字符）
+curl -s http://127.0.0.1:8080/v1/music/generations \
+  -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
+  -d '{"prompt":"upbeat lofi hip hop with warm piano, 90 bpm"}'
+```
+
+TTS 额外支持 `emotion`（`happy` / `sad` / `angry` / `fearful` / `disgusted` / `surprised` / `neutral`）、
+`volume`、`pitch`。**只输出 mp3**：上游不提供其它容器格式，要 `wav` 请自行转码。
+
+### 3.7 多模态的错误语义
+
+上游把业务码塞在 HTTP 200 里，网关把它们翻成真正的 HTTP 状态，并**原样保留上游文案**：
+
+| 上游 `code` | 网关 HTTP | 含义 | 能做什么 |
+|---|---|---|---|
+| `402` | 402 | 账号额度耗尽（文案会明确说 plan balance has run out） | 充值，重试无用 |
+| `503`（视频查询） | 503 + `status: succeeded` + `retryable: true` | 任务已渲染完成，但服务端没备好文件交付 | 继续轮询同一个 `task_id`，**不要重新提交** |
+| `401` | 401 | token 失效 | 网关会自动刷新一次 |
+
+视频任务的 `status` 取值：`submitted` / `queued` / `running` / `succeeded` / `failed` / `cancelled`。
 
 ---
 
@@ -171,6 +283,10 @@ export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3.1-Flash
 flowchart LR
     C[客户端<br/>OpenAI / Anthropic SDK] -->|Bearer sk-local| G[minimax-code2api]
     G -->|Bearer &lt;OAuth token&gt;<br/>x-api-key: sk-xxx| U[agent.minimax.io<br/>/mavis/api/v1/llm/v1/messages]
+    G -->|Bearer &lt;OAuth token&gt;<br/>UA: MiniMaxAgent| M[agent.minimax.io<br/>/mavis/api/v1/mcp/&lt;tool&gt;]
+    M --> IMG[image_synthesize]
+    M --> VID[submit / query_video_generation]
+    M --> TTS[synthesize_speech / batch_text_to_music]
     G -.->|401 时刷新一次| O[account.minimax.io<br/>/oauth2/token]
     G -.->|可选出口| P[UPSTREAM_PROXY]
 ```
@@ -191,6 +307,7 @@ flowchart LR
 | `TOKEN_STORE` | `/data/token.json` | 网关自己管理的 token 文件，会就地刷新 |
 | `MINIMAX_AUTH_FILE` | 自动探测 | 桌面端 `auth.json` 路径 |
 | `MINIMAX_BASE_URL` | 按区域 | 上游 LLM 地址 |
+| `MINIMAX_MCP_BASE` | 由 `MINIMAX_BASE_URL` 推导 | 上游多模态 MCP 代理地址，默认把 `/llm/v1` 换成 `/mcp` |
 | `DEFAULT_MAX_TOKENS` | `8192` | 客户端没传 `max_tokens` 时用 |
 | `UPSTREAM_TIMEOUT` | `600` | 上游超时（秒） |
 | `REQUEST_BODY_LIMIT` | 64 MiB | 请求体上限 |
@@ -207,6 +324,10 @@ flowchart LR
 | `404 ... no longer available (2069)` | 模型已下线（M2 / M2.1） | 换 M2.5 及以上 |
 | `503` on `/healthz` | 没有可用凭证 | 用 `python -m app.login` 登录，或挂载 `auth.json` |
 | 流式到一半断 | 反代缓冲或读超时 | nginx 关 `proxy_buffering`，`proxy_read_timeout` 拉长 |
+| 生图 / TTS 返回 `402` | 账号额度耗尽，文案里会写 `plan balance has run out` | 桌面端充值；**重试无效** |
+| 视频查询 `503` 但 `status: succeeded` | 任务渲染完成，服务端没备好文件交付 | 隔几分钟轮询同一 `task_id`；不要重新提交（会再扣一次） |
+| 视频提交 `402` + `this task costs N credits` | 余额不够这一单 | 充值，或换 `MiniMax-Hailuo-2.3`（比 H3 便宜） |
+| `reference_images` 不生效 | 参考图必须是**公网可达 URL**，本地路径网关读不到 | 先上传到图床 / OSS 再传 URL |
 | Credits 用完 | 这是账号额度，不是 API 配额 | 桌面端充值，或换官方开放平台 Key |
 
 ---
@@ -215,6 +336,7 @@ flowchart LR
 
 ```bash
 python tests/test_smoke.py          # 无网络，翻译层单元测试，CI 会跑
+python tests/test_media.py          # 无网络，多模态参数换算与错误映射
 GATEWAY=http://127.0.0.1:8080 GATEWAY_KEY=sk-local \
   python tests/test_sdk_compat.py   # 需要真实凭证，跑官方 openai / anthropic SDK
 ```
@@ -224,6 +346,13 @@ GATEWAY=http://127.0.0.1:8080 GATEWAY_KEY=sk-local \
 ## 八、边界与风险
 
 - **个人额度通道**，不是商业 API。并发高会撞账号限流，Credits 按量扣。
+- **生图 / 视频 / TTS / 音乐各自计费**，和聊天额度是同一条 account credits 池（视频另可能走 M Plan 周额度）。
+  一次 H3 4 秒视频实测报价 **320 credits**，比聊天贵得多。
+- **参考图必须是公网 URL**。桌面端是先上传本地文件到 OSS 再把签名 URL 传给上游；网关不做这一步，
+  所以 `reference_images` / `image` / `last_frame_image` 目前只接受 HTTP(S) 地址。
+  要把本地文件也支持上，需要补 `get_upload_url` + PUT 的上传流程（上游接口已知，见 `image-tools.client.js`）。
+- **生图/视频结果是 CDN 链接**，不是网关切下来存的字节。链接会过期（H3 签名 URL 约 9 小时），
+  需要长期保存请自己转存。
 - **非官方接口**，MiniMax 改协议就可能失效。好消息是出错会明确报错，不会静默降级。
 - **凭证即账号**：`auth.json` / `token.json` 泄露等于账号被别人用。不要提交进 git。
 - 本项目只做协议转换与凭证管理，**不绕过任何计费**。

@@ -20,6 +20,13 @@ REGION_LLM_BASE = {
     "cn": "https://agent.minimax.cn/mavis/api/v1/llm/v1",
 }
 
+# The multimodal tools (image / video / speech / music / ASR) live on the same
+# managed host but under the desktop gateway's MCP proxy, not the LLM path.
+REGION_MCP_BASE = {
+    "en": "https://agent.minimax.io/mavis/api/v1/mcp",
+    "cn": "https://agent.minimax.cn/mavis/api/v1/mcp",
+}
+
 # The managed desktop channel authenticates with the OAuth access token in
 # `Authorization` and a fixed placeholder in `x-api-key`. Both must be present:
 # the upstream rejects a missing `x-api-key` with "token is required".
@@ -53,6 +60,7 @@ class Settings:
 
     # Upstream LLM endpoint (Anthropic Messages wire format).
     base_url: str = field(default_factory=lambda: _env("MINIMAX_BASE_URL"))
+    mcp_base: str = field(default_factory=lambda: _env("MINIMAX_MCP_BASE"))
     account_base: str = field(default_factory=lambda: _env("MINIMAX_ACCOUNT_BASE"))
     request_timeout: float = field(default_factory=lambda: float(_env("UPSTREAM_TIMEOUT", "600") or 600))
 
@@ -89,6 +97,15 @@ class Settings:
     @property
     def messages_url(self) -> str:
         return f"{self.base_url}/messages"
+
+    @property
+    def mcp_url(self) -> str:
+        """Base URL of the desktop MCP proxy (image / video / speech tools)."""
+        if self.mcp_base:
+            return self.mcp_base.rstrip("/")
+        if self.base_url.endswith("/llm/v1"):
+            return f"{self.base_url[: -len('/llm/v1')]}/mcp"
+        return REGION_MCP_BASE[self.region]
 
     def default_auth_file(self) -> Path | None:
         """Locate the desktop client's credential file for the active region."""

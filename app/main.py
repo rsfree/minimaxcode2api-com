@@ -5,11 +5,17 @@ Surface:
 * ``POST /v1/chat/completions`` — OpenAI-compatible, streaming and buffered.
 * ``POST /v1/messages``         — Anthropic Messages passthrough.
 * ``GET  /v1/models``           — catalogue for client pickers.
+* ``POST /v1/images/generations`` — OpenAI-compatible image generation.
+* ``POST /v1/videos/generations`` — async video submit; ``GET .../{task_id}`` polls.
+* ``POST /v1/audio/speech``     — text to speech (mp3).
+* ``GET  /v1/audio/voices``     — voice catalogue for the speech endpoint.
+* ``POST /v1/music/generations``— music / BGM generation.
 * ``GET  /healthz``             — liveness plus credential status.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import time
@@ -17,8 +23,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
+from . import media
 from .auth import CredentialError, token_manager
 from .catalog import DEFAULT_MODEL, resolve_model, visible_models
 from .config import settings
@@ -29,6 +36,7 @@ from .convert import (
     iter_sse_events,
     stream_openai,
 )
+from .media import MediaError
 from .upstream import UpstreamError, upstream
 
 logging.basicConfig(
@@ -65,6 +73,24 @@ def error_response(status: int, message: str, code: str = "upstream_error") -> J
         status_code=status,
         content={"error": {"message": message, "type": code, "code": code}},
     )
+
+
+def media_error_response(exc: MediaError) -> JSONResponse:
+    """Surface a media tool failure with the upstream message intact.
+
+    The 402 text from this channel is the only notice that the account balance is
+    gone, so it is passed through verbatim instead of being rewritten.
+    """
+    body: dict[str, Any] = {
+        "error": {
+            "message": exc.message,
+            "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
+            "code": exc.code,
+        }
+    }
+    if exc.status_field:
+        body["status"] = exc.status_field
+    return JSONResponse(status_code=exc.status, content=body)
 
 
 def _authorized(request: Request) -> bool:
@@ -119,10 +145,18 @@ async def root() -> dict:
             "POST /v1/chat/completions",
             "POST /v1/messages",
             "GET /v1/models",
+            "POST /v1/images/generations",
+            "POST /v1/videos/generations",
+            "GET /v1/videos/generations/{task_id}",
+            "POST /v1/audio/speech",
+            "GET /v1/audio/voices",
+            "POST /v1/music/generations",
+            "GET /v1/media/models",
             "GET /healthz",
         ],
         "default_model": DEFAULT_MODEL,
         "models": [model.id for model in visible_models()],
+        "video_models": list(media.VIDEO_MODELS),
     }
 
 
@@ -154,8 +188,21 @@ async def healthz() -> JSONResponse:
 
 @app.get("/v1/models")
 @app.get("/models")
-async def list_models() -> dict:
-    return {"object": "list", "data": [model.to_openai() for model in visible_models()]}
+async def list_models(include_media: bool = False) -> dict:
+    data = [model.to_openai() for model in visible_models()]
+    if include_media:
+        data.extend(
+            [
+                {"id": "minimax-image", "object": "model", "owned_by": "minimax", "type": "image"},
+                {"id": "minimax-speech", "object": "model", "owned_by": "minimax", "type": "audio"},
+                {"id": "minimax-music", "object": "model", "owned_by": "minimax", "type": "audio"},
+                *[
+                    {"id": model, "object": "model", "owned_by": "minimax", "type": "video"}
+                    for model in media.VIDEO_MODELS
+                ],
+            ]
+        )
+    return {"object": "list", "data": data}
 
 
 @app.get("/v1/models/meta")
@@ -301,3 +348,378 @@ async def count_tokens(request: Request):
 @app.get("/favicon.ico")
 async def favicon() -> PlainTextResponse:
     return PlainTextResponse("", status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# multimodal — image / video / speech / music
+# ---------------------------------------------------------------------------
+def _as_url_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if isinstance(item, str) and item]
+    return []
+
+
+@app.get("/v1/media/models")
+async def list_media_models() -> dict:
+    """Capability catalogue for the multimodal endpoints."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "image",
+                "object": "media.model",
+                "type": "image",
+                "endpoint": "POST /v1/images/generations",
+                "options": {
+                    "n": "1-10 per call",
+                    "size": "e.g. 1024x1024, 1792x1024, 1024x1792",
+                    "resolution": "1K | 2K | 4K",
+                    "aspect_ratio": "21:9 16:9 3:2 4:3 1:1 4:5 3:4 2:3 9:16",
+                    "reference_images": "public https URLs, up to 4",
+                },
+            },
+            {
+                "id": "video",
+                "object": "media.model",
+                "type": "video",
+                "endpoint": "POST /v1/videos/generations, GET /v1/videos/generations/{id}",
+                "options": {
+                    "models": list(media.VIDEO_MODELS),
+                    "duration": "MiniMax-H3: 4-15s; MiniMax-Hailuo-2.3: 6 or 10s",
+                    "resolution": "768P | 1080P | 2K",
+                    "ratio": "21:9 16:9 4:3 1:1 3:4 9:16 adaptive",
+                    "image": "first frame (public URL)",
+                    "last_frame_image": "MiniMax-H3 only (public URL)",
+                    "reference_images": "MiniMax-H3 only, 1-9",
+                },
+            },
+            {
+                "id": "speech",
+                "object": "media.model",
+                "type": "audio",
+                "endpoint": "POST /v1/audio/speech, GET /v1/audio/voices",
+                "options": {"format": "mp3", "emotion": "happy sad angry fearful disgusted surprised neutral"},
+            },
+            {
+                "id": "music",
+                "object": "media.model",
+                "type": "audio",
+                "endpoint": "POST /v1/music/generations",
+                "options": {"lyrics": "optional", "format": "mp3"},
+            },
+        ],
+    }
+
+
+@app.post("/v1/images/generations")
+@app.post("/images/generations")
+async def images_generations(request: Request):
+    if not _authorized(request):
+        return error_response(401, "invalid gateway api key", "authentication_error")
+    try:
+        body = await _read_json(request)
+    except ConversionError as exc:
+        return error_response(400, str(exc), "invalid_request_error")
+
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return error_response(400, "prompt is required", "invalid_request_error")
+
+    try:
+        n = int(body.get("n") or 1)
+    except (TypeError, ValueError):
+        return error_response(400, "n must be an integer", "invalid_request_error")
+    n = max(1, min(n, 10))
+
+    reference_urls = _as_url_list(
+        body.get("reference_images") or body.get("image") or body.get("input_urls")
+    )
+    response_format = (body.get("response_format") or "url").lower()
+
+    started = time.time()
+    try:
+        result = await media.image_generate(
+            prompt=prompt,
+            n=n,
+            size=body.get("size"),
+            aspect_ratio=body.get("aspect_ratio"),
+            resolution=body.get("resolution"),
+            reference_urls=reference_urls,
+        )
+    except MediaError as exc:
+        return media_error_response(exc)
+
+    data: list[dict[str, Any]] = []
+    if response_format == "b64_json":
+        for image in result["images"]:
+            try:
+                raw = await media.download(image["url"])
+            except MediaError as exc:
+                return media_error_response(exc)
+            data.append({"b64_json": base64.b64encode(raw).decode("ascii")})
+    else:
+        data = [{"url": image["url"]} for image in result["images"]]
+
+    log.info("ok kind=image n=%d %.2fs", len(data), time.time() - started)
+    return JSONResponse(
+        content={
+            "created": int(time.time()),
+            "data": data,
+            "model": body.get("model") or "image",
+        }
+    )
+
+
+@app.post("/v1/videos/generations")
+@app.post("/videos/generations")
+async def videos_generations(request: Request):
+    """Submit an async video task. Poll ``GET /v1/videos/generations/{id}``."""
+    if not _authorized(request):
+        return error_response(401, "invalid gateway api key", "authentication_error")
+    try:
+        body = await _read_json(request)
+    except ConversionError as exc:
+        return error_response(400, str(exc), "invalid_request_error")
+
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return error_response(400, "prompt is required", "invalid_request_error")
+
+    try:
+        model = media.normalize_video_model(body.get("model"))
+    except MediaError as exc:
+        return media_error_response(exc)
+
+    payload: dict[str, Any] = {"model": model, "prompt": prompt}
+
+    duration = body.get("duration") or body.get("duration_seconds")
+    if duration is None:
+        duration = 6 if model == "MiniMax-Hailuo-2.3" else 6
+    try:
+        payload["duration"] = int(duration)
+    except (TypeError, ValueError):
+        return error_response(400, "duration must be an integer", "invalid_request_error")
+
+    resolution = body.get("resolution")
+    if resolution:
+        payload["resolution"] = resolution
+    ratio = body.get("ratio") or body.get("aspect_ratio")
+    if ratio:
+        payload["ratio"] = ratio
+
+    first_frame = body.get("image") or body.get("image_url") or body.get("first_frame_image")
+    if isinstance(first_frame, str) and first_frame:
+        payload["input_image_path"] = first_frame
+    last_frame = body.get("last_frame_image") or body.get("last_frame_image_url")
+    if isinstance(last_frame, str) and last_frame:
+        payload["last_frame_image_path"] = last_frame
+    if body.get("reference_type"):
+        payload["reference_type"] = body["reference_type"]
+
+    reference_images = _as_url_list(body.get("reference_images"))
+    if reference_images:
+        payload["reference_image_paths"] = reference_images
+    reference_videos = _as_url_list(body.get("reference_videos"))
+    if reference_videos:
+        payload["reference_video_paths"] = reference_videos
+        durations = body.get("reference_video_durations")
+        if isinstance(durations, list) and len(durations) == len(reference_videos):
+            payload["reference_video_duration_seconds"] = durations
+    reference_audios = _as_url_list(body.get("reference_audios"))
+    if reference_audios:
+        payload["reference_audio_paths"] = reference_audios
+
+    started = time.time()
+    try:
+        response = await media.video_submit(payload)
+    except MediaError as exc:
+        return media_error_response(exc)
+
+    task_id = response.get("task_id")
+    if not task_id:
+        return error_response(502, "upstream did not return a task_id")
+    log.info("ok kind=video.submit model=%s id=%s %.2fs", model, task_id, time.time() - started)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "id": str(task_id),
+            "object": "video.generation",
+            "status": response.get("status") or "submitted",
+            "model": model,
+            "duration": payload["duration"],
+            "resolution": payload.get("resolution"),
+            "created": int(time.time()),
+            "poll": f"/v1/videos/generations/{task_id}?model={model}",
+        },
+    )
+
+
+@app.get("/v1/videos/generations/{task_id}")
+@app.get("/videos/generations/{task_id}")
+async def videos_generations_get(request: Request, task_id: str, model: str | None = None):
+    if not _authorized(request):
+        return error_response(401, "invalid gateway api key", "authentication_error")
+    try:
+        resolved = media.normalize_video_model(model)
+    except MediaError as exc:
+        return media_error_response(exc)
+
+    try:
+        response = await media.video_query(task_id, resolved)
+    except MediaError as exc:
+        body = {
+            "error": {
+                "message": exc.message,
+                "type": "upstream_error",
+                "code": exc.code,
+            },
+            "id": task_id,
+            "object": "video.generation",
+            "model": resolved,
+        }
+        if exc.status_field:
+            body["status"] = exc.status_field
+        # The channel reports 503 when the task rendered but the server could not
+        # stage the file yet. That is worth another poll, not a resubmit.
+        if exc.code == 503:
+            body["retryable"] = True
+        return JSONResponse(status_code=exc.status, content=body)
+
+    status = response.get("status") or "unknown"
+    body = {
+        "id": str(response.get("task_id") or task_id),
+        "object": "video.generation",
+        "status": status,
+        "model": resolved,
+    }
+    video_url = response.get("video_url")
+    if video_url:
+        body["video_url"] = video_url
+    if response.get("duration") is not None:
+        body["duration"] = response["duration"]
+    if response.get("resolution"):
+        body["resolution"] = response["resolution"]
+    if response.get("message"):
+        body["message"] = response["message"]
+    return JSONResponse(content=body)
+
+
+@app.post("/v1/audio/speech")
+@app.post("/audio/speech")
+async def audio_speech(request: Request):
+    if not _authorized(request):
+        return error_response(401, "invalid gateway api key", "authentication_error")
+    try:
+        body = await _read_json(request)
+    except ConversionError as exc:
+        return error_response(400, str(exc), "invalid_request_error")
+
+    text = body.get("input") or body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return error_response(400, "input is required", "invalid_request_error")
+
+    response_format = (body.get("response_format") or "mp3").lower()
+    if response_format not in {"mp3", "mpeg"}:
+        return error_response(
+            400,
+            f"response_format {response_format!r} is not supported: the managed channel "
+            "only returns mp3",
+            "invalid_request_error",
+        )
+
+    started = time.time()
+    try:
+        url = await media.speech(
+            text=text,
+            voice_id=body.get("voice") or body.get("voice_id"),
+            speed=body.get("speed"),
+            volume=body.get("volume"),
+            pitch=body.get("pitch"),
+            emotion=body.get("emotion"),
+        )
+        audio = await media.download(url)
+    except MediaError as exc:
+        return media_error_response(exc)
+
+    log.info("ok kind=speech bytes=%d %.2fs", len(audio), time.time() - started)
+    return Response(
+        content=audio,
+        media_type="audio/mpeg",
+        headers={"cache-control": "no-store"},
+    )
+
+
+@app.get("/v1/audio/voices")
+@app.get("/audio/voices")
+async def audio_voices(request: Request, language: str | None = None):
+    if not _authorized(request):
+        return error_response(401, "invalid gateway api key", "authentication_error")
+    try:
+        response = await media.voices()
+    except MediaError as exc:
+        return media_error_response(exc)
+
+    items = response.get("available_voices") or []
+    if language:
+        needle = language.lower()
+        items = [
+            voice
+            for voice in items
+            if isinstance(voice, dict)
+            and needle in str(voice.get("voice_id", "")).lower()
+        ]
+    return JSONResponse(
+        content={"object": "list", "data": items, "count": len(items)}
+    )
+
+
+@app.post("/v1/music/generations")
+@app.post("/music/generations")
+async def music_generations(request: Request):
+    if not _authorized(request):
+        return error_response(401, "invalid gateway api key", "authentication_error")
+    try:
+        body = await _read_json(request)
+    except ConversionError as exc:
+        return error_response(400, str(exc), "invalid_request_error")
+
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return error_response(400, "prompt is required", "invalid_request_error")
+    if not 10 <= len(prompt) <= 300:
+        return error_response(
+            400,
+            "prompt length must be between 10 and 300 characters",
+            "invalid_request_error",
+        )
+
+    try:
+        n = max(1, min(int(body.get("n") or 1), 5))
+    except (TypeError, ValueError):
+        return error_response(400, "n must be an integer", "invalid_request_error")
+
+    started = time.time()
+    try:
+        result = await media.music(
+            prompt=prompt,
+            lyrics=body.get("lyrics"),
+            sample_rate=body.get("sample_rate"),
+            bitrate=body.get("bitrate"),
+            audio_format=body.get("response_format") or body.get("format"),
+            n=n,
+        )
+    except MediaError as exc:
+        return media_error_response(exc)
+
+    log.info("ok kind=music n=%d %.2fs", len(result["tracks"]), time.time() - started)
+    return JSONResponse(
+        content={
+            "created": int(time.time()),
+            "data": result["tracks"],
+            "model": body.get("model") or "music",
+        }
+    )
