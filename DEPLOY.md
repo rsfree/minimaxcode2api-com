@@ -209,6 +209,32 @@ TOKEN_POOL=/data/tokens
 
 不带 `TOKEN_POOL` 时仍走 `TOKEN_STORE` 单 token，两者不冲突，池子优先。
 
+#### 扩容：加号不用重启
+
+网关每 10 秒扫一次池目录（`TOKEN_POOL_WATCH`，秒，`0` 关闭）。新账号文件落进去就自动进轮询，
+删掉文件就自动退池，**不用 `docker compose restart`**，正在跑的请求也不受影响。
+
+```bash
+# 在宿主机的 /opt/minimax-code2api 下：用一次性容器写同一个卷
+docker compose run --rm --entrypoint python minimax-code2api \
+  -m app.provision --email new@mail.example.com --password 'Pa55word1' --out /data/tokens
+
+# 等 10 秒，看池子变大（不要 restart）
+curl -s http://127.0.0.1:39600/healthz |
+  python3 -c "import json,sys;d=json.load(sys.stdin);print(d['pool_size'],[a['label'] for a in d['accounts']])"
+
+docker compose logs --tail 20 | grep pool
+# minimax.auth pool: +1 account new@mail.example.com
+# minimax.auth pool reloaded: 9 account(s) (+1/-0)
+```
+
+规则：
+
+- **只增删、不覆盖** —— 内存里已轮换过的 token 不会被磁盘旧值顶掉；
+- 批量加号就把 `accounts.txt` 放进 `/opt/minimax-code2api/data/` 再跑 `--file`；
+- 单号下线 `rm data/tokens/<label>.json` 即可，别在网关运行时用别处副本覆盖同一个文件
+  （refresh token 一经轮换，旧副本就是废的）。
+
 > **一个账号没有某个模型的权限是正常的**（例如个别号没有 M3.1）。网关收到
 > `400 unknown model` 会自动换下一个账号重试，不会把错误抛给客户端。
 

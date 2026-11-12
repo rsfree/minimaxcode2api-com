@@ -371,7 +371,7 @@ audio { width: 100%; margin-top: 10px; }
         <div class="stat"><div class="v" id="sRegion">-</div><div class="k">区域</div></div>
       </div>
       <div class="box">
-        <header><h3>账号池 <span class="hint">GET /healthz</span></h3><div class="grow"></div>
+        <header><h3>账号池 <span class="hint" id="accHint">GET /healthz</span></h3><div class="grow"></div>
           <span class="note" id="accNote"></span></header>
         <div class="tbl-wrap"><table class="tbl" id="accTable">
           <thead><tr><th class="mark"></th><th>账号</th><th>状态</th><th>已用</th><th>冷却</th><th>最近错误</th></tr></thead>
@@ -545,6 +545,9 @@ function renderHealth(d, ok) {
   $("sRegion").textContent = d.region || "-";
   $("accNote").textContent = d.status === "degraded" && d.error ? d.error : "";
   $("accNote").title = $("accNote").textContent;
+  $("accHint").textContent = d.pool_watch_seconds
+    ? "GET /healthz · 新账号 " + d.pool_watch_seconds + " 秒内自动进池，无需重启"
+    : "GET /healthz";
 
   const body = $("accBody");
   if (!accounts.length) {

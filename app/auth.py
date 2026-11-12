@@ -52,7 +52,9 @@ class Token:
     expires_at_ms: int | None = None
     label: str = ""
     origin: Path | None = None      # file this record came from, if any
+    position: int = 0               # index inside that file (one file may hold an array)
     index: int = 0
+    pooled: bool = False            # True only for records read from TOKEN_POOL
     cooldown_until: float = 0.0
     last_error: str = ""
     uses: int = 0
@@ -69,8 +71,13 @@ class Token:
     def short(self) -> str:
         return self.access_token[:12] + "…" if self.access_token else "-"
 
+    @property
+    def slot(self) -> str:
+        """Stable identity of a pooled record: its file plus position in it."""
+        return f"{self.origin}#{self.position}" if self.origin is not None else ""
 
-def _record_to_token(record: dict, index: int, origin: Path | None = None) -> Token | None:
+
+def _record_to_token(record: dict, index: int, origin: Path | None = None, position: int = 0) -> Token | None:
     access = (record.get("accessToken") or record.get("access_token") or "").strip()
     if not access:
         return None
@@ -81,6 +88,7 @@ def _record_to_token(record: dict, index: int, origin: Path | None = None) -> To
         expires_at_ms=int(expires) if isinstance(expires, (int, float)) else None,
         label=(record.get("email") or record.get("label") or "").strip(),
         origin=origin,
+        position=position,
         index=index,
     )
 
@@ -130,6 +138,7 @@ class TokenPool:
         self._tokens: list[Token] = []
         self._cursor = itertools.count()
         self._loaded = False
+        self._signature: tuple = ()
 
     # -- loading -----------------------------------------------------------
     def _load(self) -> None:
@@ -151,11 +160,12 @@ class TokenPool:
                     log.warning("skip unreadable token file %s: %s", path, exc)
                     continue
                 records = data if isinstance(data, list) else [data]
-                for record in records:
+                for position, record in enumerate(records):
                     if not isinstance(record, dict):
                         continue
-                    token = _record_to_token(record, index, path)
+                    token = _record_to_token(record, index, path, position)
                     if token:
+                        token.pooled = True
                         self._tokens.append(token)
                         index += 1
 
@@ -184,12 +194,99 @@ class TokenPool:
             )
 
         self._loaded = True
+        self._signature = self._pool_signature()
         log.info("token pool loaded: %d account(s) %s",
                  len(self._tokens), [t.label or t.short for t in self._tokens] if self._tokens else "")
 
     def _ensure(self) -> None:
         if not self._loaded:
             self._load()
+
+    # -- hot reload --------------------------------------------------------
+    def _pool_signature(self) -> tuple:
+        """Cheap identity of the pool directory: names, mtimes, sizes."""
+        if not settings.token_pool:
+            return ()
+        root = Path(settings.token_pool).expanduser()
+        parts: list[tuple] = []
+        try:
+            if root.is_dir():
+                for path in sorted(root.glob("*.json")):
+                    if path.name == "index.json":
+                        continue
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    parts.append((path.name, stat.st_mtime_ns, stat.st_size))
+            elif root.exists():
+                stat = root.stat()
+                parts.append((root.name, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            pass
+        return tuple(parts)
+
+    async def reload(self) -> dict:
+        """Merge the pool directory into the running pool.
+
+        New files become usable immediately; deleted files leave rotation. An
+        account already in memory is kept as-is — its access/refresh tokens are
+        newer than what is on disk, because this process is the one that writes
+        rotated refresh tokens back out.
+        """
+        async with self._lock:
+            if not settings.token_pool:
+                return {"added": 0, "removed": 0, "pool_size": len(self._tokens)}
+            root = Path(settings.token_pool).expanduser()
+            fresh: list[tuple[str, Token]] = []
+            for path in _pool_files(root):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    log.warning("skip unreadable token file %s: %s", path, exc)
+                    continue
+                records = data if isinstance(data, list) else [data]
+                for position, record in enumerate(records):
+                    if not isinstance(record, dict):
+                        continue
+                    token = _record_to_token(record, 0, path, position)
+                    if token:
+                        fresh.append((token.slot, token))
+            if not fresh:
+                log.warning("pool reload skipped: no readable account file under %s", root)
+                return {"added": 0, "removed": 0, "pool_size": len(self._tokens)}
+
+            known = {token.slot: token for token in self._tokens if token.pooled}
+            fixed = [t for t in self._tokens if not t.pooled]
+            before = len(self._tokens) - len(fixed)
+            merged: list[Token] = list(fixed)
+            added = 0
+            for slot, candidate in fresh:
+                live = known.get(slot)
+                if live is None:
+                    added += 1
+                    candidate.pooled = True
+                    live = candidate
+                    log.info("pool: +1 account %s", live.label or live.short)
+                merged.append(live)
+            removed = max(0, before - (len(merged) - len(fixed)))
+            for position, token in enumerate(merged):
+                token.index = position
+            self._tokens = merged
+            self._signature = self._pool_signature()
+            if added or removed:
+                log.info("pool reloaded: %d account(s) (+%d/-%d)", len(self._tokens), added, removed)
+            return {"added": added, "removed": removed, "pool_size": len(self._tokens)}
+
+    async def reload_if_changed(self) -> bool:
+        """Reload only when the pool directory actually changed on disk."""
+        if not self._loaded or not settings.token_pool:
+            return False
+        signature = self._pool_signature()
+        if signature == self._signature:
+            return False
+        await self.reload()
+        return True
 
     # -- refresh -----------------------------------------------------------
     async def _refresh(self, token: Token) -> Token:
@@ -351,6 +448,7 @@ class TokenPool:
         self._ensure()
         return {
             "pool_size": len(self._tokens),
+            "pool_watch_seconds": settings.pool_watch if settings.token_pool else 0,
             "accounts": [
                 {
                     "label": t.label or t.short,

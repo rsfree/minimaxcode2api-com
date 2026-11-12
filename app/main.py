@@ -63,10 +63,31 @@ async def lifespan(_: FastAPI):
     except CredentialError as exc:
         log.error("no usable credential at startup: %s", exc)
     task = asyncio.create_task(_signin_loop()) if _signin_enabled() else None
+    watcher = asyncio.create_task(_pool_watch_loop()) if _pool_watch_enabled() else None
     yield
-    if task is not None:
-        task.cancel()
+    for pending in (task, watcher):
+        if pending is not None:
+            pending.cancel()
     await upstream.shutdown()
+
+
+def _pool_watch_enabled() -> bool:
+    return bool(settings.token_pool and settings.pool_watch > 0)
+
+
+async def _pool_watch_loop() -> None:
+    """Pick up accounts added to ``TOKEN_POOL`` without restarting the gateway.
+
+    Provisioning writes one JSON file per account, so scaling the pool is just
+    "drop the file in and wait one interval". Existing entries are never
+    replaced by what is on disk — this process owns the rotated refresh tokens.
+    """
+    while True:
+        await asyncio.sleep(max(2.0, settings.pool_watch))
+        try:
+            await token_manager.reload_if_changed()
+        except Exception as exc:  # noqa: BLE001 - a bad file must not kill the loop
+            log.warning("pool reload failed: %s", exc)
 
 
 def _signin_enabled() -> bool:

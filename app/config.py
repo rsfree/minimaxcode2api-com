@@ -77,6 +77,9 @@ class Settings:
     token_store: str = field(default_factory=lambda: _env("TOKEN_STORE", "/data/token.json"))
     # Directory of ``*.json`` account files (or a single JSON file / array).
     token_pool: str = field(default_factory=lambda: _env("TOKEN_POOL"))
+    # Seconds between directory scans. New/removed account files are merged into
+    # the live pool without a restart; 0 turns the watcher off.
+    pool_watch: float = field(default_factory=lambda: float(_env("TOKEN_POOL_WATCH", "10") or 10))
 
     # Daily check-in. The reward is the only free top-up; claiming it from the
     # gateway keeps a pool alive without anyone remembering to click.

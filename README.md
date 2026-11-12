@@ -131,6 +131,29 @@ TOKEN_POOL=./data/tokens UPSTREAM_PROXY=http://127.0.0.1:7890 \
 GATEWAY_API_KEY=sk-local python -m uvicorn app.main:app --port 8080
 ```
 
+### 扩容：加号不用重启
+
+`TOKEN_POOL` 目录默认**每 10 秒扫一次**：新写进去的账号文件自动进池、被删掉的文件自动退池，
+不用 restart，也不会打断正在跑的请求。
+
+```bash
+# 1) 把新号写进网关正在用的那个目录
+python -m app.provision --email new@mail.example --password 'secret'
+#    Docker 部署就写卷里的同一路径，一次性的临时容器即可：
+#    docker compose run --rm --entrypoint python minimax-code2api \
+#      -m app.provision --email new@mail.example --password 'secret' --out /data/tokens
+
+# 2) 10 秒后看池子（不用重启）
+curl -s http://127.0.0.1:8080/healthz |
+  python -c "import json,sys;d=json.load(sys.stdin);print(d['pool_size'],[a['label'] for a in d['accounts']])"
+```
+
+日志里会出现 `pool: +1 account xxx` 和 `pool reloaded: 9 account(s) (+1/-0)`。
+
+- 热加载只做**新增 / 移除**，内存里已续期的 token 不会被磁盘上的旧值覆盖；
+- 扫描间隔由 `TOKEN_POOL_WATCH` 控制（秒，默认 `10`，填 `0` 关掉）；
+- 想按账号下线，直接 `rm` 对应 json 即可，正在进行的请求不受影响。
+
 ### 看池状态
 
 `GET /healthz` 不返回任何 token，只报每个账号是否可用、用了几次、冷却多久：
@@ -479,6 +502,7 @@ flowchart LR
 | `UPSTREAM_PROXY` | 空 | 上游出口代理。**国内网络必须设**，见 DEPLOY.md 第一节 |
 | `UPSTREAM_TRANSPORT` | `auto` | `auto` / `httpx` / `curl`。出口代理会重置 Python TLS 握手时用 `curl` |
 | `TOKEN_POOL` | 空 | **多账号池目录**，一个账号一个 json。设了就优先用它轮询 |
+| `TOKEN_POOL_WATCH` | `10` | 号池目录扫描间隔（秒）。新账号自动进池，`0` 关闭热加载 |
 | `SIGNIN_AUTO` | `1` | 有 `TOKEN_POOL` 时每次启动 + 每 6 小时自动签到领积分 |
 | `SIGNIN_TIMEZONE` | `Asia/Shanghai` | 签到时区，必须是 IANA 名字，不能是 `480` 这种偏移 |
 | `SIGNIN_INTERVAL_HOURS` | `6` | 自动签到的检查间隔（最小 10 分钟） |

@@ -192,6 +192,53 @@ def test_console_asset() -> None:
         assert endpoint in html, f"console does not call {endpoint}"
 
 
+def test_pool_hot_reload() -> None:
+    """Accounts dropped into TOKEN_POOL join the rotation without a restart."""
+    import tempfile
+
+    from app.auth import TokenPool
+    from app.config import settings
+
+    def record(name: str) -> str:
+        return json.dumps(
+            {"email": f"{name}@mail.example.com", "accessToken": f"tok-{name}", "expiresAtMs": 4102444800000}
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "aaa.json").write_text(record("aaa"), encoding="utf-8")
+        (root / "bbb.json").write_text(record("bbb"), encoding="utf-8")
+
+        original = settings.token_pool
+        settings.token_pool = str(root)
+        try:
+            pool = TokenPool()
+            assert pool.describe()["pool_size"] == 2
+
+            # An in-memory refresh is newer than the file; reload must not undo it.
+            live = pool.find("tok-aaa")
+            assert live is not None
+            live.access_token = "tok-aaa-rotated"
+
+            (root / "ccc.json").write_text(record("ccc"), encoding="utf-8")
+            assert asyncio.run(pool.reload_if_changed()) is True
+            described = pool.describe()
+            assert described["pool_size"] == 3, described
+            assert pool.find("tok-ccc") is not None
+            assert pool.find("tok-aaa-rotated") is not None
+
+            # Unchanged directory → no reload.
+            assert asyncio.run(pool.reload_if_changed()) is False
+
+            (root / "bbb.json").unlink()
+            assert asyncio.run(pool.reload_if_changed()) is True
+            assert pool.describe()["pool_size"] == 2
+            assert pool.find("tok-bbb") is None
+            assert pool.find("tok-aaa-rotated") is not None
+        finally:
+            settings.token_pool = original
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
@@ -201,6 +248,7 @@ def main() -> None:
         test_stream_translation,
         test_signin_panel,
         test_console_asset,
+        test_pool_hot_reload,
     ]
     for test in tests:
         test()
