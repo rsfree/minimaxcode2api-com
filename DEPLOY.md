@@ -211,6 +211,38 @@ TOKEN_POOL=/data/tokens
 > **一个账号没有某个模型的权限是正常的**（例如个别号没有 M3.1）。网关收到
 > `400 unknown model` 会自动换下一个账号重试，不会把错误抛给客户端。
 
+### 3.5 每日签到（免费回血）
+
+签到是唯一不花钱的加额度方式：**每天 400 积分，第 4/7 天各 1000，7 天一轮共 4000，
+领到手 30 天有效，仅限 MiniMax Code 使用**。
+
+不用配置任何东西 —— 只要有 `TOKEN_POOL`，网关**每次启动都会替全池签到**，之后每 6 小时补一次：
+
+```bash
+docker compose logs -f | grep check-in
+# daily check-in: 7/8 accounts, +2800 credits
+```
+
+手动补签或查看进度：
+
+```bash
+# 直接签
+docker compose exec minimax-code2api python -m app.signin --dir /data/tokens
+
+# 只看状态不领
+docker compose exec minimax-code2api python -m app.signin --dir /data/tokens --status
+```
+
+```
+9q5serignw@mail.xiuvi.cn            day 1 claimable cycle=4000 pts
+cblens4c0q@mail.xiuvi.cn            day 1 claimed   cycle=4000 pts
+
+8 account(s), 2800 credits still claimable this cycle
+```
+
+`SIGNIN_TIMEZONE` 必须是 IANA 名字（默认 `Asia/Shanghai`），写 `480` 这种偏移会被服务端拒：
+`{"status_code":1406010011,"status_msg":"invalid timezone_id"}`。
+
 ---
 
 ## 4. 配置 `.env`
@@ -233,6 +265,8 @@ MINIMAX_REGION=en                 # 账号注册在国际站就填 en
 TOKEN_STORE=/data/token.json
 TOKEN_POOL=/data/tokens           # 多账号池目录，设了就优先轮询它
 UPSTREAM_TRANSPORT=auto           # auto / httpx / curl，出口代理重置 Python TLS 时用 curl
+SIGNIN_AUTO=1                     # 有池子时自动签到领积分
+SIGNIN_TIMEZONE=Asia/Shanghai     # 必须是 IANA 名字，写 480 会被拒
 DEFAULT_MAX_TOKENS=8192
 GATEWAY_PORT=8080
 ```
@@ -379,6 +413,16 @@ curl -s "$BASE/v1/videos/generations/<task_id>?model=MiniMax-Hailuo-2.3" \
 期望轮询到 `status: succeeded` 并带 `video_url`。若看到
 `503 + status: succeeded + retryable: true`，是上游交付环节没备好文件，继续轮询同一 `task_id`。
 
+**⑪ 签到（有 `TOKEN_POOL` 才适用）**
+
+```bash
+docker compose exec minimax-code2api \
+  python -m app.signin --dir /data/tokens --status
+```
+
+期望每个账号一行，`cycle=4000 pts`，说明 7 天一轮的奖励全都在账上。全部 `claimed`
+也没问题——明天会重新变成 `claimable`。
+
 ### 关于 `/healthz` 返回 503
 
 含义是「服务活着，但没有可用凭证」。容器不会退出（便于你修凭证而不是陷入重启循环），
@@ -481,6 +525,9 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | `reference_images` 没效果 | 传的是本地路径，上游只认公网 URL | 先上传图床/OSS 再传链接 |
 | SDK 报 `404` + `{"detail":"Not Found"}`，curl 却正常 | 环境里有 `HTTP_PROXY`，httpx 对 localhost 也走代理，请求行变成绝对 URL，Starlette 把它当路径 | 已由内置中间件兼容；1.0.0 之前的版本请给客户端设 `NO_PROXY=127.0.0.1,localhost` |
 | `pool_size` 有值但总是不用某个号 | 该号缺对应模型权限，`400 unknown model` 后被自动跳过 | 正常行为，看 `/healthz` 的 `last_error` |
+| 签到报 `1406010011 invalid timezone_id` | `SIGNIN_TIMEZONE` 写成了偏移量 | 改成 IANA 名字，如 `Asia/Shanghai` |
+| 日志 `daily check-in: nothing to claim` | 今天已经签过了（幂等，不是故障） | 正常；次日 0 点后自动再签 |
+| 签到成功但仍 `402` | 签到积分 30 天有效、**仅限 MiniMax Code** 消耗，且一天才 400 | 多账号分摊，或充值；单号靠签到撑不住高并发 |
 | 日志 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF` | 出口代理只放行 Windows schannel 指纹，拒 Python/OpenSSL 握手 | 留着 `UPSTREAM_TRANSPORT=auto` 让它自动退回 curl（镜像已装 curl） |
 
 看实时日志定位：

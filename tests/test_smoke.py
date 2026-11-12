@@ -148,6 +148,27 @@ def test_stream_translation() -> None:
     assert chunks[-1]["usage"]["completion_tokens"] == 2
 
 
+def test_signin_panel() -> None:
+    from app.signin import CLAIMABLE, CLAIMED, summarize
+
+    panel = {
+        "scene": 1,
+        "days": [
+            {"day_no": 1, "points": 400, "bonus_points": 0, "status": CLAIMED, "is_today": True},
+            {"day_no": 2, "points": 400, "bonus_points": 0, "status": CLAIMABLE, "is_today": False},
+            {"day_no": 4, "points": 1000, "bonus_points": 0, "status": CLAIMABLE, "is_today": False},
+        ],
+    }
+    info = summarize(panel)
+    assert info["today_day"] == 1 and info["today_status"] == CLAIMED
+    assert info["claimable"] is False
+    assert info["cycle_total_points"] == 1800
+    assert info["cycle_pending_points"] == 1400
+
+    live = dict(panel, days=[dict(panel["days"][0], status=CLAIMABLE)])
+    assert summarize(live)["claimable"] is True
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
@@ -155,6 +176,7 @@ def main() -> None:
         test_tool_roundtrip,
         test_response_translation,
         test_stream_translation,
+        test_signin_panel,
     ]
     for test in tests:
         test()

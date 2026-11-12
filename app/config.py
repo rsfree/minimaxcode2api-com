@@ -78,6 +78,14 @@ class Settings:
     # Directory of ``*.json`` account files (or a single JSON file / array).
     token_pool: str = field(default_factory=lambda: _env("TOKEN_POOL"))
 
+    # Daily check-in. The reward is the only free top-up; claiming it from the
+    # gateway keeps a pool alive without anyone remembering to click.
+    signin_auto: bool = field(default_factory=lambda: _env_bool("SIGNIN_AUTO", True))
+    signin_timezone: str = field(default_factory=lambda: _env("SIGNIN_TIMEZONE", "Asia/Shanghai"))
+    signin_interval_hours: float = field(
+        default_factory=lambda: float(_env("SIGNIN_INTERVAL_HOURS", "6") or 6)
+    )
+
     # Gateway side.
     api_keys: list[str] = field(default_factory=list)
     default_max_tokens: int = field(default_factory=lambda: _env_int("DEFAULT_MAX_TOKENS", 8192))

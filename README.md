@@ -154,6 +154,47 @@ curl -s http://127.0.0.1:8080/healthz | python -m json.tool
 
 ---
 
+## 二点六、每日签到（唯一的免费加额度方式）
+
+账号余额用完就是 `402`，唯一不花钱的回血途径是**每日签到**。规则（2026-11-12 实测）：
+
+| 项 | 值 |
+|---|---|
+| 单日奖励 | 400 积分（第 4 天、第 7 天各 1000） |
+| 一轮 | 7 天，合计 **4000 积分** |
+| 有效期 | 领到手起 **30 天** |
+| 用途 | **仅限 MiniMax Code** 消耗，不能用于开放平台 API |
+| 接口 | `GET /minimax-cloud/api/v1/signin/status` / `POST .../signin/claim`，域名 `agent.minimax.io` |
+
+网关**默认每次启动都会替池子里所有账号签到**，之后每 6 小时补一次（幂等，
+签过就跳过），日志里能看到：
+
+```
+daily check-in: 7/8 accounts, +2800 credits
+```
+
+手动跑或只是想看进度：
+
+```bash
+python -m app.signin --dir data/tokens            # 直接签到
+python -m app.signin --dir data/tokens --status   # 只看状态，不领
+```
+
+```
+0q46nzqeyy@mail.xiuvi.cn            day 1 claimed   cycle=4000 pts
+9q5serignw@mail.xiuvi.cn            day 1 claimable cycle=4000 pts
+
+8 account(s), 2800 credits still claimable this cycle
+```
+
+关键点：`timezone_id` 必须是 IANA 名字（`Asia/Shanghai`），传偏移量 `480` 会被服务端
+以 `1406010011 invalid timezone_id` 拒绝——这个坑没有文档，只有前端 bundle 里能看出来。
+
+**规模效应**：8 个账号 × 4000/周 = **3.2 万积分/周**，足够抵消日常刷请求的消耗。
+这也是多账号池真正的价值所在：单号每天 400 不够用，八个号一起签到才够。
+
+---
+
 ## 三、接口
 
 ### 3.1 OpenAI 协议
@@ -381,6 +422,9 @@ flowchart LR
 | `UPSTREAM_PROXY` | 空 | 上游出口代理。**国内网络必须设**，见 DEPLOY.md 第一节 |
 | `UPSTREAM_TRANSPORT` | `auto` | `auto` / `httpx` / `curl`。出口代理会重置 Python TLS 握手时用 `curl` |
 | `TOKEN_POOL` | 空 | **多账号池目录**，一个账号一个 json。设了就优先用它轮询 |
+| `SIGNIN_AUTO` | `1` | 有 `TOKEN_POOL` 时每次启动 + 每 6 小时自动签到领积分 |
+| `SIGNIN_TIMEZONE` | `Asia/Shanghai` | 签到时区，必须是 IANA 名字，不能是 `480` 这种偏移 |
+| `SIGNIN_INTERVAL_HOURS` | `6` | 自动签到的检查间隔（最小 10 分钟） |
 | `MINIMAX_ACCESS_TOKEN` | 空 | 直接给一个 access token（约 12h 失效） |
 | `MINIMAX_REFRESH_TOKEN` | 空 | 只给 refresh token，网关自己续期 |
 | `TOKEN_STORE` | `/data/token.json` | 网关自己管理的 token 文件，会就地刷新 |
@@ -410,6 +454,8 @@ flowchart LR
 | Credits 用完 | 这是账号额度，不是 API 配额 | 桌面端充值，或换官方开放平台 Key |
 | SDK 报 `404` + `{"detail":"Not Found"}`，但 `curl` 同一条 URL 正常 | 环境里有 `HTTP_PROXY`，httpx 连 `127.0.0.1` 也走代理，请求行变成 `POST http://127.0.0.1:8099/v1/...`，框架把整串当路径 | 已内置中间件把它还原成 origin-form；旧版本请给客户端设 `NO_PROXY=127.0.0.1,localhost` |
 | 池子里某个号一直不被使用 | 该号没有对应模型的权限，`400 unknown model` 后被自动跳过 | 正常，看 `/healthz` 的 `last_error` |
+| 签到报 `1406010011 invalid timezone_id` | `SIGNIN_TIMEZONE` 写成了偏移量 | 改成 IANA 名字，如 `Asia/Shanghai` |
+| 签到成功但仍 `402` | 积分 30 天有效、仅限 MiniMax Code，且一天只 400 | 多号分摊或充值；单号靠签到撑不住高并发 |
 | 日志里 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF_WHILE_READING` | 出口代理只放行 Windows schannel 指纹，拒绝 Python/OpenSSL 握手 | 保持 `UPSTREAM_TRANSPORT=auto`，会自动退回 curl（镜像已装 curl） |
 
 ---

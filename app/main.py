@@ -15,6 +15,7 @@ Surface:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -54,8 +55,45 @@ async def lifespan(_: FastAPI):
         await token_manager.get()
     except CredentialError as exc:
         log.error("no usable credential at startup: %s", exc)
+    task = asyncio.create_task(_signin_loop()) if _signin_enabled() else None
     yield
+    if task is not None:
+        task.cancel()
     await upstream.shutdown()
+
+
+def _signin_enabled() -> bool:
+    return bool(settings.signin_auto and settings.token_pool)
+
+
+async def _signin_loop() -> None:
+    """Claim the daily reward for every pooled account, then idle.
+
+    Runs once at startup — which is what actually keeps a long-lived container
+    topped up, since most deployments restart far more often than daily — and
+    then every ``SIGNIN_INTERVAL_HOURS``.
+    """
+    from . import signin
+
+    while True:
+        try:
+            rows = await asyncio.to_thread(
+                signin.claim_pool,
+                settings.token_pool,
+                settings.region,
+                settings.signin_timezone,
+                settings.upstream_proxy or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - never take the gateway down
+            log.warning("daily check-in skipped: %s", exc)
+        else:
+            gained = sum(int(row.get("points") or 0) for row in rows if row.get("claimed"))
+            claimed = sum(1 for row in rows if row.get("claimed"))
+            if claimed:
+                log.info("daily check-in: %s/%s accounts, +%s credits", claimed, len(rows), gained)
+            else:
+                log.info("daily check-in: nothing to claim across %s accounts", len(rows))
+        await asyncio.sleep(max(600.0, settings.signin_interval_hours * 3600))
 
 
 app = FastAPI(
