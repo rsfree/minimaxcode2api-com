@@ -333,6 +333,20 @@ class TokenPool:
                 return token
         return self._tokens[0] if self._tokens else None
 
+    def find(self, key: str | None) -> Token | None:
+        """Look one account up by label or token, ignoring cool-down.
+
+        Async media tasks belong to the account that created them, so a caller
+        that remembers the owner has to reach exactly that account again.
+        """
+        if not key:
+            return None
+        self._ensure()
+        for token in self._tokens:
+            if key in {token.label, token.access_token, token.short}:
+                return token
+        return None
+
     def describe(self) -> dict:
         self._ensure()
         return {

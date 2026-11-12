@@ -30,6 +30,19 @@ REDIRECT_HINT = (
     "egress that reaches {base_url} directly, or switch MINIMAX_REGION."
 )
 
+# Generation tools are entitlement-gated per account: the same call returns
+# ``code 503 "temporarily unavailable"`` on an account without the feature and
+# succeeds on a sibling. Only creation tools rotate — for
+# ``query_video_generation`` a 503 genuinely means "file not staged yet" and
+# the caller has to keep polling the same task.
+ROTATABLE_CODES = {503}
+ROTATABLE_TOOLS = {
+    "image_synthesize",
+    "submit_video_generation",
+    "synthesize_speech",
+    "batch_text_to_music",
+}
+
 
 class UpstreamError(RuntimeError):
     def __init__(self, status: int, message: str, payload: Any = None) -> None:
@@ -268,12 +281,25 @@ class Upstream:
             raise _error_from(response.status_code, body)
         return response
 
-    async def mcp(self, tool: str, payload: dict, timeout: float = 120.0) -> dict:
+    async def mcp(self, tool: str, payload: dict, timeout: float = 120.0,
+                  account: str | None = None) -> dict:
         """POST a desktop MCP tool call and return the decoded JSON body.
 
         Generation tools answer ``200`` with a business ``code`` inside the
         envelope, so a 200 here does not mean success — ``media.call`` owns that
         check.
+        """
+        body, _ = await self.mcp_ex(tool, payload, timeout, account)
+        return body
+
+    async def mcp_ex(self, tool: str, payload: dict, timeout: float = 120.0,
+                     account: str | None = None) -> tuple[dict, str]:
+        """Same as :meth:`mcp`, but also reports which account served it.
+
+        ``account`` pins the call to one pooled account — needed by the async
+        video flow, whose ``task_id`` is only visible to the account that
+        submitted it. Any other account answers
+        ``404 task was not found or does not belong to the current caller``.
         """
         await self.startup()
         url = f"{settings.mcp_url}/{tool}"
@@ -281,12 +307,19 @@ class Upstream:
         tried: set[str] = set()
         last: UpstreamError | None = None
         attempts = max(1, len(getattr(token_manager, "_tokens", []) or [1]))
+        pinned = token_manager.find(account) if account else None
 
         for _ in range(attempts + 1):
-            try:
-                token = await token_manager.acquire(exclude=tried)
-            except CredentialError as exc:
-                raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
+            token = None
+            if pinned is not None:
+                key = pinned.access_token or pinned.label
+                if key not in tried and pinned.access_token:
+                    token = pinned
+            if token is None:
+                try:
+                    token = await token_manager.acquire(exclude=tried)
+                except CredentialError as exc:
+                    raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
             tried.add(token.access_token or token.label)
 
             response = await self._dispatch(url, payload, _mcp_headers(token.access_token), False, timeout)
@@ -326,7 +359,22 @@ class Upstream:
                 raise UpstreamError(502, f"upstream returned non-JSON: {body[:300]!r}") from exc
             if not isinstance(decoded, dict):
                 raise UpstreamError(502, f"unexpected upstream payload: {body[:300]!r}")
-            return decoded
+
+            # Entitlement is per account: a generation tool answers 200 with
+            # code 503 ("temporarily unavailable") on an account that is not
+            # allowed to use it, while a sibling account succeeds. Rotating here
+            # is what makes video work on a pool where only one号 has access.
+            code = decoded.get("code")
+            if code in ROTATABLE_CODES and tool in ROTATABLE_TOOLS and len(tried) < attempts:
+                last = UpstreamError(
+                    int(code), decoded.get("message") or f"{tool} unavailable on this account"
+                )
+                log.warning(
+                    "mcp %s: account %s cannot use this tool (%s), trying the next",
+                    tool, token.label or token.short, code,
+                )
+                continue
+            return decoded, token.access_token or token.label
 
         raise last or UpstreamError(502, "no account could serve the request")
 

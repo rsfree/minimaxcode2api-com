@@ -181,8 +181,8 @@ python -m app.signin --dir data/tokens --status   # 只看状态，不领
 ```
 
 ```
-0q46nzqeyy@mail.xiuvi.cn            day 1 claimed   cycle=4000 pts
-9q5serignw@mail.xiuvi.cn            day 1 claimable cycle=4000 pts
+aaa@mail.example.com            day 1 claimed   cycle=4000 pts
+bbb@mail.example.com            day 1 claimable cycle=4000 pts
 
 8 account(s), 2800 credits still claimable this cycle
 ```
@@ -328,6 +328,10 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 | `reference_images` | 参考图 URL 数组，最多 4 张（图生图） |
 | `response_format` | `url`（默认，直接给 CDN 链接）或 `b64_json`（网关下载后转 base64） |
 
+⚠️ **实测发现**：返回的 URL 后缀是 `.png`、CDN 的 `Content-Type` 也是 `image/png`，
+但**实际字节是 JPEG**（`ff d8 ff e1`，带 AIGC 水印 Exif）。这是上游工具的行为，网关无法改。
+按扩展名或 Content-Type 判断格式的程序会被误导——**靠文件头判断**。
+
 ### 3.5 文生视频 / 图生视频
 
 视频是**异步**的：提交拿 `task_id`，再轮询。上游没有 OpenAI 式的视频协议，这里用 REST 风格自定义。
@@ -360,6 +364,26 @@ curl -s "http://127.0.0.1:8080/v1/videos/generations/462436026450282?model=MiniM
 | `reference_images` / `reference_videos` / `reference_audios` | **仅 H3**，公网 URL 数组 |
 | `ratio` | `21:9 16:9 4:3 1:1 3:4 9:16 adaptive`；H3 纯文本模式不接受 `adaptive` |
 | `resolution` | H3 默认 `2K`；Hailuo 默认 `768P`（10 秒只能 768P） |
+
+#### 多账号池下的两个坑（网关已处理）
+
+1. **视频权限是按账号给的**，不是按 API key。同一份代码、同一个模型，8 个号里
+   只有 1 个能提交成功，其余返回
+   `{"code":503,"message":"video generation is temporarily unavailable"}` ——
+   这句 "temporarily unavailable" 会让人以为是上游故障，其实是**这个号没有视频能力**。
+   网关遇到 `503` 会自动换下一个账号重试（生图 / TTS / 音乐同理，只有
+   `query_video_generation` 的 503 才是真的"文件还没备好"，不换号）。
+2. **异步任务属于提交它的那个账号**。用别的号去查，即使 `task_id` 完全正确也会回
+   `404 task was not found or does not belong to the current caller`。
+   网关在进程内记住 `task_id → 账号` 的映射，轮询时钉住原账号。
+
+> 由此带来的限制：`task_id` 的归属只存在内存里，**重启网关后旧任务就查不了了**
+> （会回 404 并在 `hint` 里说明）。要长期可查，得把映射落盘。
+
+另外实测这条通道的视频**只渲染不交付**：状态会正常走到 `running` 然后变
+`503 the video is ready but could not be prepared for delivery`，连查 5 分钟都拿不到
+`video_url`。这不是网关问题，是上游没把文件备到可下载位置 —— 继续查同一个 `task_id`，
+**不要重新提交**（会再扣一次 320 credits）。
 
 ### 3.6 语音合成 / 音乐
 
@@ -449,6 +473,9 @@ flowchart LR
 | 流式到一半断 | 反代缓冲或读超时 | nginx 关 `proxy_buffering`，`proxy_read_timeout` 拉长 |
 | 生图 / TTS 返回 `402` | 账号额度耗尽，文案里会写 `plan balance has run out` | 桌面端充值；**重试无效** |
 | 视频查询 `503` 但 `status: succeeded` | 任务渲染完成，服务端没备好文件交付 | 隔几分钟轮询同一 `task_id`；不要重新提交（会再扣一次） |
+| 视频提交 `503 temporarily unavailable` | **该账号没有视频权限**，不是上游故障 | 仓库池里有别的号能提交就行，网关会自动换号；全池都没有就充 M Plan |
+| 视频查询 `404 does not belong to the current caller` | 提交和查询用到了不同账号；或网关重启丢了映射 | 用同一个网关实例查；重启后再查只能重新提交 |
+| 生图返回的 `.png` 打不开 / 格式不对 | 字节其实是 JPEG，只是名字和 Content-Type 写成了 png | 按文件头（`ff d8`）判断格式 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单 | 充值，或换 `MiniMax-Hailuo-2.3`（比 H3 便宜） |
 | `reference_images` 不生效 | 参考图必须是**公网可达 URL**，本地路径网关读不到 | 先上传到图床 / OSS 再传 URL |
 | Credits 用完 | 这是账号额度，不是 API 配额 | 桌面端充值，或换官方开放平台 Key |
@@ -467,6 +494,13 @@ python tests/test_smoke.py          # 无网络，翻译层单元测试，CI 会
 python tests/test_media.py          # 无网络，多模态参数换算与错误映射
 GATEWAY=http://127.0.0.1:8080 GATEWAY_KEY=sk-local \
   python tests/test_sdk_compat.py   # 需要真实凭证，跑官方 openai / anthropic SDK
+
+# 多模态实测：默认只查免费的 models / voices
+GATEWAY=http://127.0.0.1:8080 GATEWAY_KEY=sk-local \
+  python tests/test_media_live.py
+# 加上生图 / TTS / 音乐（会真实扣积分），视频另开（一次 320 credits 起）
+MEDIA_LIVE=1 MEDIA_LIVE_VIDEO=1 GATEWAY=... GATEWAY_KEY=... \
+  python tests/test_media_live.py
 ```
 
 ---

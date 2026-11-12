@@ -548,6 +548,25 @@ async def images_generations(request: Request):
     )
 
 
+# A video task_id is only visible to the account that submitted it: querying
+# from a sibling account answers 404 "does not belong to the current caller".
+# Remember the owner so polling sticks to it, even though chat rotates freely.
+_VIDEO_OWNERS: dict[str, str] = {}
+_VIDEO_OWNERS_MAX = 512
+
+
+def _remember_video_owner(task_id: str, account: str) -> None:
+    if len(_VIDEO_OWNERS) >= _VIDEO_OWNERS_MAX:
+        # Cheap FIFO eviction; losing an entry only costs a 404 on a stale poll.
+        for stale in list(_VIDEO_OWNERS)[: _VIDEO_OWNERS_MAX // 4]:
+            _VIDEO_OWNERS.pop(stale, None)
+    _VIDEO_OWNERS[task_id] = account
+
+
+def _video_owner(task_id: str) -> str | None:
+    return _VIDEO_OWNERS.get(task_id)
+
+
 @app.post("/v1/videos/generations")
 @app.post("/videos/generations")
 async def videos_generations(request: Request):
@@ -609,13 +628,14 @@ async def videos_generations(request: Request):
 
     started = time.time()
     try:
-        response = await media.video_submit(payload)
+        response, served = await media.video_submit(payload)
     except MediaError as exc:
         return media_error_response(exc)
 
     task_id = response.get("task_id")
     if not task_id:
         return error_response(502, "upstream did not return a task_id")
+    _remember_video_owner(str(task_id), served)
     log.info("ok kind=video.submit model=%s id=%s %.2fs", model, task_id, time.time() - started)
     return JSONResponse(
         status_code=202,
@@ -643,7 +663,7 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
         return media_error_response(exc)
 
     try:
-        response = await media.video_query(task_id, resolved)
+        response = await media.video_query(task_id, resolved, account=_video_owner(task_id))
     except MediaError as exc:
         body = {
             "error": {
@@ -661,6 +681,14 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
         # stage the file yet. That is worth another poll, not a resubmit.
         if exc.code == 503:
             body["retryable"] = True
+        # A 404 here almost always means the poll landed on a different pooled
+        # account than the one that submitted the task.
+        if exc.code == 404 and _video_owner(task_id) is None:
+            body["hint"] = (
+                "this task_id is not associated with any account in this process; "
+                "a video task can only be polled by the account that created it, and "
+                "that mapping is lost after a gateway restart"
+            )
         return JSONResponse(status_code=exc.status, content=body)
 
     status = response.get("status") or "unknown"

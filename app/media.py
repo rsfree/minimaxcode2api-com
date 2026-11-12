@@ -82,10 +82,18 @@ def _status_for(code: int) -> int:
     return 502
 
 
-async def call(tool: str, payload: dict, timeout: float) -> dict:
+async def call(tool: str, payload: dict, timeout: float, account: str | None = None) -> dict:
     """Invoke one MCP tool and unwrap the business-code envelope."""
+    data, _ = await call_ex(tool, payload, timeout, account)
+    return data
+
+
+async def call_ex(
+    tool: str, payload: dict, timeout: float, account: str | None = None
+) -> tuple[dict, str]:
+    """Same as :func:`call`, but also returns the account that served it."""
     try:
-        data = await upstream.mcp(tool, payload, timeout=timeout)
+        data, served = await upstream.mcp_ex(tool, payload, timeout=timeout, account=account)
     except UpstreamError as exc:
         raise MediaError(exc.status, exc.message, payload=exc.payload) from exc
 
@@ -93,7 +101,7 @@ async def call(tool: str, payload: dict, timeout: float) -> dict:
     if isinstance(code, int) and code != 0:
         message = data.get("message") or f"upstream tool {tool} failed (code {code})"
         raise MediaError(_status_for(code), str(message), code=code, payload=data)
-    return data
+    return data, served
 
 
 # ---------------------------------------------------------------------------
@@ -190,14 +198,22 @@ def normalize_video_model(model: str | None) -> str:
     raise MediaError(400, f"unknown video model {model!r}; use one of {', '.join(VIDEO_MODELS)}")
 
 
-async def video_submit(payload: dict) -> dict:
-    return await call("submit_video_generation", payload, VIDEO_SUBMIT_TIMEOUT)
+async def video_submit(payload: dict, account: str | None = None) -> tuple[dict, str]:
+    """Submit a video task; returns ``(response, account that owns the task)``."""
+    return await call_ex("submit_video_generation", payload, VIDEO_SUBMIT_TIMEOUT, account)
 
 
-async def video_query(task_id: str, model: str) -> dict:
+async def video_query(task_id: str, model: str, account: str | None = None) -> dict:
     """Query one task. Deliberately sends no output path — the server treats one
-    as a delivery request and answers 503 when it cannot stage a local file."""
-    return await call("query_video_generation", {"task_id": task_id, "model": model}, VIDEO_QUERY_TIMEOUT)
+    as a delivery request and answers 503 when it cannot stage a local file.
+
+    ``account`` must be the one that submitted the task: any other account
+    answers ``404 task was not found or does not belong to the current caller``.
+    """
+    return await call(
+        "query_video_generation", {"task_id": task_id, "model": model},
+        VIDEO_QUERY_TIMEOUT, account,
+    )
 
 
 # ---------------------------------------------------------------------------
