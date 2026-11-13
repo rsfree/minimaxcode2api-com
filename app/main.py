@@ -894,7 +894,8 @@ async def list_media_models() -> dict:
                     "protocol": "Volcengine Ark POST /api/v3/images/generations",
                     "prompt": "required",
                     "image": "public URL or data: base64; string or array",
-                    "size": "1K | 2K | 4K (1.5K/3K snap to the nearer tier) or WxH",
+                    "size": "1K | 2K | 4K (1.5K/3K snap to the nearer tier) or WxH — "
+                            "the only geometry input; ratio and area tier are both derived from it",
                     "response_format": "url | b64_json",
                     "sequential_image_generation": "auto + options.max_images, 1-15",
                     "ignored": "output_format background watermark stream layer_decomposition "
@@ -981,8 +982,10 @@ async def images_generations(request: Request):
     ``output_format`` (the tool always returns JPEG), ``background``,
     ``watermark``, ``stream``, ``layer_decomposition`` and its options,
     ``optimize_prompt_options``, ``tools``, ``safety_identifier``. ``size`` is
-    advisory — pixels snap to the nearest supported ratio and area tier — and
-    the response says what was actually produced.
+    the only geometry input — pixels or tier, snapped to the nearest supported
+    ratio and area bucket — and the response says what was actually produced.
+    The tool's own ``aspect_ratio`` / ``resolution`` pair is not accepted: two
+    sources of geometry meant the pair could silently override ``size``.
     """
     if not _authorized(request):
         return error_response(401, "invalid gateway api key", "authentication_error")
@@ -1018,14 +1021,24 @@ async def images_generations(request: Request):
         body.get("image") or body.get("reference_images") or body.get("input_urls")
     )
 
+    # `size` is the one and only geometry input. The tool's own aspect_ratio /
+    # resolution pair is an implementation detail: exposing it too meant two
+    # sources of truth, and the pair silently beat `size` when both arrived.
+    # Callers still sending them (old docs, hand-written curl) are not failed —
+    # they are ignored, and the log names them so the usage can be traced.
+    stale = [key for key in ("aspect_ratio", "resolution") if body.get(key)]
+    if stale:
+        log.warning(
+            "ignoring %s: geometry comes from 'size' alone (e.g. size=1280x720)",
+            "/".join(stale),
+        )
+
     started = time.time()
     try:
         result = await media.image_generate(
             prompt=prompt,
             n=count,
             size=body.get("size"),
-            aspect_ratio=body.get("aspect_ratio"),
-            resolution=body.get("resolution"),
             reference_urls=reference_urls,
         )
         images = result["images"]

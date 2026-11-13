@@ -1756,9 +1756,14 @@ def test_ark_size_and_measured_image_info() -> None:
     # The pair that the doc advertises: 1280x720 means "16:9 at 1K", which the
     # tool renders as 1376x768 — measured, not guessed.
     assert size_to_params("1280x720") == ("16:9", "1K")
-    # 3840x2160 is 8.3 MP; the 4K bucket starts at 16.9 MP, so "4K UHD" lands on
-    # 2K by area. Callers who want the 4K bucket say resolution=4K instead.
+    # 3840x2160 is 8.3 MP; the bucket boundaries are 2x1K (2.1 MP) and 2x2K
+    # (8.4 MP), so "4K UHD" lands on 2K by area. A caller who wants the 4K
+    # bucket writes size=4K — there is no resolution= field to fall back on.
     assert size_to_params("3840x2160") == ("16:9", "2K")
+    # Portrait and ultrawide snap to the nearest of the nine presets, not to
+    # whatever pixels the caller typed.
+    assert size_to_params("1024x1536") == ("2:3", "1K")
+    assert size_to_params("2560x1080") == ("21:9", "2K")
     try:
         size_to_params("big")
     except MediaError as exc:
@@ -1772,6 +1777,50 @@ def test_ark_size_and_measured_image_info() -> None:
     ) + (1152).to_bytes(4, "big")
     assert image_info(png) == {"output_format": "png", "size": "2048x1152"}
     assert image_info(b"not an image") == {}
+
+
+def test_image_geometry_comes_from_size_alone() -> None:
+    """One geometry input — `size`. The tool's ratio/resolution pair is internal.
+
+    Exposing both used to give one request two answers: the pair silently beat
+    `size` whenever a caller sent it, so `size=1280x720` plus a stray
+    `aspect_ratio=1:1` produced a square. ``image_generate`` no longer has such
+    parameters, and every slot reaches the tool as the same snapped pair.
+    """
+    import inspect
+    from unittest.mock import patch
+
+    from app import media as media_mod
+
+    params = inspect.signature(media_mod.image_generate).parameters
+    assert "size" in params
+    assert "aspect_ratio" not in params and "resolution" not in params, (
+        "geometry must not have a second entry point"
+    )
+
+    captured: dict = {}
+
+    async def fake_call(tool, payload, timeout, need_credits=0):
+        captured["tool"] = tool
+        captured["payload"] = payload
+        captured["need_credits"] = need_credits
+        return {
+            "code": 0,
+            "success_items": [{"output_url": "https://cdn.example/1.jpeg"}],
+        }
+
+    with patch.object(media_mod, "call", fake_call):
+        result = asyncio.run(
+            media_mod.image_generate(prompt="a red circle", n=2, size="1280x720")
+        )
+
+    assert captured["tool"] == "image_synthesize"
+    requests = captured["payload"]["requests"]
+    assert len(requests) == 2, "one slot per requested image"
+    assert {(r["aspect_ratio"], r["resolution"]) for r in requests} == {("16:9", "1K")}
+    # n=2 means two pictures' worth of credit, not one.
+    assert captured["need_credits"] == media_mod.image_credit_need(2)
+    assert [image["url"] for image in result["images"]] == ["https://cdn.example/1.jpeg"]
 
 
 def test_image_model_mapping() -> None:
@@ -2065,6 +2114,11 @@ def test_ark_image_endpoint_contract() -> None:
                 "watermark": True,
                 "stream": False,
                 "optimize_prompt_options": {"mode": "standard"},
+                # Geometry has exactly one entry point. These two are the
+                # upstream tool's own parameters; a caller that still sends them
+                # must not get a different picture than `size` asked for.
+                "aspect_ratio": "1:1",
+                "resolution": "1K",
                 "sequential_image_generation": "auto",
                 "sequential_image_generation_options": {"max_images": 2},
             },
@@ -2082,9 +2136,12 @@ def test_ark_image_endpoint_contract() -> None:
             "output_tokens": 2048 * 2048 // 256,
             "total_tokens": 2048 * 2048 // 256,
         }
-        # Quantity came from Ark's sequential block, size passed through verbatim,
-        # and the reference image reached the generator.
+        # Quantity came from Ark's sequential block, `size` is the only geometry
+        # input, and the reference image reached the generator.
         assert seen["n"] == 2 and seen["size"] == "2K"
+        assert "aspect_ratio" not in seen and "resolution" not in seen, (
+            "the tool's ratio/resolution pair must not survive as a second input"
+        )
         assert seen["reference_urls"] == ["https://example.test/ref.png"]
 
         missing = client.post("/v1/images/generations", headers=headers, json={"size": "1K"})
@@ -2263,6 +2320,7 @@ def main() -> None:
         test_model_catalogue_complete,
         test_video_model_enum_matches_upstream,
         test_ark_size_and_measured_image_info,
+        test_image_geometry_comes_from_size_alone,
         test_image_model_mapping,
         test_ark_inline_image_is_uploaded,
         test_image_accepts_multiple_references,

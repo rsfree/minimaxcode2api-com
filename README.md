@@ -53,6 +53,7 @@ M2 / M2.1 是真的下线了（`404 The model "MiniMax-M2" is no longer availabl
 （图像只有 `prompt` / `reference_images` / `aspect_ratio` / `area`，TTS 只有 `voice_id`），
 模型由后端默认路由；唯一能在参数层换模型的是视频。想用 `image-01`、`image-01-live`、
 `MiniMax-H3-Image-Highspeed` 这些，只能直连开放平台 `POST /v1/image_generation` 自己带 `model`。
+（图像那几个几何参数是**上游**的形状；网关对外只收 Ark 的 `size`，换算见 [3.4](#34-文生图)。）
 
 **调试时怎么选**：
 
@@ -737,7 +738,7 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 | `model` | 只认 `minimax-h3-image` 及其别名（`minimax-image` / `image-01` / `h3-image` 等，大小写与下划线不敏感）；缺省即该值，响应回显规范名；**其它值 → `400 unknown image model`** |
 | `prompt` | 必填；缺失或空白 → `400 prompt is required` |
 | `image` | 支持 `string` 或 `string[]`，**一次可传多张**（实测 2 / 3 / 4 / 6 张均正常，`usage.input_images` 如实回显；10 张撞过单号 402，换号后带过）。各项可以是公网 URL、`data:image/...;base64,`、裸 base64，也认 `[{"image_url": {"url": …}}]` 这种 OpenAI 形状。URL 必须上游能直接下载，base64 会先转存到通道 CDN |
-| `size` | 档位 `1K` / `1.5K` / `2K` / `3K` / `4K`，或 `宽x高`。**是建议值**，换算见下 |
+| `size` | **唯一的几何入参**：档位 `1K` / `1.5K` / `2K` / `3K` / `4K`，或 `宽x高`。比例与档位都由它换算，换算见下。不收 `aspect_ratio` / `resolution`（那是上游参数，传了会被忽略并记一条日志） |
 | `response_format` | `url`（默认）或 `b64_json`，都支持；其它值 → `400` |
 | `sequential_image_generation` + `sequential_image_generation_options.max_images` | 支持：`auto` 时按 `max_images` 出图，范围 1–15 |
 | `n` | OpenAI 兼容保留，1–15（优先级低于上面的 `max_images`） |
@@ -757,31 +758,40 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 
 #### `size` 怎么换算
 
-上游只有三个面积档 `1K` / `2K` / `4K`，和九个宽高比，所以：
+上游只认「宽高比 + 面积档」两样东西：三个档（`1K` / `2K` / `4K`）和九个宽高比
+（`21:9` `16:9` `3:2` `4:3` `1:1` `4:5` `3:4` `2:3` `9:16`）。网关对外只收一个 `size`，
+在入口一次换算完，调用方不需要知道这两个参数存在：
 
 | 传入 | 处理 |
 |---|---|
-| `1K` / `2K` / `4K` | 直接用 |
+| `1K` / `2K` / `4K` | 直接用，比例默认 `1:1` |
 | `1.5K` | 落到 `2K`（面积更近） |
 | `3K` | 落到 `4K`（面积更近） |
 | `宽x高` | 先按比例吸附到最近的宽高比（9 种），再按面积选档：≤ `2×1024²`（2.1 MP）→ `1K`；≤ `2×2048²`（8.4 MP）→ `2K`；再大 → `4K` |
+| `auto` / 不传 | `1:1 @ 1K` |
 | 非法值 | `400 invalid size` |
 
-**没把 `宽x高` 直接透传给上游**，原因实测过（同一 prompt，2026-11-13）：
+**为什么只留一个 `size`**：上游其实同时收 `width`/`height` 和 `aspect_ratio`/`resolution`，
+以前网关把后者也暴露给调用方，结果同一个请求能有两种答案——`size=1280x720` 旁边多一个
+`aspect_ratio=1:1`，出来的就是方图。现在几何只有一个来源，多传的那两个字段会被忽略
+（日志里记一条 `ignoring aspect_ratio/resolution`，方便发现残留的旧调用）。
 
-| 传给上游 | 实际输出 |
+**为什么不一比一透传 `宽x高`**（同一 prompt 实测，2026-11-13）：
+
+| 上游入参 | 实际输出 |
 |---|---|
 | `width=1280, height=720`（不给比例/档位） | `1408×768` |
 | `width=3840, height=2160` + `resolution=1K` + `aspect_ratio=1:1` | `1024×1024` ← 比例/档位**完胜**，WxH 被忽略 |
+| `resolution=1K` + `aspect_ratio=16:9` | `1376×768` |
 | `resolution=2K` + `aspect_ratio=16:9` | `2752×1536` |
 | `resolution=4K` + `aspect_ratio=16:9` | `5504×3072` |
 
-上游确实收 `width`/`height`，但只要有 `resolution`/`aspect_ratio` 它们就不起作用，单独用又会吸附到
+上游确实收 `width`/`height`，但只要有比例/档位它们就不起作用，单独用又会吸附到
 它自己的预设尺寸。所以网关统一换算成「比例 + 档位」，同一诉求只有一个答案：
 `size=1280x720` 恒等于 `16:9 @ 1K` → `1376×768`，而不是时好时坏的 1408×768。
 
-注意 `3840×2160` 只有 8.29 MP，按面积落在 **2K**（4K 档从 16.9 MP 起）。要 4K 就写
-`size=4K` 或 `resolution=4K`，别指望像素值等于档位。
+注意 `3840×2160` 只有 8.29 MP，按面积落在 **2K**。要 4K 就写 `size=4K`，
+别指望像素值等于档位。
 
 **返回值才是真相**：`data[].size` 和 `data[].output_format` 由网关读取图片字节得出，不是照抄请求。
 
@@ -816,7 +826,7 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 - **未知名字直接 `400 unknown image model`**。这里以前是"传什么都忽略、原样回显"，
   结果客户以为自己换了个模型其实还是同一后端——这比报错更坑；
 - `MiniMax-H3`（不带 `-image`）是**视频**模型，别混用；
-- 画质与风格只能靠 `prompt` 和 `size`（换算成 `aspect_ratio` + `resolution`）控制。
+- 画质与风格只能靠 `prompt` 和 `size` 控制（`size` 由网关换算成上游的比例 + 档位）。
 
 ### 3.5 文生视频 / 图生视频
 

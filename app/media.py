@@ -227,6 +227,10 @@ _AREA_2K = 2048 * 2048
 def size_to_params(size: str | None) -> tuple[str, str]:
     """Translate Ark's ``size`` (tier or ``WxH``) into (aspect_ratio, resolution).
 
+    ``size`` is the *only* geometry input the gateway accepts. Callers speak
+    pixels or a tier; the tool only understands a ratio plus an area bucket, so
+    everything is snapped here and nowhere else — one request shape, one answer.
+
     Tiers fix the resolution and leave the ratio alone; ``WxH`` snaps to the
     nearest supported ratio and the nearest area bucket, which is as close as
     this channel can get — the returned pixels are whatever the tool produces,
@@ -405,16 +409,16 @@ async def image_generate(
     prompt: str,
     n: int = 1,
     size: str | None = None,
-    aspect_ratio: str | None = None,
-    resolution: str | None = None,
     reference_urls: list[str] | None = None,
 ) -> dict:
-    """Run ``image_synthesize`` and return the raw envelope plus a clean item list."""
-    derived_aspect, derived_resolution = size_to_params(size)
-    aspect = (aspect_ratio or "").strip() or derived_aspect
-    if aspect == "auto":
-        aspect = derived_aspect
-    res = _SIZE_TIERS.get((resolution or "").strip().lower()) or (resolution or "").strip().upper() or derived_resolution
+    """Run ``image_synthesize`` and return the raw envelope plus a clean item list.
+
+    ``size`` is the single source of geometry: the ratio and the area bucket are
+    both derived from it by :func:`size_to_params`. There is deliberately no way
+    to pass them separately — two inputs meant two answers for one request, and
+    the pair silently overrode ``size`` whenever a caller sent both.
+    """
+    aspect, res = size_to_params(size)
 
     resolved_refs: list[str] = []
     for index, reference in enumerate(reference_urls or []):
