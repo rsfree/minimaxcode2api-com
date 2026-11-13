@@ -329,6 +329,10 @@ class Upstream:
                 body = await response.aread()
                 await response.aclose()
                 err = _error_from(400, body)
+                # Name the account on the error itself: raising here skips the
+                # attribution below, so the console showed "-" for the one row
+                # an operator actually needs to read.
+                err.account = current
                 retriable = (
                     "unknown model" in err.message.lower() or _quota_exhausted(err.message)
                 )
@@ -367,6 +371,7 @@ class Upstream:
                 body = await response.aread()
                 await response.aclose()
                 last = _error_from(response.status_code, body)
+                last.account = current
                 log.warning(
                     "account %s hit a transport failure (%s); trying next",
                     token.label or token.short, response.status_code,
@@ -377,6 +382,7 @@ class Upstream:
                 body = await response.aread()
                 await response.aclose()
                 last = _error_from(response.status_code, body)
+                last.account = current
 
                 # A 401 may just be a rotated token: refresh once, then keep it.
                 if response.status_code == 401 and await token_manager.renew(token):
@@ -390,6 +396,7 @@ class Upstream:
                     body = await retry.aread()
                     await retry.aclose()
                     last = _error_from(retry.status_code, body)
+                    last.account = current
 
                 token_manager.park(
                     token, response.status_code, last.message,

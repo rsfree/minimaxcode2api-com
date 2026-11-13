@@ -1322,6 +1322,10 @@ def test_bad_model_is_not_blamed_on_the_balance() -> None:
     assert "quota" not in str(err).lower(), str(err)
     assert "unknown model" in str(err).lower(), str(err)
     assert len(calls) == 3, f"stopped after 3 model misses, made {len(calls)} calls"
+    # Raising inside the 400 branch skips the attribution at the bottom of the
+    # loop, so the row that says "wrong model" used to show account "-". The
+    # third miss is the one that gives up, hence t2.
+    assert getattr(err, "account", "") == "t2@x", getattr(err, "account", None)
 
 
 def test_capacity_math() -> None:
