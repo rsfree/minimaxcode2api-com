@@ -882,8 +882,6 @@ async def images_generations(request: Request):
         else:
             entry = {"url": image["url"]}
         entry.update(infos[index] or {})
-        if image.get("revised_prompt"):
-            entry["revised_prompt"] = image["revised_prompt"]
         pixels += _pixel_count(entry.get("size", ""))
         data.append(entry)
 

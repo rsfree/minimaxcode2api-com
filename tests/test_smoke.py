@@ -1184,7 +1184,12 @@ def test_ark_image_endpoint_contract() -> None:
 
     async def fake_generate(**kwargs):
         seen.update(kwargs)
-        return {"images": [{"url": "https://cdn.test/a.png"}], "raw": {}}
+        # `revised_prompt` is upstream's "Success to generate image" filler; Ark's
+        # data[] has no such field, so it must not leak into the response.
+        return {
+            "images": [{"url": "https://cdn.test/a.png", "revised_prompt": "ok"}],
+            "raw": {},
+        }
 
     async def fake_describe(url):
         return {"output_format": "jpeg", "size": "2048x2048"}

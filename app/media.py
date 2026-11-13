@@ -268,7 +268,11 @@ async def describe_asset(url: str, timeout: float = 20.0) -> dict[str, Any]:
             async for chunk in response.aiter_bytes():
                 head += chunk
                 info = image_info(head)
-                if info or len(head) >= 262144:
+                # Keep reading past the magic bytes: the format is known after
+                # four of them, but SOF0 (the pixel size) sits behind the Exif
+                # block, so stopping at the first hit is what made every 1K
+                # asset come back without a size.
+                if info.get("size") or len(head) >= 524288:
                     return info
             return image_info(head)
     except Exception as exc:  # noqa: BLE001 - metadata is a nicety, never fatal
