@@ -827,7 +827,7 @@ flowchart LR
 | `GATEWAY_API_KEY` | 空 | 调用方要带的 key，逗号分隔多个。**公网部署必须设** |
 | `MINIMAX_REGION` | `en` | `en`（国际站）或 `cn`（国内站） |
 | `UPSTREAM_PROXY` | 空 | 上游出口代理。**国内网络必须设**，见 DEPLOY.md 第一节 |
-| `UPSTREAM_TRANSPORT` | `auto` | `auto` / `httpx` / `curl`。出口代理会重置 Python TLS 握手时用 `curl` |
+| `UPSTREAM_TRANSPORT` | `auto` | `auto` / `httpx` / `curl`。出口代理会重置 Python TLS 握手时用 `curl`；`auto` 下退回 curl 只维持 5 分钟，之后自动重试 httpx |
 | `TOKEN_POOL` | 空 | **多账号池目录**，一个账号一个 json。设了就优先用它轮询 |
 | `TOKEN_POOL_WATCH` | `10` | 号池目录扫描间隔（秒）。新账号自动进池，`0` 关闭热加载 |
 | `PROVISION_CONCURRENCY` | `3` | 控制台「＋ 添加账号」同时开通几个号（登录接口会限流，别开大） |

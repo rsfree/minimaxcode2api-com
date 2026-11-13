@@ -1004,6 +1004,141 @@ def test_transport_status_never_escapes_as_http() -> None:
     assert error_response(429, "slow down").status_code == 429
 
 
+def test_curl_fallback_expires_instead_of_latching_forever() -> None:
+    """One httpx blip must not decide the transport for the rest of uptime.
+
+    Production showed the failure mode: a single ``ConnectError`` at 12:37 set a
+    permanent flag, and every request after that went out over curl — which at
+    the time could not carry a body over 128 KiB. Nothing logged it again; the
+    symptom was "some chats 500 for no reason" hours later.
+    """
+    import time as _time
+
+    from app import upstream as up
+    from app.config import settings
+
+    original = settings.upstream_transport
+    settings.upstream_transport = "auto"
+    try:
+        state = up.Upstream()
+        assert state._prefer_httpx() is True
+        assert state.transport_state() == "httpx"
+
+        state._latch_curl()
+        assert state._prefer_httpx() is False
+        assert state.transport_state().startswith("curl")
+
+        # ...and after the cool-down it goes back to httpx on its own.
+        state._curl_until = _time.monotonic() - 1
+        assert state._prefer_httpx() is True
+        assert state.transport_state() == "httpx"
+
+        # Explicit settings stay explicit in both directions.
+        settings.upstream_transport = "curl"
+        assert up.Upstream()._prefer_httpx() is False
+        settings.upstream_transport = "httpx"
+        forced = up.Upstream()
+        forced._latch_curl()
+        assert forced._prefer_httpx() is True
+    finally:
+        settings.upstream_transport = original
+
+
+def test_curl_transport_keeps_bodies_out_of_argv() -> None:
+    """A request body must never ride in argv.
+
+    Linux caps a *single* argument at MAX_ARG_STRLEN = 131072 bytes, so
+    ``create_subprocess_exec("curl", ..., json.dumps(body), url)`` dies with
+    ``OSError: [Errno 7] Argument list too long`` for any conversation over
+    ~128 KiB — before curl runs, with no upstream involved. The body has to go
+    over stdin instead, where there is no ceiling at all.
+    """
+    import asyncio as _asyncio
+
+    from app import curl_transport
+
+    seen: dict = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        seen["stdin"] = kwargs.get("stdin")
+        raise OSError(7, "Argument list too long")
+
+    original = _asyncio.create_subprocess_exec
+    _asyncio.create_subprocess_exec = fake_exec
+    try:
+        big = {"model": "MiniMax-M3", "messages": [{"role": "user", "content": "词" * 100_000}]}
+        try:
+            _asyncio.run(curl_transport.open_post("https://example.invalid/x", {}, big))
+        except curl_transport.CurlStartError as exc:
+            # The hint is the difference between "curl is broken" and "our argv
+            # blew the kernel limit".
+            assert "argument list too long" in str(exc).lower()
+        else:  # pragma: no cover
+            raise AssertionError("a failed exec must not be swallowed")
+    finally:
+        _asyncio.create_subprocess_exec = original
+
+    args = seen["args"]
+    assert seen["stdin"] is _asyncio.subprocess.PIPE, "body should be piped on stdin"
+    assert "-" in args and "--data-binary" in args
+    assert all(len(a) < 4096 for a in args), "something big leaked into argv"
+    assert not any("词词词" in a for a in args)
+
+
+def test_curl_transport_posts_large_bodies_intact() -> None:
+    """End to end over a loopback socket: 600 KiB in, 600 KiB server-side."""
+    import asyncio as _asyncio
+    import http.server
+    import threading
+
+    from app import curl_transport
+
+    got: dict = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - stdlib naming
+            length = int(self.headers.get("content-length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            got["len"] = len(raw)
+            got["content_length"] = self.headers.get("content-length")
+            got["content_type"] = self.headers.get("content-type")
+            try:
+                got["model"] = json.loads(raw)["model"]
+            except Exception:  # noqa: BLE001 - asserted below
+                got["model"] = None
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):  # silence the test output
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    payload = {"model": "MiniMax-M3", "messages": [{"role": "user", "content": "长" * 200_000}]}
+    try:
+        status, body = _asyncio.run(
+            curl_transport.post_json(f"http://127.0.0.1:{port}/v1/messages", {}, payload, 20.0)
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert status == 200, body
+    assert json.loads(body)["ok"] is True
+    assert got["model"] == "MiniMax-M3"
+    # Non-ASCII is sent as UTF-8, and the body arrives whole with a real length.
+    assert got["len"] > 500_000
+    assert got["content_length"] == str(got["len"])
+    assert got["content_type"] == "application/json"
+
+
 def test_error_groups_aggregate_by_message() -> None:
     """Cluster failures by their message, not one row at a time.
 
@@ -1079,6 +1214,8 @@ def test_diagnostics_endpoint_reports_the_basics() -> None:
             assert {"service", "pool", "store", "probes", "log", "hints"} <= set(data)
             assert data["service"]["version"].startswith("console-")
             assert data["service"]["python"]
+            # 配置值不等于实际在用值：httpx 失手会临时切到 curl。
+            assert data["service"]["transport"]
             assert isinstance(data["log"], list) and len(data["log"]) <= 5
             # Every buffered line carries a printable clock, or the page prints
             # "undefined" where the timestamp should be.
@@ -1398,6 +1535,9 @@ def main() -> None:
         test_store_degrades_to_memory,
         test_admin_logs_pagination,
         test_transport_status_never_escapes_as_http,
+        test_curl_fallback_expires_instead_of_latching_forever,
+        test_curl_transport_keeps_bodies_out_of_argv,
+        test_curl_transport_posts_large_bodies_intact,
         test_error_groups_aggregate_by_message,
         test_console_watch_records_only_trouble,
         test_diagnostics_endpoint_reports_the_basics,

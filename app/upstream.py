@@ -14,6 +14,7 @@ Two things this layer owns, because they are easy to get wrong:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -29,6 +30,11 @@ REDIRECT_HINT = (
     "legacy CN origin, which rejects a {region} token. Set UPSTREAM_PROXY to an "
     "egress that reaches {base_url} directly, or switch MINIMAX_REGION."
 )
+
+# How long one httpx egress failure keeps the automatic fallback on curl. Short
+# enough that a blip cannot define the process's behaviour for hours, long enough
+# that a genuinely filtered egress is not re-probed on every request.
+CURL_LATCH_SECONDS = 300.0
 
 # Generation tools are entitlement-gated per account: the same call returns
 # ``code 503 "temporarily unavailable"`` on an account without the feature and
@@ -153,7 +159,46 @@ class UpstreamResponse:
 class Upstream:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        # ``UPSTREAM_TRANSPORT=curl`` is a deliberate choice; the automatic
+        # fallback is a *latch with an expiry*, not a switch. See ``_prefer_httpx``.
         self._force_curl = settings.upstream_transport == "curl"
+        self._curl_until = 0.0
+
+    def _latch_curl(self) -> None:
+        self._curl_until = time.monotonic() + CURL_LATCH_SECONDS
+
+    def _prefer_httpx(self) -> bool:
+        """True when the next POST should go out over httpx.
+
+        One ``ConnectError`` used to set a permanent flag: from that moment the
+        process spoke curl only — a transport that (before bodies moved to
+        stdin) could not carry more than 128 KiB. A single blip therefore
+        degraded every later request, invisibly, until the next restart. The
+        latch now expires, so a transient outage costs one failed connect per
+        ``CURL_LATCH_SECONDS`` instead of the rest of the uptime.
+        """
+        if settings.upstream_transport == "curl":
+            return False
+        if settings.upstream_transport == "httpx":
+            return True
+        if not self._curl_until:
+            return True
+        if time.monotonic() < self._curl_until:
+            return False
+        log.info("curl fallback expired; probing httpx again")
+        self._curl_until = 0.0
+        return True
+
+    def transport_state(self) -> str:
+        """One line for the diagnostics panel: which wire is actually in use."""
+        if settings.upstream_transport == "curl":
+            return "curl (forced by UPSTREAM_TRANSPORT)"
+        if settings.upstream_transport == "httpx":
+            return "httpx (forced by UPSTREAM_TRANSPORT)"
+        left = self._curl_until - time.monotonic()
+        if self._curl_until and left > 0:
+            return f"curl (fallback, {int(left)}s left; httpx failed earlier)"
+        return "httpx"
 
     async def startup(self) -> None:
         if self._client is not None:
@@ -183,6 +228,24 @@ class Upstream:
             raise RuntimeError("upstream client not started")
         return self._client
 
+    async def _dispatch_attributed(
+        self, url: str, payload: dict, headers: dict[str, str], stream: bool, account: str
+    ) -> UpstreamResponse:
+        """``_dispatch`` with failures turned into an attributable 502.
+
+        A transport that cannot even start (no ``curl`` binary, exec limits,
+        forced-httpx connect errors) used to escape as an unhandled ``OSError``
+        and reach the caller as a bodyless 500 with ``account: "-"``. It is not
+        that account's fault and retrying the pool will not help, but the row
+        has to name where it broke.
+        """
+        try:
+            return await self._dispatch(url, payload, headers, stream)
+        except (OSError, RuntimeError, httpx.HTTPError) as exc:
+            err = UpstreamError(502, f"transport {type(exc).__name__}: {exc}"[:400])
+            err.account = account
+            raise err from exc
+
     async def _dispatch(
         self,
         url: str,
@@ -192,7 +255,7 @@ class Upstream:
         timeout: float | None = None,
     ) -> UpstreamResponse:
         """POST through httpx, falling back to curl when the egress rejects OpenSSL."""
-        if not self._force_curl:
+        if self._prefer_httpx():
             try:
                 kwargs = {"timeout": timeout} if timeout else {}
                 request = self.client.build_request("POST", url, json=payload, headers=headers, **kwargs)
@@ -202,9 +265,10 @@ class Upstream:
                 if settings.upstream_transport == "httpx":
                     raise
                 log.warning(
-                    "httpx egress failed (%s); switching to the curl transport", type(exc).__name__
+                    "httpx egress failed (%s); using curl for the next %ds",
+                    type(exc).__name__, int(CURL_LATCH_SECONDS),
                 )
-                self._force_curl = True
+                self._latch_curl()
         curl_stream = await curl_transport.open_post(
             url,
             headers,
@@ -241,8 +305,8 @@ class Upstream:
 
             token.in_flight += 1
             try:
-                response = await self._dispatch(
-                    settings.messages_url, payload, _headers(token.access_token), stream
+                response = await self._dispatch_attributed(
+                    settings.messages_url, payload, _headers(token.access_token), stream, current
                 )
             finally:
                 token.in_flight -= 1
@@ -316,8 +380,8 @@ class Upstream:
 
                 # A 401 may just be a rotated token: refresh once, then keep it.
                 if response.status_code == 401 and await token_manager.renew(token):
-                    retry = await self._dispatch(
-                        settings.messages_url, payload, _headers(token.access_token), stream
+                    retry = await self._dispatch_attributed(
+                        settings.messages_url, payload, _headers(token.access_token), stream, current
                     )
                     if retry.status_code == 200:
                         retry.account = token.label or token.short

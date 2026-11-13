@@ -583,7 +583,8 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | 升级后日志还是空的 | 历史上一直存在内存里，第一个落盘版本之前的数据补不回来 | 这是预期：新版本从部署那一刻开始记，之后重启不清 |
 | 控制台「积分余额」一直是 `—` / 探针数据不动 | `PROBE_AUTO=0`、`PROBE_INTERVAL=0`，或首轮还没跑完（启动后 8 秒开始，30 个号约 8 秒） | 点「刷新探针」，或 `curl -X POST -H "X-API-Key: $KEY" .../admin/probes/refresh`；**探针不花积分**，可以随便刷 |
 | 某个号探针报 `401` 但业务请求正常 | 探针不主动续期 token；业务请求触发续期后即恢复 | 不用处理，下一轮自动好；持续 401 说明 refresh token 也失效了 |
-| 日志 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF` | 出口代理只放行 Windows schannel 指纹，拒 Python/OpenSSL 握手 | 留着 `UPSTREAM_TRANSPORT=auto` 让它自动退回 curl（镜像已装 curl） |
+| 日志 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF` | 出口代理只放行 Windows schannel 指纹，拒 Python/OpenSSL 握手 | 留着 `UPSTREAM_TRANSPORT=auto` 让它自动退回 curl（镜像已装 curl）；退回只维持 5 分钟，之后自动再试 httpx |
+| 只有**长对话**报 500，错误是 `OSError: [Errno 7] Argument list too long: 'curl'` | 旧版本把请求体当命令行参数交给 curl，Linux 单个参数上限 128 KiB（`MAX_ARG_STRLEN`），超了就 exec 失败 | 升级到 2026-11-13 之后的镜像（请求体改走 stdin，无上限）；临时可 `UPSTREAM_TRANSPORT=httpx` 绕过 |
 
 看实时日志定位：
 

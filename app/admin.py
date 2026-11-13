@@ -20,7 +20,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import catalog, logring, media, signin
+from . import catalog, logring, media, signin, upstream
 from .auth import Token, token_manager
 from .config import settings
 from .metrics import metrics, stamp
@@ -240,7 +240,9 @@ async def diagnostics(lines: int = 80) -> dict:
             "region": settings.region,
             "base_url": settings.base_url,
             "proxy": settings.upstream_proxy or "",
-            "transport": settings.upstream_transport,
+            # The configured value is not necessarily the wire in use: an httpx
+            # failure latches the process onto curl for a while.
+            "transport": upstream.upstream.transport_state(),
             "key_required": bool(settings.api_keys),
             "python": platform.python_version(),
             "pid": os.getpid(),

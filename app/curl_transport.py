@@ -9,6 +9,15 @@ through because schannel is what the filter expects.
 This module posts JSON through the ``curl`` binary instead. It is selected with
 ``UPSTREAM_TRANSPORT=curl``; ``httpx`` stays the default because it is faster and
 supports connection pooling.
+
+**Bodies go over stdin, never argv.** ``create_subprocess_exec`` builds one C
+string per argument, and the kernel caps a single argument at ``MAX_ARG_STRLEN``
+(131072 bytes on Linux; Windows caps the whole command line at 32767
+characters). A chat body with a long conversation crosses that easily, and the
+failure mode is not a 413 — it is ``OSError: [Errno 7] Argument list too long``
+raised before curl even starts, which surfaces as a bare 500 that has nothing to
+do with the upstream or the account. ``curl --data-binary @-`` reads the same
+bytes from the pipe, sets ``content-length``, and has no size ceiling.
 """
 
 from __future__ import annotations
@@ -18,13 +27,24 @@ import json
 import logging
 import sys
 from typing import AsyncIterator, Iterable
+from urllib.parse import urlencode
 
 log = logging.getLogger("minimax.curl")
 
 IS_WINDOWS = sys.platform.startswith("win")
 
+# Strong references to in-flight stdin writers: a bare ``create_task`` can be
+# garbage collected mid-write, which truncates the body in the least visible way
+# possible.
+_writers: set[asyncio.Task] = set()
 
-def _base_args(url: str, headers: dict[str, str], timeout: float, proxy: str | None, form: bool) -> list[str]:
+
+class CurlStartError(RuntimeError):
+    """curl could not be started at all (missing binary, argv/exec limit)."""
+
+
+def _base_args(url: str, headers: dict[str, str], timeout: float, proxy: str | None,
+               content_type: str | None) -> list[str]:
     args = ["curl", "-sS", "-N", "-D", "-", "--http1.1", "-m", str(max(1, int(timeout)))]
     if IS_WINDOWS:
         # Windows schannel checks revocation over the proxy and fails when the
@@ -35,8 +55,8 @@ def _base_args(url: str, headers: dict[str, str], timeout: float, proxy: str | N
     else:
         args += ["--noproxy", "*"]
     args += ["-X", "POST"]
-    if not form:
-        args += ["-H", "content-type: application/json"]
+    if content_type:
+        args += ["-H", f"content-type: {content_type}"]
     for key, value in headers.items():
         args += ["-H", f"{key}: {value}"]
     return args
@@ -94,6 +114,44 @@ class CurlStream:
         await self.proc.wait()
 
 
+async def _feed(proc: asyncio.subprocess.Process, body: bytes) -> None:
+    """Write the request body into curl's stdin, then close it."""
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(body)
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        # curl already exited (bad URL, TLS reset). Its exit code and stderr say
+        # why; a broken pipe here is a symptom, not the diagnosis.
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):  # pragma: no cover
+            pass
+
+
+async def _spawn(args: list[str], body: bytes | None) -> asyncio.subprocess.Process:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE if body is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise CurlStartError(
+            f"cannot start curl: {exc.strerror or exc}"
+            + (" (argument list too long — the body must not travel in argv)"
+               if getattr(exc, "errno", None) == 7 else "")
+        ) from exc
+    if body is not None:
+        task = asyncio.create_task(_feed(proc, body))
+        _writers.add(task)
+        task.add_done_callback(_writers.discard)
+    return proc
+
+
 async def open_post(
     url: str,
     headers: dict[str, str],
@@ -101,13 +159,10 @@ async def open_post(
     timeout: float = 600.0,
     proxy: str | None = None,
 ) -> CurlStream:
-    args = _base_args(url, headers, timeout, proxy, form=False)
-    args += ["--data-binary", json.dumps(payload, ensure_ascii=False), url]
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    args = _base_args(url, headers, timeout, proxy, content_type="application/json")
+    args += ["--data-binary", "@-", url]
+    proc = await _spawn(args, body)
     assert proc.stdout is not None
     status, resp_headers = await _read_head(proc.stdout)
     return CurlStream(proc, status, resp_headers)
@@ -120,15 +175,13 @@ async def open_form(
     proxy: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> CurlStream:
-    args = _base_args(url, headers or {}, timeout, proxy, form=True)
-    for key, value in form.items():
-        args += ["--data-urlencode", f"{key}={value}"]
-    args.append(url)
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    body = urlencode(form).encode("utf-8")
+    args = _base_args(
+        url, headers or {}, timeout, proxy,
+        content_type="application/x-www-form-urlencoded",
     )
+    args += ["--data-binary", "@-", url]
+    proc = await _spawn(args, body)
     assert proc.stdout is not None
     status, resp_headers = await _read_head(proc.stdout)
     return CurlStream(proc, status, resp_headers)
