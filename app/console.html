@@ -1829,8 +1829,8 @@ async function loadLogs(keepOffset) {
       '<td class="mono dim" style="white-space:nowrap">' + esc(r.time) + "</td>" +
       "<td>" + (r.ok ? '<span class="tag ok">' + (r.status || 200) + "</span>"
                      : '<span class="tag bad">' + (r.status || "—") + "</span>") + "</td>" +
-      '<td class="dim">' + esc(kindLabel(r.kind)) + "</td>" +
-      '<td class="mono">' + esc(r.model) + "</td>" +
+      '<td class="dim" style="white-space:nowrap">' + esc(kindLabel(r.kind)) + "</td>" +
+      '<td class="mono" style="white-space:nowrap">' + esc(r.model) + "</td>" +
       '<td class="dim" style="white-space:nowrap" title="' + esc(r.account || "—") + '">' +
         esc(r.account || "—") + "</td>" +
       '<td class="num">' + ms(r.latency_ms) + "</td>" +
