@@ -265,8 +265,15 @@ def test_console_asset() -> None:
     # visible error, so the endpoints are pinned by name.
     for endpoint in ("/admin/summary", "/admin/overview", "/admin/usage", "/admin/logs",
                      "/admin/capacity", "/admin/config", "/admin/signin",
-                     "/admin/accounts/import"):
+                     "/admin/accounts/import", "/admin/errors", "/admin/diagnostics"):
         assert endpoint in html, f"console does not call {endpoint}"
+
+    # A failed call has to be readable from the page itself: the row table shows
+    # the error text, the row opens a detail sheet, and the 诊断 modal exists.
+    # Without these the page can only say "HTTP 502" and stop there.
+    for anchor in ('id="logVeil"', 'id="diagVeil"', 'id="logGroups"', "错误 / 说明",
+                   "kindLabel(", "openLogDetail(", "copyText("):
+        assert anchor in html, f"console lost {anchor}"
 
     # The pool list carries no balance — it lives in the probe payload. The row
     # mapping has to lift it, or the whole 积分 column quietly prints dashes
@@ -983,6 +990,110 @@ def test_admin_logs_pagination() -> None:
         settings.api_keys = original
 
 
+def test_transport_status_never_escapes_as_http() -> None:
+    """A dead socket reports status 0; that must leave as 502, not a bare 500.
+
+    ``_error_from(0, b"")`` produces ``UpstreamError(0, "upstream HTTP 0")`` and
+    a zero status cannot be serialised into a response — the caller then got a
+    bodyless 500, which is exactly the "bad response status code" a relay shows.
+    """
+    from app.main import error_response
+
+    assert error_response(0, "upstream HTTP 0").status_code == 502
+    assert error_response(599, "edge").status_code == 599
+    assert error_response(429, "slow down").status_code == 429
+
+
+def test_error_groups_aggregate_by_message() -> None:
+    """Cluster failures by their message, not one row at a time.
+
+    "9 failures" is a number; "HTTP 0 ×9 between 00:36 and 05:28" is a
+    diagnosis. The console strip reads this, so it has to group, count and
+    order correctly.
+    """
+    from app.metrics import Metrics
+
+    m = Metrics(limit=100)
+    for _ in range(3):
+        m.record("chat", "MiniMax-M2.7", account="a", ok=False, status=502,
+                 latency_ms=4000, error="upstream HTTP 0")
+    m.record("chat", "MiniMax-M2.7", account="a", ok=False, status=429, latency_ms=90,
+             error="rate limited")
+    m.record("chat", "MiniMax-M2.7", account="a", ok=True, latency_ms=800)
+
+    groups = m.error_groups(24, 5)
+    assert [g["error"] for g in groups] == ["upstream HTTP 0", "rate limited"]
+    assert groups[0]["count"] == 3 and groups[0]["status"] == 502
+    assert groups[1]["count"] == 1
+    # Successes never show up here, and the window is honoured.
+    assert m.error_groups(24, 5) == m.error_groups(24, 5)
+    assert all("count" in g and "first_ts" in g and "last_ts" in g for g in groups)
+
+
+def test_console_watch_records_only_trouble() -> None:
+    """A console API failure must leave a row; a healthy poll must not.
+
+    This is the difference between "the panel is broken" and "the panel's
+    request never reached the server" — without the row, the operator has no
+    way to tell them apart.
+    """
+    from fastapi.testclient import TestClient
+
+    from app import metrics as metrics_mod
+    from app.config import settings
+    from app.main import app
+
+    original = settings.api_keys
+    settings.api_keys = ["unit-test-key"]
+    try:
+        with TestClient(app) as client:
+            before = len(metrics_mod.metrics.rows())
+            client.get("/admin/summary", headers={"x-api-key": "unit-test-key"})
+            healthy = [r for r in metrics_mod.metrics.rows()[before:] if r.kind == "console"]
+            assert not healthy, "a fast 200 poll must not fill the history"
+
+            client.get("/admin/accounts/nope", headers={"x-api-key": "unit-test-key"})
+            rows = [r for r in metrics_mod.metrics.rows()[before:] if r.kind == "console"]
+            assert rows, "a 404 on /admin left no evidence"
+            last = rows[-1]
+            assert last.ok is False and last.status == 404
+            assert "GET /admin/accounts/nope" in last.model
+    finally:
+        settings.api_keys = original
+
+
+def test_diagnostics_endpoint_reports_the_basics() -> None:
+    """/admin/diagnostics is the report the operator pastes into a ticket."""
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+
+    original = settings.api_keys
+    settings.api_keys = ["unit-test-key"]
+    try:
+        with TestClient(app) as client:
+            assert client.get("/admin/diagnostics").status_code == 401
+            data = client.get("/admin/diagnostics?lines=5",
+                              headers={"x-api-key": "unit-test-key"}).json()
+            assert {"service", "pool", "store", "probes", "log", "hints"} <= set(data)
+            assert data["service"]["version"].startswith("console-")
+            assert data["service"]["python"]
+            assert isinstance(data["log"], list) and len(data["log"]) <= 5
+            # Every buffered line carries a printable clock, or the page prints
+            # "undefined" where the timestamp should be.
+            for row in data["log"]:
+                assert row["time_label"]
+
+            errors = client.get("/admin/errors?hours=24&limit=3",
+                                headers={"x-api-key": "unit-test-key"}).json()
+            assert "groups" in errors and isinstance(errors["groups"], list)
+            for group in errors["groups"]:
+                assert group["first"] and group["last"]
+    finally:
+        settings.api_keys = original
+
+
 def test_log_clock_uses_console_timezone() -> None:
     """The container runs on UTC; the log must still read like a local clock."""
     from datetime import datetime
@@ -1286,6 +1397,10 @@ def main() -> None:
         test_request_history_survives_restart,
         test_store_degrades_to_memory,
         test_admin_logs_pagination,
+        test_transport_status_never_escapes_as_http,
+        test_error_groups_aggregate_by_message,
+        test_console_watch_records_only_trouble,
+        test_diagnostics_endpoint_reports_the_basics,
         test_log_clock_uses_console_timezone,
         test_bad_model_is_not_blamed_on_the_balance,
         test_capacity_math,

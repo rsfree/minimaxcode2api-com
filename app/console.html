@@ -282,6 +282,46 @@ audio { width: 100%; margin-top: 10px; }
 .toast.ok { border-left-color: var(--ok); }
 pre.out { background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
   padding: 11px 13px; font: 12px/1.6 var(--mono); overflow: auto; max-height: 420px; white-space: pre-wrap; }
+
+/* ── 排错 ─────────────────────────────────────────────────────────── */
+/* 失败行：左红条 + 错误摘要。原来的表格只有状态码，等于把「为什么」藏起来了。 */
+table.tbl tr.clickable { cursor: pointer; }
+table.tbl tr.failrow .mark i { background: var(--bad); }
+.cellerr { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 11.5px; color: var(--bad); }
+.cellerr.none { color: var(--ink-3); }
+.errgroups { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft); align-items: center; }
+.eg { display: inline-flex; align-items: center; gap: 7px; padding: 3.5px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface-2); font-size: 11.5px; cursor: pointer;
+  max-width: 560px; }
+.eg:hover { border-color: var(--bad); }
+.eg b { font-family: var(--mono); color: var(--bad); flex: none; }
+.eg span { font-family: var(--mono); color: var(--ink-2); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.kv { display: grid; grid-template-columns: 88px 1fr; gap: 6px 14px; font-size: 12.5px; }
+.kv .k { color: var(--ink-3); }
+.kv .v { font-family: var(--mono); word-break: break-all; }
+.modal.wider { max-width: 820px; }
+.modal .body { max-height: 68vh; overflow: auto; }
+.diagsum { display: flex; align-items: center; gap: 10px; padding: 10px 13px; border-radius: 9px;
+  border: 1px solid var(--line); background: var(--surface-2); font-size: 12.5px; margin-bottom: 13px;
+  line-height: 1.55; }
+.diagsum.ok { border-color: var(--ok); background: var(--ok-soft); }
+.diagsum.warn { border-color: var(--warn); background: var(--warn-soft); }
+.diagsum.bad { border-color: var(--bad); background: var(--bad-soft); }
+.sect { margin-top: 16px; }
+.sect h4 { font-size: 12px; font-weight: 600; color: var(--ink-3); letter-spacing: .04em;
+  text-transform: uppercase; margin-bottom: 7px; }
+.netlog { border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2);
+  max-height: 190px; overflow: auto; }
+.netlog .r { display: flex; gap: 9px; padding: 4px 9px; font: 11px var(--mono);
+  border-bottom: 1px solid var(--line-soft); }
+.netlog .r:last-child { border-bottom: none; }
+.netlog .r .st { width: 42px; flex: none; }
+.netlog .r.bad .st { color: var(--bad); }
+.netlog .r .pa { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.netlog .r .ms { color: var(--ink-3); flex: none; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -355,6 +395,7 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
         <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" aria-hidden="true"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
       <button class="ghost" id="btnKeyOpen">密钥</button>
+      <button class="ghost" id="btnDiag" title="逐个探测接口，看是哪一层断了">诊断</button>
       <button id="btnRefresh">刷新</button>
     </div>
 
@@ -653,13 +694,15 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
             <select id="logLimit"><option>100</option><option selected>200</option><option>500</option><option>1000</option></select>
           </label>
         </div>
+        <div class="errgroups" id="logGroups" hidden></div>
         <div class="tbl-wrap"><table class="tbl">
-          <thead><tr><th>时间</th><th>结果</th><th>类型</th><th>模型</th><th>账号</th>
-            <th class="num">耗时</th><th class="num">Token</th><th>来源</th><th>请求 ID</th></tr></thead>
-          <tbody id="logBody"><tr><td colspan="9"><div class="empty">加载中…</div></td></tr></tbody>
+          <thead><tr><th class="mark"></th><th>时间</th><th>结果</th><th>类型</th><th>模型</th><th>账号</th>
+            <th class="num">耗时</th><th class="num">Token</th><th>错误 / 说明</th><th>请求 ID</th></tr></thead>
+          <tbody id="logBody"><tr><td colspan="10"><div class="empty">加载中…</div></td></tr></tbody>
         </table></div>
         <div class="logfoot">
           <span class="note" id="logPage">—</span>
+          <span class="dim" style="font-size:11.5px;margin-left:8px">点任意一行看完整报错与请求 ID</span>
           <span style="flex:1"></span>
           <button class="xs ghost" id="logPrev">上一页</button>
           <button class="xs ghost" id="logNext">下一页</button>
@@ -777,6 +820,58 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
 </div>
 
 <div id="toasts"></div>
+
+<!-- 一条请求的全部字段。表格只能放得下两三个，排查要的是原样。 -->
+<div class="veil" id="logVeil">
+  <div class="modal wide">
+    <header>
+      <h3 id="logTitle">请求详情</h3>
+      <div class="hint">来自落盘的请求历史表，字段原样展示，可直接复制给上游或贴进工单。</div>
+    </header>
+    <div class="body">
+      <div class="kv" id="logKv"></div>
+      <div class="sect">
+        <h4>错误 / 说明</h4>
+        <pre class="out" id="logErr"></pre>
+      </div>
+    </div>
+    <footer>
+      <button class="xs" id="logCopy">复制这一行 JSON</button>
+      <button class="xs ghost" id="logCopyErr">只复制报错</button>
+      <div class="grow"></div>
+      <button class="primary xs" id="logClose">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 连接诊断：浏览器逐个打接口，和服务器自述并排放 -->
+<div class="veil" id="diagVeil">
+  <div class="modal wider">
+    <header>
+      <h3>连接诊断</h3>
+      <div class="hint">从这台浏览器逐个请求网关的接口。哪一层断了，下面的表会指出来——
+        尤其是「浏览器报 502、服务器却查不到这条请求」的情况。</div>
+    </header>
+    <div class="body">
+      <div class="diagsum" id="diagSum">检查中…</div>
+      <div class="tbl-wrap"><table class="tbl">
+        <thead><tr><th>检查</th><th>结果</th><th class="num">耗时</th><th>说明</th></tr></thead>
+        <tbody id="diagBody"></tbody>
+      </table></div>
+      <div class="sect"><h4>服务器自述</h4><div class="kv" id="diagFacts"></div></div>
+      <div class="sect"><h4>服务端最近告警（容器日志 WARNING 以上）</h4>
+        <pre class="out" id="diagLog" style="max-height:200px"></pre></div>
+      <div class="sect"><h4>本次会话里面板自己的请求（失败与慢的）</h4>
+        <div class="netlog" id="diagNet"></div></div>
+    </div>
+    <footer>
+      <button class="xs" id="diagCopy">复制诊断报告</button>
+      <button class="xs ghost" id="diagRerun">重测</button>
+      <div class="grow"></div>
+      <button class="primary xs" id="diagClose">关闭</button>
+    </footer>
+  </div>
+</div>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -825,6 +920,15 @@ function toast(text, kind) {
 }
 
 /* ── 请求封装 ─────────────────────────────────────────────────────── */
+// 面板自己的调用也留一份流水：出问题时能说清「哪一次、打到哪、多久、回什么」，
+// 而不是只剩一个 HTTP 502 的 toast。只记失败与慢的，正常轮询不占地方。
+const netLog = [];
+
+function noteNet(entry) {
+  netLog.unshift(entry);
+  if (netLog.length > 60) netLog.pop();
+}
+
 function authHeaders(extra) {
   const h = Object.assign({}, extra || {});
   if (apiKey) h["Authorization"] = "Bearer " + apiKey;
@@ -834,7 +938,21 @@ function authHeaders(extra) {
 async function api(path, opts, quiet) {
   opts = opts || {};
   opts.headers = authHeaders(opts.headers);
-  const res = await fetch(path, opts);
+  const method = (opts.method || "GET").toUpperCase();
+  const started = performance.now();
+  let res;
+  try {
+    res = await fetch(path, opts);
+  } catch (err) {
+    // 连响应都没拿到（DNS / TCP / 代理 / 证书）。这类错误 status 记为 0。
+    noteNet({ t: Date.now(), method, path, status: 0,
+      ms: Math.round(performance.now() - started), note: String((err && err.message) || err) });
+    throw err;
+  }
+  const elapsed = Math.round(performance.now() - started);
+  if (!res.ok || elapsed >= 1500) {
+    noteNet({ t: Date.now(), method, path, status: res.status, ms: elapsed, note: res.ok ? "慢" : "" });
+  }
   if (res.status === 401) {
     // 后台请求（例如进页面就预取音色）不该打断用户，只有用户主动发起的调用才弹门。
     if (!quiet) openKeyGate();
@@ -843,20 +961,35 @@ async function api(path, opts, quiet) {
   return res;
 }
 
-async function errorText(res) {
+async function errorText(res, path) {
   let body = "";
   try {
     const data = await res.json();
-    body = (data && (data.error && data.error.message)) || data.detail || data.message || JSON.stringify(data);
+    if (data && typeof data === "object") {
+      body = (data.error && (data.error.message || data.error)) || data.detail || data.message ||
+        (Object.keys(data).length ? JSON.stringify(data) : "");
+    } else {
+      body = String(data == null ? "" : data);
+    }
   } catch (e) {
     try { body = await res.text(); } catch (e2) { body = ""; }
   }
-  return "HTTP " + res.status + (body ? " · " + String(body).slice(0, 300) : "");
+  body = String(body == null ? "" : body).trim();
+  let where = path || "";
+  try { if (res.url) where = new URL(res.url).pathname + new URL(res.url).search; } catch (e) { /* file:// */ }
+  let text = "HTTP " + res.status + (where ? " · " + where : "") +
+    (body ? " · " + body.slice(0, 300) : " · 响应体为空");
+  if (!body && res.status === 502) {
+    // 网关自己回的每个错误都带 JSON 体（error_response / media_error_response），
+    // 空体只可能来自中间层：代理、VPN、端口转发，或者进程刚好在重启。
+    text += "（网关的错误一律带 JSON 体，空体说明这个 502 不是网关回的，卡在浏览器和服务器之间）";
+  }
+  return text;
 }
 
 async function getJSON(path, quiet) {
   const res = await api(path, {}, quiet);
-  if (!res.ok) throw new Error(await errorText(res));
+  if (!res.ok) throw new Error(await errorText(res, path));
   return res.json();
 }
 
@@ -866,9 +999,49 @@ async function postJSON(path, body, quiet) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   }, quiet);
-  if (!res.ok) throw new Error(await errorText(res));
+  if (!res.ok) throw new Error(await errorText(res, path));
   return res.json();
 }
+
+async function copyText(text, okMsg) {
+  const value = String(text == null ? "" : text);
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e2) { /* 剪贴板也不可用 */ }
+    ta.remove();
+  }
+  toast(okMsg || "已复制", "ok");
+}
+
+// 表格加载失败时把原因写在表格里，而不是留一句「加载中…」让人以为它在转。
+function showTableError(tbodyId, colspan, message) {
+  const el = $(tbodyId);
+  if (!el) return;
+  el.innerHTML = '<tr><td colspan="' + colspan + '"><div class="empty">' +
+    '<div class="big">加载失败</div>' +
+    '<div class="mono" style="font-size:11.5px;color:var(--bad);white-space:pre-wrap;max-width:720px;margin:0 auto">' +
+    esc(message) + "</div>" +
+    '<div style="margin-top:12px"><button class="xs" onclick="openDiag()">打开诊断</button> ' +
+    '<button class="xs ghost" onclick="retryView()">重试</button></div></div></td></tr>';
+}
+
+function retryView() {
+  const view = (location.hash || "#chat").slice(1);
+  if (view === "logs") loadLogs();
+  else if (view === "accounts") loadOverview();
+  else if (view === "usage") loadUsage();
+  else if (view === "capacity") loadCapacity();
+  else if (view === "config") loadConfig();
+  else loadModels();
+}
+
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
 function openKeyGate() {
@@ -909,7 +1082,7 @@ function show(view) {
   if (view === "capacity") loadCapacity();
   if (view === "models") loadModels();
   if (view === "config") loadConfig();
-  if (view === "logs") { loadLogs(); logsTimer = setInterval(loadLogs, 5000); }
+  if (view === "logs") { loadLogs(); loadErrorGroups(); logsTimer = setInterval(loadLogs, 5000); }
 }
 document.querySelectorAll(".nav a").forEach((a) => {
   a.addEventListener("click", (e) => { e.preventDefault(); show(a.dataset.view); });
@@ -988,8 +1161,13 @@ async function loadOverview() {
   try {
     overview = await getJSON("/admin/overview");
   } catch (e) {
+    // 别只弹个 toast 就把页面留在「加载中」：把失败原因写进表格，并告诉人下一步点哪。
     toast(e.message || String(e), "bad");
-    return;
+    $("accHint").textContent = "加载失败 · 点「诊断」看链路";
+    $("accNote").textContent = "—";
+    showTableError("accBody", 10, e.message || String(e));
+    $("cycleBody").innerHTML = '<tr><td colspan="5"><div class="empty">账号数据没取到，签到周期也画不出来</div></td></tr>';
+    return false;
   }
   const p = overview.pool;
   const t = overview.probes.totals || {};
@@ -1019,6 +1197,7 @@ async function loadOverview() {
   renderAlerts(overview.alerts || []);
   renderAccounts();
   renderCycle();
+  return true;
 }
 
 function accountRows() {
@@ -1357,7 +1536,7 @@ async function loadUsage() {
     usageData = await getJSON("/admin/usage?hours=" + hours);
   } catch (e) {
     toast(e.message || String(e), "bad");
-    return;
+    return false;
   }
   const t = usageData.total;
   $("uReq").textContent = t.requests;
@@ -1373,6 +1552,7 @@ async function loadUsage() {
   $("usChartNote").textContent = t.requests ? "合计 " + num(t.total_tokens) + " token / " + t.requests + " 次" : "窗口内没有请求";
   drawChart(usageData.series.points);
   renderUsageTable();
+  return true;
 }
 
 // 刻度要取整到 1/2/5×10^k，否则 max=1 时会出现「1 1 0 0」这种重复刻度。
@@ -1477,7 +1657,7 @@ async function loadCapacity() {
     d = await getJSON("/admin/capacity?hours=" + hours + "&days=7");
   } catch (e) {
     toast(e.message || String(e), "bad");
-    return;
+    return false;
   }
   const b = d.balance, r = d.run_rate;
   const hasBalance = !!b.balance_known;
@@ -1512,6 +1692,7 @@ async function loadCapacity() {
   ).join("");
 
   $("capMethod").innerHTML = (d.method || []).map((m) => "<li>" + esc(m) + "</li>").join("");
+  return true;
 }
 
 $("capHours").addEventListener("change", loadCapacity);
@@ -1520,6 +1701,21 @@ $("btnCapacity").addEventListener("click", loadCapacity);
 /* ── 请求日志 ─────────────────────────────────────────────────────── */
 let logOutcome = "";
 let logOffset = 0;
+let logRows = [];          // 当前页的行，点开详情时按索引取回原对象
+
+// kind 决定「类型」列。原来除 mcp 之外一律写成「对话」，图像、视频、面板调用
+// 全混在一起，等于把分类信息丢了。
+const KIND_LABEL = {
+  chat: "对话", "chat.stream": "对话·流", messages: "原生", "messages.stream": "原生·流",
+  image: "图像", video: "视频", speech: "语音", music: "音乐",
+  console: "面板", error: "异常", usage: "用量",
+};
+function kindLabel(kind) {
+  if (!kind) return "—";
+  if (kind.indexOf("mcp:") === 0) return "多模态";
+  return KIND_LABEL[kind] || kind;
+}
+
 document.querySelectorAll("#logChips .chip").forEach((chip) => {
   chip.addEventListener("click", () => {
     document.querySelectorAll("#logChips .chip").forEach((c) => c.classList.toggle("on", c === chip));
@@ -1529,7 +1725,7 @@ document.querySelectorAll("#logChips .chip").forEach((chip) => {
 });
 $("logQ").addEventListener("input", () => loadLogs());
 $("logLimit").addEventListener("change", () => loadLogs());
-$("btnLogs").addEventListener("click", () => loadLogs());
+$("btnLogs").addEventListener("click", () => { loadLogs(); loadErrorGroups(); });
 $("logPrev").addEventListener("click", () => {
   logOffset = Math.max(0, logOffset - Number($("logLimit").value));
   loadLogs(true);
@@ -1538,6 +1734,63 @@ $("logNext").addEventListener("click", () => {
   logOffset += Number($("logLimit").value);
   loadLogs(true);
 });
+$("logBody").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-row]");
+  if (!tr) return;
+  const row = logRows[Number(tr.dataset.row)];
+  if (row) openLogDetail(row);
+});
+$("logGroups").addEventListener("click", (e) => {
+  const chip = e.target.closest("[data-err]");
+  if (!chip) return;
+  $("logQ").value = chip.dataset.err;
+  logOutcome = "error";
+  document.querySelectorAll("#logChips .chip").forEach((c) => c.classList.toggle("on", c.dataset.outcome === "error"));
+  loadLogs();
+});
+
+async function loadErrorGroups() {
+  let d;
+  try {
+    d = await getJSON("/admin/errors?hours=24&limit=6", true);
+  } catch (e) {
+    $("logGroups").hidden = true;
+    return;
+  }
+  const bar = $("logGroups");
+  const groups = (d && d.groups) || [];
+  if (!groups.length) { bar.hidden = true; return; }
+  bar.hidden = false;
+  bar.innerHTML = '<span class="dim" style="font-size:11.5px">近 24h 失败聚合</span>' +
+    groups.map((g) => '<span class="eg" data-err="' + esc(g.error) + '" title="点一下只看这一条">' +
+      "<b>" + num(g.count) + "×</b><span>" + esc(g.error) + "</span></span>").join("");
+}
+
+function openLogDetail(r) {
+  $("logTitle").textContent = (r.ok ? "成功" : "失败") + " · " + (r.model || "—");
+  const fields = [
+    ["时间", r.time],
+    ["结果", (r.status || "—") + (r.ok ? " · 成功" : " · 失败")],
+    ["类型", kindLabel(r.kind)],
+    ["模型", r.model],
+    ["账号", r.account],
+    ["耗时", ms(r.latency_ms)],
+    ["Token", (r.prompt_tokens || 0) + " 入 / " + (r.completion_tokens || 0) + " 出"],
+    ["来源", r.client || "—"],
+    ["请求 ID", r.request_id],
+  ];
+  $("logKv").innerHTML = fields.map(([k, v]) =>
+    '<div class="k">' + esc(k) + '</div><div class="v">' + esc(String(v == null ? "—" : v)) + "</div>").join("");
+  const err = String(r.error || "").trim();
+  $("logErr").textContent = err ||
+    (r.ok ? "这次调用没有错误。" : "上游没有返回错误正文，只有状态码。看「服务端最近告警」里同一时刻的行。");
+  $("logErr").style.borderLeft = err ? "3px solid var(--bad)" : "1px solid var(--line)";
+  $("logCopy").onclick = () => copyText(JSON.stringify(r, null, 2), "已复制这一行");
+  $("logCopyErr").onclick = () => copyText(err || "(无错误正文)", err ? "已复制报错" : "没有报错可复制");
+  $("logVeil").classList.add("on");
+}
+$("logClose").addEventListener("click", () => $("logVeil").classList.remove("on"));
+$("logVeil").addEventListener("click", (e) => { if (e.target === $("logVeil")) $("logVeil").classList.remove("on"); });
 
 async function loadLogs(keepOffset) {
   const limit = Number($("logLimit").value);
@@ -1548,7 +1801,10 @@ async function loadLogs(keepOffset) {
     d = await getJSON("/admin/logs?limit=" + limit + "&offset=" + logOffset +
       "&q=" + q + "&outcome=" + logOutcome, true);
   } catch (e) {
-    return;
+    $("reqNote").textContent = "读取失败";
+    $("logPage").textContent = "—";
+    showTableError("logBody", 10, e.message || String(e));
+    return false;
   }
   const durable = d.source === "sqlite";
   $("logHint").textContent = durable ? "落盘保留 · 重启不清" : "仅内存 · 重启清空";
@@ -1560,24 +1816,196 @@ async function loadLogs(keepOffset) {
   $("logPrev").disabled = d.offset <= 0;
   $("logNext").disabled = d.offset + d.count >= d.total;
   if (logOffset !== d.offset) logOffset = d.offset;
-  if (!d.rows.length) {
-    $("logBody").innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">没有记录</div>' +
+  logRows = d.rows || [];
+  if (!logRows.length) {
+    $("logBody").innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">没有记录</div>' +
       "打一次对话或生成请求就会出现在这里</div></td></tr>";
-    return;
+    return true;
   }
-  $("logBody").innerHTML = d.rows.map((r) => {
-    const kindTag = r.kind.startsWith("mcp:") ? "多模态" : "对话";
-    return "<tr>" +
-      '<td class="mono dim">' + esc(r.time) + "</td>" +
-      "<td>" + (r.ok ? '<span class="tag ok">200</span>' : '<span class="tag bad">' + r.status + "</span>") + "</td>" +
-      '<td class="dim">' + kindTag + "</td>" +
+  $("logBody").innerHTML = logRows.map((r, i) => {
+    const err = String(r.error || "").trim();
+    return '<tr class="clickable' + (r.ok ? "" : " failrow") + '" data-row="' + i + '">' +
+      '<td class="mark"><i></i></td>' +
+      '<td class="mono dim" style="white-space:nowrap">' + esc(r.time) + "</td>" +
+      "<td>" + (r.ok ? '<span class="tag ok">' + (r.status || 200) + "</span>"
+                     : '<span class="tag bad">' + (r.status || "—") + "</span>") + "</td>" +
+      '<td class="dim">' + esc(kindLabel(r.kind)) + "</td>" +
       '<td class="mono">' + esc(r.model) + "</td>" +
-      '<td class="dim">' + esc(r.account) + "</td>" +
+      '<td class="dim">' + esc(r.account || "—") + "</td>" +
       '<td class="num">' + ms(r.latency_ms) + "</td>" +
       '<td class="num">' + (r.total_tokens ? num(r.total_tokens) : "—") + "</td>" +
-      '<td class="dim" style="font-size:11.5px">' + esc(r.client || "—") + "</td>" +
+      '<td><div class="cellerr' + (err ? "" : " none") + '" title="' + esc(err || "—") + '">' +
+        esc(err || (r.ok ? "—" : "（没有错误正文）")) + "</div></td>" +
       '<td class="mono dim" style="font-size:11px">' + esc(r.request_id) + "</td></tr>";
   }).join("");
+  return true;
+}
+
+/* ── 连接诊断 ─────────────────────────────────────────────────────── */
+// 面板报错时最需要的不是一句话，而是「哪一层」。这里从浏览器按顺序打接口，
+// 再和服务器自述、容器告警、面板自己的请求流水并排摆出来。
+const DIAG_CHECKS = [
+  ["GET /healthz", "/healthz", "不带密钥，只看服务器是否活着"],
+  ["GET /admin/summary", "/admin/summary", "侧栏脉冲用的就是它"],
+  ["GET /admin/overview", "/admin/overview", "账号池页面的数据源"],
+  ["GET /admin/logs?limit=1", "/admin/logs?limit=1", "请求历史是否可读"],
+];
+let diagResult = null;
+
+async function openDiag() {
+  $("diagVeil").classList.add("on");
+  await runDiagnostics();
+}
+window.openDiag = openDiag;
+
+async function runDiagnostics() {
+  const rows = [];
+  for (const [label, path, note] of DIAG_CHECKS) {
+    const started = performance.now();
+    let status = 0;
+    let detail = note;
+    try {
+      const res = await fetch(path, { headers: authHeaders(), cache: "no-store" });
+      status = res.status;
+      const elapsed = Math.round(performance.now() - started);
+      if (!res.ok) {
+        let body = "";
+        try { body = await res.text(); } catch (e) { body = ""; }
+        detail = note + " · " + (String(body || "").trim().slice(0, 220) || "响应体为空");
+      }
+      rows.push({ label, path, status, ms: elapsed, ok: res.ok, detail });
+    } catch (err) {
+      rows.push({ label, path, status: 0, ms: Math.round(performance.now() - started),
+        ok: false, detail: note + " · 请求没发出去：" + String((err && err.message) || err) });
+    }
+  }
+  const passed = rows.filter((r) => r.ok).length;
+  const sum = $("diagSum");
+  let level = "ok";
+  let text = rows.length + "/" + rows.length + " 通过：浏览器到网关的链路正常。";
+  const dead = rows.filter((r) => r.status === 0).length;
+  const empty502 = rows.filter((r) => r.status === 502).length;
+  const auth = rows.filter((r) => r.status === 401).length;
+  if (passed === rows.length) {
+    text = "全部通过：这台浏览器能连上网关，接口都在正常返回。" +
+      "如果刚才某次操作仍报 502，去「请求日志」筛「面板」——那里没有对应行，就说明那次请求根本没到服务器。";
+  } else if (dead) {
+    level = "bad";
+    text = "有接口连响应都没拿到（status 0）：网络 / 代理 / 端口转发断了，或者网关进程不在。先看下面「服务器自述」是否也拿不到。";
+  } else if (auth) {
+    level = "warn";
+    text = "密钥不被接受（401）：点顶部「密钥」重新填一次网关的 GATEWAY_API_KEY。";
+  } else if (empty502) {
+    level = "warn";
+    text = "有接口回 502：先看响应体是不是空。空体不是网关回的（网关每个错误都带 JSON），多半是中间代理。";
+  } else {
+    level = "warn";
+    text = passed + "/" + rows.length + " 通过，失败的看下表最后一行说明。";
+  }
+  sum.className = "diagsum " + level;
+  sum.textContent = text;
+
+  $("diagBody").innerHTML = rows.map((r) => {
+    const tag = r.ok ? '<span class="tag ok">' + r.status + "</span>"
+      : '<span class="tag bad">' + (r.status || "断开") + "</span>";
+    return "<tr><td class=\"mono\" style=\"font-size:11.5px\">" + esc(r.label) + "</td>" +
+      "<td>" + tag + "</td>" +
+      '<td class="num">' + ms(r.ms) + "</td>" +
+      '<td class="dim" style="font-size:11.5px;max-width:380px;overflow:hidden;text-overflow:ellipsis">' +
+      esc(r.detail) + "</td></tr>";
+  }).join("");
+  renderNetLog();
+
+  let facts = null;
+  try {
+    facts = await getJSON("/admin/diagnostics?lines=80", true);
+  } catch (e) {
+    $("diagFacts").innerHTML = '<div class="k">读取失败</div><div class="v" style="color:var(--bad)">' +
+      esc(e.message || String(e)) + "</div>";
+    $("diagLog").textContent = "（拿不到服务器自述）";
+  }
+  if (facts) renderDiagFacts(facts);
+  diagResult = { at: new Date().toISOString(), rows, facts, summary: text };
+}
+
+function renderDiagFacts(d) {
+  const s = d.service || {};
+  const p = d.pool || {};
+  const st = d.store || {};
+  const pr = d.probes || {};
+  const bits = [
+    ["版本", s.version],
+    ["运行", dur(s.uptime_seconds)],
+    ["区域", s.region + (s.proxy ? " · proxy" : "") + " · " + s.transport],
+    ["服务器时间", s.server_time],
+    ["号池", (p.usable || 0) + "/" + (p.size || 0) + " 可用 · 冷却 " + (p.cooling || 0) +
+      " · 禁用 " + (p.disabled || 0) + " · 在途 " + (p.in_flight || 0)],
+    ["历史", (st.mode || "?") + " · " + num(st.rows || 0) + " 行 · 队列 " + (st.queued || 0) +
+      (st.error ? " · 错误 " + st.error : "")],
+    ["探针", pr.age_seconds != null ? ago(pr.updated_at) + " 前" : "未采样"],
+    ["告警", (d.log_stats && d.log_stats.buffered ? d.log_stats.buffered + " 条在缓冲" : "无")],
+  ];
+  $("diagFacts").innerHTML = bits.map(([k, v]) =>
+    '<div class="k">' + esc(k) + '</div><div class="v">' + esc(String(v == null ? "—" : v)) + "</div>").join("");
+
+  const logs = d.log || [];
+  $("diagLog").textContent = logs.length
+    ? logs.map((r) => r.time_label + " " + r.level + " " + r.logger + " · " + r.message +
+        (r.exc ? "\n" + r.exc : "")).join("\n")
+    : "（最近没有 WARNING 以上的记录）";
+}
+
+function renderNetLog() {
+  const rows = netLog.slice(0, 40);
+  $("diagNet").innerHTML = rows.length
+    ? rows.map((e) => {
+        const t = new Date(e.t).toLocaleTimeString("zh-CN", { hour12: false });
+        return '<div class="r' + (e.status && e.status < 400 ? "" : " bad") + '">' +
+          '<span class="st">' + (e.status || "ERR") + "</span>" +
+          '<span class="pa">' + esc(e.method + " " + e.path) + (e.note ? " · " + esc(e.note) : "") + "</span>" +
+          '<span class="ms">' + t + " · " + e.ms + "ms</span></div>";
+      }).join("")
+    : '<div class="r"><span class="pa dim">这次会话里还没有失败或偏慢的请求</span></div>';
+}
+
+$("btnDiag").addEventListener("click", openDiag);
+$("diagClose").addEventListener("click", () => $("diagVeil").classList.remove("on"));
+$("diagVeil").addEventListener("click", (e) => { if (e.target === $("diagVeil")) $("diagVeil").classList.remove("on"); });
+$("diagRerun").addEventListener("click", () => runDiagnostics());
+$("diagCopy").addEventListener("click", () => copyText(diagReport(), "诊断报告已复制，可直接粘贴"));
+
+function diagReport() {
+  const d = diagResult || { rows: [], facts: null };
+  const lines = [
+    "minimax-code2api 控制台诊断",
+    "生成时间: " + new Date().toString(),
+    "页面: " + location.href,
+    "浏览器: " + navigator.userAgent,
+    "",
+    "— 接口 —",
+  ];
+  (d.rows || []).forEach((r) => lines.push(r.label + " → " + (r.status || "断开") + " · " + r.ms + "ms · " + r.detail));
+  const f = d.facts;
+  if (f) {
+    const s = f.service || {};
+    const p = f.pool || {};
+    const st = f.store || {};
+    lines.push("", "— 服务器 —",
+      "version=" + s.version + " uptime=" + dur(s.uptime_seconds) + " region=" + s.region +
+        " transport=" + s.transport + " proxy=" + (s.proxy || "-"),
+      "pool=" + (p.usable || 0) + "/" + (p.size || 0) + " cooling=" + (p.cooling || 0) +
+        " disabled=" + (p.disabled || 0) + " inflight=" + (p.in_flight || 0),
+      "store=" + (st.mode || "?") + " rows=" + (st.rows || 0) + " queued=" + (st.queued || 0) +
+        " error=" + (st.error || "-"),
+      "", "— 服务端最近告警 —");
+    (f.log || []).slice(-20).forEach((r) => lines.push(r.time_label + " " + r.level + " " + r.logger + " " + r.message));
+    lines.push("", "— 失败聚合（近 24h）—");
+    (f.error_groups || []).forEach((g) => lines.push(g.count + "× " + g.error + "  (" + g.first + " → " + g.last + ")"));
+  }
+  lines.push("", "— 面板请求（失败与慢）—");
+  netLog.slice(0, 25).forEach((e) => lines.push(new Date(e.t).toLocaleString("zh-CN") + " " +
+    (e.status || "ERR") + " " + e.method + " " + e.path + " " + e.ms + "ms " + (e.note || "")));
+  return lines.join("\n");
 }
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
@@ -1587,11 +2015,12 @@ async function loadModels() {
     models = data.data || [];
   } catch (e) {
     $("mdBody").innerHTML = '<tr><td colspan="7"><div class="empty">读取模型失败</div></td></tr>';
-    return;
+    return false;
   }
   const chat = models.filter((m) => !m.type || m.type === "chat");
   $("model").innerHTML = chat.map((m) => '<option value="' + esc(m.id) + '">' + esc(m.id) + "</option>").join("");
   renderModels();
+  return true;
 }
 
 const KIND = { chat: "对话", image: "图像", audio: "语音", video: "视频" };
@@ -1698,7 +2127,7 @@ async function loadConfig() {
     d = await getJSON("/admin/config", true);
   } catch (e) {
     $("cfgBody").innerHTML = '<div class="empty">读取配置失败</div>';
-    return;
+    return false;
   }
   $("cfgNote").textContent = d.env_file;
   $("cfgBody").innerHTML = d.groups.map((g) =>
@@ -1710,6 +2139,7 @@ async function loadConfig() {
     "</tbody></table></div></div>"
   ).join("");
   $("cfgBody").dataset.json = JSON.stringify(d, null, 2);
+  return true;
 }
 $("btnCfgCopy").addEventListener("click", async () => {
   try {
@@ -2007,17 +2437,20 @@ $("btnTts").addEventListener("click", async () => {
 });
 
 /* ── 顶部刷新 ─────────────────────────────────────────────────────── */
-$("btnRefresh").addEventListener("click", () => {
+// 「已刷新」只在真的刷新成功后才说。原来它无条件先弹出来，和随后出现的
+// 失败提示叠在一起，看着像「刷新成功但页面坏了」。
+$("btnRefresh").addEventListener("click", async () => {
   refreshNav();
   const view = (location.hash || "#chat").slice(1);
-  if (view === "accounts") loadOverview();
-  else if (view === "usage") loadUsage();
-  else if (view === "capacity") loadCapacity();
-  else if (view === "logs") loadLogs();
-  else if (view === "models") loadModels();
-  else if (view === "config") loadConfig();
-  else loadModels();
-  toast("已刷新", "ok");
+  let ok = true;
+  if (view === "accounts") ok = await loadOverview();
+  else if (view === "usage") ok = await loadUsage();
+  else if (view === "capacity") ok = await loadCapacity();
+  else if (view === "logs") ok = await loadLogs();
+  else if (view === "models") ok = await loadModels();
+  else if (view === "config") ok = await loadConfig();
+  else ok = await loadModels();
+  if (ok !== false) toast("已刷新", "ok");
 });
 
 /* ── 启动 ─────────────────────────────────────────────────────────── */
