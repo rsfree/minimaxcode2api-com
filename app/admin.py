@@ -13,6 +13,7 @@ fan out to upstream on a page load. The one place they do (``/admin/signin``,
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import platform
@@ -22,12 +23,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import catalog, logring, media, signin, upstream
 from .auth import Token, token_manager
-from .config import settings
+from .config import RUNTIME_NOTES, settings
 from .metrics import metrics, stamp
 from .onboard import importer
 from .probe import probes
 from .security import authorized
 from .store import store
+
+log = logging.getLogger("minimax.admin")
 
 def _guard(request: Request) -> None:
     if not authorized(request):
@@ -571,10 +574,11 @@ async def capacity(hours: float = 24, days: int = 7) -> dict:
 
 @router.get("/config")
 async def config() -> dict:
-    """Effective configuration, secrets masked. Read-only on purpose.
+    """Effective configuration, secrets masked.
 
-    Editing runtime config would mean either a writable state file or a restart;
-    both are worse than telling the operator what to change in ``.env``.
+    The rows are the whole picture; ``editable`` is the subset that can be
+    changed without recreating the container — the form in the console is built
+    from it, so the two can never drift apart.
     """
 
     def mask(value: str) -> str:
@@ -591,6 +595,7 @@ async def config() -> dict:
             ("传输方式", settings.upstream_transport, "auto = httpx 失败后回落 curl"),
             ("请求体上限", f"{settings.request_body_limit // (1024 * 1024)} MB", "REQUEST_BODY_LIMIT"),
             ("默认 max_tokens", str(settings.default_max_tokens), "客户端没给时的兜底"),
+            ("重试次数", str(settings.retry_attempts), "RETRY_ATTEMPTS，面板可改；0 = 只试一次"),
         ]),
         ("鉴权", [
             ("网关密钥", mask(settings.api_keys[0]) if settings.api_keys else "未设置（不鉴权）",
@@ -624,5 +629,41 @@ async def config() -> dict:
         "groups": [{"name": name, "rows": [
             {"key": label, "value": value, "note": note} for label, value, note in items
         ]} for name, items in rows],
-        "env_file": ".env（改动需 docker compose up -d 重建容器）",
+        "editable": settings.editable_state(),
+        "runtime_file": str(settings.runtime_path()),
+        "runtime_notes": RUNTIME_NOTES,
+        "env_file": ".env（只有上面「不可运行期修改」的项需要重建容器）",
+    }
+
+
+@router.post("/config")
+async def update_config(request: Request) -> dict:
+    """Change the editable knobs in place — no rebuild, no restart.
+
+    The write lands in ``/data/runtime.json`` so it survives a container
+    recreate, and takes effect on the next request because every consumer reads
+    ``settings.<name>`` at use time. Two of them are baked into the httpx client
+    (timeout, proxy), so those rebuild the client instead of waiting.
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001 - any malformed body is a 400
+        raise HTTPException(status_code=400, detail=f"请求体不是 JSON：{exc}") from exc
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(status_code=400, detail="没有要修改的项")
+    if len(body) > 40:
+        raise HTTPException(status_code=400, detail="一次最多改 40 项")
+
+    applied, rejected = settings.apply_runtime(body)
+    if applied and {"request_timeout", "upstream_transport"} & set(applied):
+        await upstream.upstream.reload_client()
+        log.info("config: rebuilt the upstream client after %s", sorted(applied))
+
+    if applied:
+        log.info("config: applied %s", applied)
+    return {
+        "applied": applied,
+        "rejected": [{"key": key, "why": why} for key, why in rejected],
+        "editable": settings.editable_state(),
+        "runtime_file": str(settings.runtime_path()),
     }

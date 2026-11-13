@@ -6,6 +6,7 @@ extra moving parts and every knob is visible in ``.env.example``.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +53,90 @@ def _env_bool(name: str, default: bool) -> bool:
     if not raw:
         return default
     return raw in {"1", "true", "yes", "on"}
+
+
+# Knobs the console may change without recreating the container.
+#
+# Everything here is read through ``settings.<name>`` at the moment it is used,
+# so assigning the attribute is the whole "apply" step. What is *not* here
+# (region, base_url, proxy, API keys, body limit, port) is baked into a client,
+# a route table or the auth header of every request — changing those at runtime
+# would leave half the process on the old value, which is worse than a restart.
+EDITABLE: dict[str, dict] = {
+    "retry_attempts": {
+        "kind": "int", "min": 0, "max": 50,
+        "note": "一次调用最多重试几次（换号或同号重试）。0 = 只试一次",
+    },
+    "request_timeout": {
+        "kind": "float", "min": 5, "max": 3600,
+        "note": "上游超时（秒），改完立即重建连接池",
+    },
+    "default_max_tokens": {
+        "kind": "int", "min": 1, "max": 64000,
+        "note": "客户端没给 max_tokens 时的兜底",
+    },
+    "upstream_transport": {
+        "kind": "choice", "choices": ["auto", "httpx", "curl"],
+        "note": "出站传输。auto = httpx 失败后回落 curl",
+    },
+    "pool_watch": {
+        "kind": "float", "min": 0, "max": 3600,
+        "note": "号池目录扫描间隔（秒），0 关闭",
+    },
+    "probe_auto": {
+        "kind": "bool",
+        "note": "面板探针自动刷新",
+    },
+    "probe_interval": {
+        "kind": "float", "min": 0, "max": 86400,
+        "note": "探针间隔（秒），0 = 只手动",
+    },
+    "signin_auto": {
+        "kind": "bool",
+        "note": "每日自动签到",
+    },
+    "signin_interval_hours": {
+        "kind": "float", "min": 1, "max": 168,
+        "note": "签到巡检间隔（小时）",
+    },
+    "metrics_retention_days": {
+        "kind": "float", "min": 0.5, "max": 365,
+        "note": "请求历史保留天数",
+    },
+    "expose_retired_models": {
+        "kind": "bool",
+        "note": "在 /v1/models 里展示已下线模型",
+    },
+}
+
+
+def _coerce(spec: dict, value: object) -> object:
+    """Turn a JSON/query value into the field's type, or explain why not."""
+    kind = spec["kind"]
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on", "开"}:
+            return True
+        if text in {"0", "false", "no", "off", "关"}:
+            return False
+        raise ValueError("期望 true / false")
+    if kind == "choice":
+        text = str(value).strip().lower()
+        choices = spec["choices"]
+        if text not in choices:
+            raise ValueError("只能是 " + " / ".join(choices))
+        return text
+    cast = int if kind == "int" else float
+    try:
+        number = cast(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else cast(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError("期望整数" if kind == "int" else "期望数字") from None
+    low, high = spec["min"], spec["max"]
+    if not low <= number <= high:
+        raise ValueError(f"范围 {low}..{high}")
+    return number
 
 
 @dataclass
@@ -108,12 +193,23 @@ class Settings:
     request_body_limit: int = field(default_factory=lambda: _env_int("REQUEST_BODY_LIMIT", 64 * 1024 * 1024))
     expose_retired_models: bool = field(default_factory=lambda: _env_bool("EXPOSE_RETIRED_MODELS", False))
 
+    # How many times one caller request may be retried before the error goes
+    # back. The unit is an attempt, not an account: a retry normally means
+    # "park this account, take the next", but when the pool has no untried
+    # account left a transient failure (5xx, connection reset) reuses the last
+    # one instead of giving up. 0 = one attempt, no retry.
+    retry_attempts: int = field(default_factory=lambda: _env_int("RETRY_ATTEMPTS", 3))
+
     def __post_init__(self) -> None:
         self.region = self.region if self.region in REGION_ACCOUNT_BASE else "en"
         self.base_url = (self.base_url or REGION_LLM_BASE[self.region]).rstrip("/")
         self.account_base = (self.account_base or REGION_ACCOUNT_BASE[self.region]).rstrip("/")
         raw_keys = _env("GATEWAY_API_KEY")
         self.api_keys = [part.strip() for part in raw_keys.replace("\n", ",").split(",") if part.strip()]
+        # Value from .env/defaults, before any runtime overlay. "Reset this knob"
+        # means "go back to this".
+        self._baseline: dict[str, object] = {key: getattr(self, key) for key in EDITABLE}
+        self._overrides: dict[str, object] = {}
 
     @property
     def token_endpoint(self) -> str:
@@ -155,5 +251,96 @@ class Settings:
         )
         return candidate if candidate.exists() else None
 
+    # -- runtime overrides -------------------------------------------------
+    def runtime_path(self) -> Path:
+        """Where the console persists what it changed.
+
+        ``/data`` is the volume that survives a container recreate; on a laptop
+        it is the repository's ``data/``. ``RUNTIME_CONFIG`` overrides both.
+        """
+        raw = _env("RUNTIME_CONFIG")
+        if raw:
+            return Path(raw)
+        root = Path("/data")
+        return (root if root.is_dir() else Path("data")) / "runtime.json"
+
+    def load_runtime(self) -> list[str]:
+        """Re-apply the last saved overrides. Returns notes for the operator."""
+        path = self.runtime_path()
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as exc:
+            return [f"{path} 读取失败（{type(exc).__name__}: {exc}），本次按 .env 运行"]
+        if not isinstance(raw, dict):
+            return [f"{path} 顶层不是对象，已忽略"]
+        applied, rejected = self.apply_runtime(raw, persist=False)
+        notes = [f"{path} 里 {key} 未生效：{why}" for key, why in rejected]
+        if applied:
+            notes.append(f"从 {path} 恢复了 {len(applied)} 项运行配置")
+        return notes
+
+    def apply_runtime(self, updates: dict, persist: bool = True) -> tuple[dict, list[tuple[str, str]]]:
+        """Validate and assign. Returns ``(applied, [(key, why_rejected)])``.
+
+        ``None`` or ``""`` means "go back to the .env value", which is the only
+        way to undo an override without editing the file by hand.
+        """
+        applied: dict[str, object] = {}
+        rejected: list[tuple[str, str]] = []
+        for key, value in (updates or {}).items():
+            spec = EDITABLE.get(key)
+            if spec is None:
+                rejected.append((key, "不可运行期修改（改 .env 后重建容器）"))
+                continue
+            if value is None or value == "":
+                self._overrides.pop(key, None)
+                setattr(self, key, self._baseline[key])
+                applied[key] = self._baseline[key]
+                continue
+            try:
+                coerced = _coerce(spec, value)
+            except ValueError as exc:
+                rejected.append((key, str(exc)))
+                continue
+            setattr(self, key, coerced)
+            self._overrides[key] = coerced
+            applied[key] = coerced
+        if persist and applied:
+            try:
+                self._save_runtime()
+            except OSError as exc:
+                rejected.append(("runtime.json", f"写入失败：{exc}"))
+        return applied, rejected
+
+    def _save_runtime(self) -> None:
+        path = self.runtime_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(self._overrides, ensure_ascii=False, indent=2) + "\n", "utf-8")
+        tmp.replace(path)
+
+    def editable_state(self) -> dict:
+        """Everything the console needs to draw the form."""
+        out: dict[str, dict] = {}
+        for key, spec in EDITABLE.items():
+            row = {
+                "value": getattr(self, key),
+                "baseline": self._baseline[key],
+                "source": "runtime" if key in self._overrides else "env",
+                "note": spec.get("note", ""),
+                "kind": spec["kind"],
+            }
+            for extra in ("min", "max", "choices"):
+                if extra in spec:
+                    row[extra] = spec[extra]
+            out[key] = row
+        return out
+
 
 settings = Settings()
+
+# Notes from replaying the saved overrides; the lifespan logs them, and
+# /admin/config shows them, so a broken runtime.json is visible instead of silent.
+RUNTIME_NOTES: list[str] = settings.load_runtime()

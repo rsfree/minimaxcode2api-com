@@ -312,8 +312,22 @@ METRICS_RETENTION_DAYS=3          # 请求历史保留天数，重启不清
 PROBE_AUTO=1                      # 后台探针（控制台的余额/签到状态来源），不花积分
 PROBE_INTERVAL=300                # 探针间隔秒数，最小 60；0 或 PROBE_AUTO=0 = 只手动刷新
 DEFAULT_MAX_TOKENS=8192
+RETRY_ATTEMPTS=3                  # 一次调用最多重试几次（0 = 不重试），面板可在线改
 GATEWAY_PORT=8080
 ```
+
+### 哪些配置能在线改、哪些必须重建
+
+面板「配置 → 运行配置」可以**不改 `.env`、不重建容器**直接改这 11 项：
+`RETRY_ATTEMPTS`、`UPSTREAM_TIMEOUT`、`DEFAULT_MAX_TOKENS`、`UPSTREAM_TRANSPORT`、
+`TOKEN_POOL_WATCH`、`PROBE_AUTO`/`PROBE_INTERVAL`、`SIGNIN_AUTO`/`SIGNIN_INTERVAL_HOURS`、
+`METRICS_RETENTION_DAYS`、`EXPOSE_RETIRED_MODELS`。
+
+改动写在 `/data/runtime.json`（容器内的卷，备份与迁移记得带上它），优先级高于 `.env`；
+重建容器、换镜像都不丢。面板点「重置」= 删掉该条覆盖，回到 `.env` 的值。
+
+剩下这些烘进了客户端或路由，改了必须重建：`MINIMAX_REGION`、`MINIMAX_BASE_URL`、
+`UPSTREAM_PROXY`、`GATEWAY_API_KEY`、`GATEWAY_PORT`、`REQUEST_BODY_LIMIT`、`TOKEN_POOL`。
 
 `.env` 权限收紧，且**永远不要提交进 git**：
 

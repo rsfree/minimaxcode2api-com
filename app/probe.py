@@ -284,14 +284,19 @@ def token_pool_ref():
 probes = ProbeCache()
 
 
-async def probe_loop(interval: float) -> None:
-    """Warm the cache once, then keep it fresh. Never raises."""
+async def probe_loop(interval: float = 0.0) -> None:
+    """Warm the cache once, then keep it fresh. Never raises.
+
+    The interval and the on/off switch are read every lap, so the console can
+    change them without a restart (``interval`` is only the startup fallback).
+    """
     await asyncio.sleep(8)  # let the pool load and the first requests settle
     while True:
-        try:
-            await probes.refresh()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a probe sweep must not kill the app
-            log.warning("probe sweep failed: %s", exc)
-        await asyncio.sleep(max(60.0, interval))
+        if settings.probe_auto:
+            try:
+                await probes.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a probe sweep must not kill the app
+                log.warning("probe sweep failed: %s", exc)
+        await asyncio.sleep(max(60.0, settings.probe_interval or interval))

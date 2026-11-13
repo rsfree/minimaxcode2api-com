@@ -765,11 +765,16 @@ table.tbl tr.failrow .mark i { background: var(--bad); }
     <!-- 运行配置 -->
     <section class="view" id="view-config" hidden>
       <div class="box">
-        <header><h3>生效配置 <span class="hint">只读 · 改配置改 .env 后 docker compose up -d</span></h3>
+        <header><h3>运行配置 <span class="hint">改完立即生效 · 写入 /data/runtime.json · 重建容器后保留</span></h3>
           <div class="grow"></div><span class="note" id="cfgNote">—</span>
+          <button class="xs" id="btnCfgSave">保存</button>
           <button class="xs ghost" id="btnCfgCopy">复制 JSON</button>
         </header>
-        <div id="cfgBody"><div class="empty">加载中…</div></div>
+        <div id="cfgEdit"><div class="empty">加载中…</div></div>
+      </div>
+      <div class="box">
+        <header><h3>生效配置 <span class="hint">只读快照 · 带 🔒 的需要改 .env 并重建容器</span></h3></header>
+        <div id="cfgBody"></div>
       </div>
     </section>
   </div>
@@ -2123,15 +2128,78 @@ $("mdCurl").addEventListener("click", async () => {
 });
 
 /* ── 运行配置 ─────────────────────────────────────────────────────── */
+// 可运行期修改的项：后端 EDITABLE 是唯一事实来源，这里只负责标签与控件。
+let cfgState = null;
+const CFG_LABELS = {
+  retry_attempts: "重试次数",
+  request_timeout: "上游超时（秒）",
+  default_max_tokens: "默认 max_tokens",
+  upstream_transport: "出站传输",
+  pool_watch: "号池扫描（秒）",
+  probe_auto: "探针自动刷新",
+  probe_interval: "探针间隔（秒）",
+  signin_auto: "自动签到",
+  signin_interval_hours: "签到间隔（小时）",
+  metrics_retention_days: "历史保留（天）",
+  expose_retired_models: "展示下线模型",
+};
+
+function cfgControl(key, st) {
+  const id = "cfg_" + key;
+  if (st.kind === "bool") {
+    return '<label style="display:flex;gap:6px;align-items:center;cursor:pointer">' +
+      '<input type="checkbox" id="' + id + '"' + (st.value ? " checked" : "") + ">" +
+      "<span class=\"dim\" style=\"font-size:12px\">" + (st.value ? "开" : "关") + "</span></label>";
+  }
+  if (st.kind === "choice") {
+    return '<select id="' + id + '" style="max-width:150px">' +
+      (st.choices || []).map((c) => '<option value="' + esc(c) + '"' + (c === st.value ? " selected" : "") +
+        ">" + esc(c) + "</option>").join("") + "</select>";
+  }
+  const step = st.kind === "float" ? "0.1" : "1";
+  return '<input type="number" id="' + id + '" value="' + st.value + '" min="' + st.min +
+    '" max="' + st.max + '" step="' + step + '" style="width:120px">';
+}
+
+function cfgRead(key, st) {
+  const el = $("cfg_" + key);
+  if (!el) return st.value;
+  if (st.kind === "bool") return el.checked;
+  if (st.kind === "choice") return el.value;
+  const num = Number(el.value);
+  return Number.isFinite(num) ? num : el.value;
+}
+
 async function loadConfig() {
   let d;
   try {
     d = await getJSON("/admin/config", true);
   } catch (e) {
-    $("cfgBody").innerHTML = '<div class="empty">读取配置失败</div>';
+    $("cfgEdit").innerHTML = '<div class="empty">读取配置失败：' + esc(e.message) + "</div>";
+    $("cfgBody").innerHTML = "";
     return false;
   }
-  $("cfgNote").textContent = d.env_file;
+  cfgState = d.editable || {};
+  $("cfgNote").textContent = (d.runtime_notes && d.runtime_notes.length)
+    ? d.runtime_notes.join("；")
+    : "覆盖文件 " + d.runtime_file;
+
+  const keys = Object.keys(cfgState);
+  $("cfgEdit").innerHTML = '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
+    '<th>项</th><th style="width:170px">值</th><th>说明</th><th style="width:80px">来源</th>' +
+    "</tr></thead><tbody>" +
+    keys.map((key) => {
+      const st = cfgState[key];
+      const src = st.source === "runtime"
+        ? '<span style="color:var(--warn)">已覆盖</span>'
+        : '<span class="dim">env</span>';
+      return "<tr><td>" + esc(CFG_LABELS[key] || key) +
+        '<div class="dim mono" style="font-size:11px">' + esc(key) + "</div></td>" +
+        "<td>" + cfgControl(key, st) + "</td>" +
+        '<td class="dim" style="font-size:12px">' + esc(st.note || "") + "</td>" +
+        "<td>" + src + "</td></tr>";
+    }).join("") + "</tbody></table></div>";
+
   $("cfgBody").innerHTML = d.groups.map((g) =>
     '<div class="box" style="margin:0;border:0;border-bottom:1px solid var(--line-soft);box-shadow:none;border-radius:0">' +
     '<header><h3>' + esc(g.name) + "</h3></header>" +
@@ -2143,6 +2211,37 @@ async function loadConfig() {
   $("cfgBody").dataset.json = JSON.stringify(d, null, 2);
   return true;
 }
+
+$("btnCfgSave").addEventListener("click", async () => {
+  if (!cfgState) return;
+  const payload = {};
+  for (const key of Object.keys(cfgState)) {
+    const st = cfgState[key];
+    const cur = cfgRead(key, st);
+    if (cur === st.value) continue;                 // 没动
+    // 改回 .env 的值 = 删掉这条覆盖，让 .env 重新说了算
+    payload[key] = cur === st.baseline ? null : cur;
+  }
+  const count = Object.keys(payload).length;
+  if (!count) { toast("没有改动", "bad"); return; }
+  const btn = $("btnCfgSave");
+  btn.disabled = true;
+  try {
+    const d = await postJSON("/admin/config", payload, false);
+    const ok = Object.keys(d.applied || {}).length;
+    const bad = d.rejected || [];
+    if (bad.length) {
+      toast("生效 " + ok + " 项；" + bad.map((r) => r.key + "：" + r.why).join("；"), "bad");
+    } else {
+      toast("已生效 " + ok + " 项，无需重启", "ok");
+    }
+    await loadConfig();
+  } catch (e) {
+    toast("保存失败：" + e.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+});
 $("btnCfgCopy").addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText($("cfgBody").dataset.json || "");

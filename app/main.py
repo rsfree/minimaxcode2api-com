@@ -41,7 +41,7 @@ from . import admin, logring, media, metrics as metrics_mod, probe, redact, secu
 from .auth import CredentialError, token_manager
 from .security import UI_COOKIE, UI_COOKIE_MAX_AGE, authorized as _authorized, is_loopback as _is_loopback
 from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
-from .config import settings
+from .config import RUNTIME_NOTES, settings
 from .convert import (
     ConversionError,
     build_anthropic_request,
@@ -71,13 +71,16 @@ async def lifespan(_: FastAPI):
         await token_manager.get()
     except CredentialError as exc:
         log.error("no usable credential at startup: %s", exc)
-    task = asyncio.create_task(_signin_loop()) if _signin_enabled() else None
+    for note in RUNTIME_NOTES:
+        log.info("runtime config: %s", note)
+    if settings.retry_attempts:
+        log.info("retries: up to %d attempt(s) per request", 1 + settings.retry_attempts)
+    # The three background loops start whenever their feature *could* run and
+    # read their on/off switch every lap: the console can then disable or
+    # re-enable them without a restart, which is the point of runtime config.
+    task = asyncio.create_task(_signin_loop()) if _signin_watchable() else None
     watcher = asyncio.create_task(_pool_watch_loop()) if _pool_watch_enabled() else None
-    probes_task = (
-        asyncio.create_task(probe.probe_loop(settings.probe_interval))
-        if settings.probe_auto and settings.probe_interval > 0
-        else None
-    )
+    probes_task = asyncio.create_task(probe.probe_loop()) if settings.probe_interval > 0 else None
     yield
     for pending in (task, watcher, probes_task):
         if pending is not None:
@@ -87,7 +90,17 @@ async def lifespan(_: FastAPI):
 
 
 def _pool_watch_enabled() -> bool:
-    return bool(settings.token_pool and settings.pool_watch > 0)
+    """Start the watcher whenever there is a pool directory.
+
+    The interval is re-read every lap, so a pool watcher that starts "off"
+    (``TOKEN_POOL_WATCH=0``) can be switched on later from the console.
+    """
+    return bool(settings.token_pool)
+
+
+def _signin_watchable() -> bool:
+    """Same idea for the check-in loop: ``SIGNIN_AUTO`` is read per lap."""
+    return bool(settings.token_pool)
 
 
 async def _pool_watch_loop() -> None:
@@ -98,15 +111,15 @@ async def _pool_watch_loop() -> None:
     replaced by what is on disk — this process owns the rotated refresh tokens.
     """
     while True:
-        await asyncio.sleep(max(2.0, settings.pool_watch))
+        await asyncio.sleep(max(2.0, settings.pool_watch) if settings.pool_watch > 0 else 30.0)
+        if settings.pool_watch <= 0:
+            # Switched off in the console. Keep the task alive so turning it
+            # back on does not need a restart.
+            continue
         try:
             await token_manager.reload_if_changed()
         except Exception as exc:  # noqa: BLE001 - a bad file must not kill the loop
             log.warning("pool reload failed: %s", exc)
-
-
-def _signin_enabled() -> bool:
-    return bool(settings.signin_auto and settings.token_pool)
 
 
 async def _refresh_before_checkin() -> None:
@@ -143,6 +156,11 @@ async def _signin_loop() -> None:
     from . import signin
 
     while True:
+        if not settings.signin_auto:
+            # Turned off in the console; stay alive so turning it back on does
+            # not need a restart.
+            await asyncio.sleep(60.0)
+            continue
         try:
             await _refresh_before_checkin()
             rows = await asyncio.to_thread(

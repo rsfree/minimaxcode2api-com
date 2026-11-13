@@ -13,6 +13,7 @@ Two things this layer owns, because they are easy to get wrong:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -74,6 +75,14 @@ QUOTA_HINTS = (
 def _quota_exhausted(message: str) -> bool:
     text = (message or "").lower()
     return any(hint in text for hint in QUOTA_HINTS)
+
+
+# Worth another attempt on the *same* account: the request never reached a
+# model (connection died, edge 5xx). A 4xx is not here on purpose — repeating a
+# rejected request just repeats the rejection, and 429 in the chat path has
+# already parked the account, so rotating is the answer there.
+def _transient(err: "UpstreamError") -> bool:
+    return err.status == 0 or 500 <= err.status < 600
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -189,6 +198,21 @@ class Upstream:
         self._curl_until = 0.0
         return True
 
+    async def reload_client(self) -> None:
+        """Rebuild the httpx client after a runtime knob changed.
+
+        ``request_timeout`` and the proxy are baked into the client when it is
+        created, so a value that only changed in ``settings`` would never reach
+        the wire. The curl latch is cleared as well: an operator who just picked
+        a transport should see that choice now, not when the latch expires.
+        """
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+        self._force_curl = settings.upstream_transport == "curl"
+        self._curl_until = 0.0
+        await self.startup()
+
     def transport_state(self) -> str:
         """One line for the diagnostics panel: which wire is actually in use."""
         if settings.upstream_transport == "curl":
@@ -283,18 +307,33 @@ class Upstream:
 
         tried: set[str] = set()
         last: UpstreamError | None = None
-        attempts = max(1, len(getattr(token_manager, "_tokens", []) or [1]))
+        last_token = None
         current = ""
         model_misses = 0
+        # One attempt plus the configured retries. Deliberately *not* capped at
+        # the pool size: when every account has already been tried, a transient
+        # failure (5xx, connection reset) reuses the last one, which is the only
+        # resilience a single-account pool has.
+        tries = 1 + max(0, int(settings.retry_attempts))
 
-        for _ in range(attempts + 1):
+        for attempt in range(tries):
             try:
                 token = await token_manager.acquire(exclude=tried)
             except CredentialError as exc:
-                # Nothing left to try. Report what actually went wrong: a bad
-                # model name used to surface here as "out of quota", because the
-                # extra lap ran the pool dry and then blamed the balance.
-                if last is not None and not _quota_exhausted(last.message):
+                # Nothing untried left. Retry the last account only when the
+                # failure says nothing about its credentials or its balance.
+                if last is not None and last_token is not None and _transient(last):
+                    token = last_token
+                    wait = min(2.0, 0.25 * (2**attempt))
+                    log.warning(
+                        "pool has no untried account; retrying %s after HTTP %s in %.2fs (%d/%d)",
+                        token.label or token.short, last.status, wait, attempt + 1, tries,
+                    )
+                    await asyncio.sleep(wait)
+                elif last is not None and not _quota_exhausted(last.message):
+                    # Nothing left to try. Report what actually went wrong: a bad
+                    # model name used to surface here as "out of quota", because
+                    # the extra lap ran the pool dry and then blamed the balance.
                     last.account = last.account or current
                     raise last from exc
                 # 503, not 502: nothing is wrong with the upstream, the pool itself
@@ -302,9 +341,11 @@ class Upstream:
                 # but the pool-level detail (which mailbox has no refresh token,
                 # what the token endpoint said) stays in this log line: the
                 # caller gets a reason, never an account identity.
-                log.warning("no usable account: %s", exc)
-                raise UpstreamError(503, f"no usable account: {exc}") from exc
+                else:
+                    log.warning("no usable account: %s", exc)
+                    raise UpstreamError(503, f"no usable account: {exc}") from exc
             tried.add(token.access_token or token.label)
+            last_token = token
             current = token.label or token.short
 
             token.in_flight += 1
@@ -340,7 +381,7 @@ class Upstream:
                 retriable = (
                     "unknown model" in err.message.lower() or _quota_exhausted(err.message)
                 )
-                if retriable and len(tried) < attempts:
+                if retriable and attempt + 1 < tries:
                     if _quota_exhausted(err.message):
                         # The daily allowance resets at local midnight, not in
                         # fifteen minutes — park until then and let the sign-in
@@ -478,10 +519,11 @@ class Upstream:
 
         tried: set[str] = set()
         last: UpstreamError | None = None
-        attempts = max(1, len(getattr(token_manager, "_tokens", []) or [1]))
+        last_account = ""
+        tries = 1 + max(0, int(settings.retry_attempts))
         pinned = token_manager.find(account) if account else None
 
-        for _ in range(attempts + 1):
+        for attempt in range(tries):
             token = None
             if pinned is not None:
                 key = pinned.access_token or pinned.label
@@ -491,8 +533,17 @@ class Upstream:
                 try:
                     token = await token_manager.acquire(exclude=tried)
                 except CredentialError as exc:
+                    # Same rule as the chat path: an account that is merely
+                    # cooling down can still be the one that owns this task.
+                    if last is not None and _transient(last) and attempt + 1 < tries:
+                        wait = min(2.0, 0.25 * (2**attempt))
+                        log.warning("mcp %s: no untried account; retrying in %.2fs (%d/%d)",
+                                    tool, wait, attempt + 1, tries)
+                        await asyncio.sleep(wait)
+                        continue
                     raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
             tried.add(token.access_token or token.label)
+            last_account = token.label or token.short
 
             response = await self._dispatch(url, payload, _mcp_headers(token.access_token), False, timeout)
             body = await response.aread()
@@ -516,9 +567,26 @@ class Upstream:
                     status = retry.status_code
                     await retry.aclose()
                 if status != 200:
+                    last = _error_from(status, body)
+                    last.account = last_account
                     token_manager.park(token, status, last.message if last else f"HTTP {status}")
                     log.warning("mcp %s: account %s failed (%s)", tool, token.label or token.short, status)
                     continue
+
+            if status == 0 or status >= 500:
+                # The tool call never landed. Same reasoning as the chat path:
+                # walk the pool instead of handing the caller a 502 from the
+                # first blip, and back off a little when the pool is a single
+                # account and the retry lands on the same one.
+                last = _error_from(status, body)
+                last.account = last_account
+                log.warning(
+                    "mcp %s: account %s hit HTTP %s; retrying (%d/%d)",
+                    tool, last_account, status, attempt + 1, tries,
+                )
+                if attempt + 1 < tries:
+                    await asyncio.sleep(min(2.0, 0.25 * (2**attempt)))
+                continue
 
             if status != 200:
                 raise _error_from(status, body)
@@ -537,10 +605,11 @@ class Upstream:
             # allowed to use it, while a sibling account succeeds. Rotating here
             # is what makes video work on a pool where only one号 has access.
             code = decoded.get("code")
-            if code in ROTATABLE_CODES and tool in ROTATABLE_TOOLS and len(tried) < attempts:
+            if code in ROTATABLE_CODES and tool in ROTATABLE_TOOLS and attempt + 1 < tries:
                 last = UpstreamError(
                     int(code), decoded.get("message") or f"{tool} unavailable on this account"
                 )
+                last.account = last_account
                 log.warning(
                     "mcp %s: account %s cannot use this tool (%s), trying the next",
                     tool, token.label or token.short, code,
@@ -549,7 +618,7 @@ class Upstream:
             return decoded, token.access_token or token.label
 
         if last is not None:
-            last.account = last.account or current
+            last.account = last.account or last_account
             raise last
         raise UpstreamError(502, "no account could serve the request")
 

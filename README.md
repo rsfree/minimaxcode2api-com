@@ -347,7 +347,7 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/ui?key=sk-local'
 | 运营 | 容量规划 | 余额可撐天数、日均消耗与签到日供给、行动建议、1/3/7/14 天补号测算 |
 | 观测 | 请求日志 | 每个请求的时间、结果、类型、模型、账号、耗时、token、**错误正文**、请求 ID；顶部有「近 24h 失败聚合」，**点任意一行看完整字段与报错**并一键复制；5 秒自动刷新 |
 | 配置 | 模型 | 13 个模型的上下文 / 最大输出 / 能力 / 模态，可按类型与能力筛选；**在线调试**（改请求体、发真实请求、复制 cURL） |
-| 配置 | 运行配置 | 生效的环境变量（密钥脱敏）、冷却时长、签到与探针间隔，只读 |
+| 配置 | 运行配置 | **可在线改**（重试次数、超时、传输、探针/签到间隔等 11 项）：改完立即生效，写入 `/data/runtime.json`，重建容器后保留；下方是完整生效配置快照（密钥脱敏） |
 
 设计令牌与 [WorkBuddy2API](https://wb2api.1task.cn/panel/) 控制台同一套（冷石墨底 + 靛蓝强调、
 等宽数字、明暗双主题），两个面板观感一致；分区也照它分：运营 / 观测 / 配置。
@@ -864,6 +864,67 @@ flowchart LR
 
 ---
 
+## 四点五、重试与运行时改配置
+
+### 一次调用最多重试几次
+
+**总尝试次数 = 1 + `RETRY_ATTEMPTS`（默认 3，即最多 4 次）**，两种重试方式合并在这个预算里：
+
+| 上游结果 | 网关动作 |
+|---|---|
+| 5xx / 连接断开（status 0） | 换下一个号；**池里没有未试过的号时，同一个号退避重试**（0.25→0.5→1→2 秒封顶） |
+| 429 / 402 / 403 | 冷却该号，换下一个 |
+| 401 | 先就地刷新 token 重试一次，仍失败再换号 |
+| 400 `unknown model` / 额度类 400 | 换号；模型名是全局的，连续 3 个号都不认就当调用方写错，直接返回 |
+| **其它 4xx（400 参数错、404 路径、422 校验）** | **不重试，原样返回** |
+
+单号池的意义就在第 1 行：池里只有一个号时没有「换号」可换，原来的实现等于 5xx 不重试；
+现在会用同一个号退避重试，次数同样受 `RETRY_ATTEMPTS` 约束。
+
+`RETRY_ATTEMPTS=0` 就是「一次都不重试」，排查上游抖动时很有用。
+
+### 运行配置在线改（不用重建容器）
+
+控制台「配置 → 运行配置」这 11 项可以直接改，保存后**下一条请求就生效**：
+
+| 配置项 | 变量 | 说明 |
+|---|---|---|
+| 重试次数 | `RETRY_ATTEMPTS` | 0–50 |
+| 上游超时 | `UPSTREAM_TIMEOUT` | 秒；改完会重建 httpx 连接池 |
+| 默认 max_tokens | `DEFAULT_MAX_TOKENS` | 客户端没给时兜底 |
+| 出站传输 | `UPSTREAM_TRANSPORT` | `auto` / `httpx` / `curl` |
+| 号池扫描间隔 | `TOKEN_POOL_WATCH` | 0 = 关闭（仍可在线打开） |
+| 探针自动刷新 / 间隔 | `PROBE_AUTO` / `PROBE_INTERVAL` | 开关每轮重读，不必重启 |
+| 自动签到 / 间隔 | `SIGNIN_AUTO` / `SIGNIN_INTERVAL_HOURS` | 同上 |
+| 历史保留天数 | `METRICS_RETENTION_DAYS` | |
+| 展示下线模型 | `EXPOSE_RETIRED_MODELS` | `/v1/models` 是否列已下线型号 |
+
+- 改的值写进 `/data/runtime.json`（`RUNTIME_CONFIG` 可改路径），**重建容器后仍在**；
+- 优先级：`runtime.json` > `.env`。在面板点「重置」= 删掉这条覆盖，回到 `.env` 的值；
+- 不可在线改的是那些已经烘进客户端或路由的项：`MINIMAX_REGION`、`MINIMAX_BASE_URL`、
+  `UPSTREAM_PROXY`、`GATEWAY_API_KEY`、`GATEWAY_PORT`、`REQUEST_BODY_LIMIT`、`TOKEN_POOL`——
+  改它们仍然要改 `.env` 并 `docker compose up -d`（面板会标「🔒」）。
+
+命令行等价写法：
+
+```bash
+KEY=$GATEWAY_API_KEY
+BASE=http://127.0.0.1:39600
+
+# 看可改项与当前值（source=runtime 表示已被覆盖）
+curl -s -H "Authorization: Bearer $KEY" "$BASE/admin/config" | jq '.editable'
+
+# 改：重试 5 次、上游超时 900 秒
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"retry_attempts":5,"request_timeout":900}' "$BASE/admin/config"
+
+# 撤销某条覆盖，回到 .env
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"retry_attempts":null}' "$BASE/admin/config"
+```
+
+---
+
 ## 五、环境变量
 
 | 变量 | 默认 | 说明 |
@@ -888,6 +949,8 @@ flowchart LR
 | `MINIMAX_BASE_URL` | 按区域 | 上游 LLM 地址 |
 | `MINIMAX_MCP_BASE` | 由 `MINIMAX_BASE_URL` 推导 | 上游多模态 MCP 代理地址，默认把 `/llm/v1` 换成 `/mcp` |
 | `DEFAULT_MAX_TOKENS` | `8192` | 客户端没传 `max_tokens` 时用 |
+| `RETRY_ATTEMPTS` | `3` | 一次调用最多重试几次。`0` = 只试一次；单位是「尝试」不是「账号」，详见第八节 |
+| `RUNTIME_CONFIG` | `/data/runtime.json` | 控制台改的运行配置存这里（容器内）；本地是 `data/runtime.json` |
 | `UPSTREAM_TIMEOUT` | `600` | 上游超时（秒） |
 | `REQUEST_BODY_LIMIT` | 64 MiB | 请求体上限 |
 | `EXPOSE_RETIRED_MODELS` | `0` | 设为 1 时把已下线模型也列出来 |

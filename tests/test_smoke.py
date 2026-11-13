@@ -1657,6 +1657,150 @@ def test_ark_image_endpoint_contract() -> None:
         media_mod.describe_asset = original_describe
 
 
+def test_retry_budget_comes_from_config() -> None:
+    """``RETRY_ATTEMPTS`` decides how many upstream attempts one request gets.
+
+    The unit is an attempt, not an account: a 5xx walks to the next account, and
+    when the pool has nothing untried left the same account is reused (with
+    backoff), which is the only resilience a one-account pool has. A 400 is the
+    caller's mistake and must not be repeated at all.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from app import upstream as upstream_mod
+    from app.auth import CredentialError, Token
+
+    def build(status: int, pool_size: int):
+        pool = [Token(access_token=f"tok{i}", label=f"t{i}@x") for i in range(pool_size)]
+        calls: list[int] = []
+
+        class Resp:
+            status_code = status
+            account = ""
+
+            async def aread(self):
+                return b'{"error":{"message":"edge said no"}}'
+
+            async def aclose(self):
+                pass
+
+        async def fake_dispatch(url, payload, headers, stream):
+            calls.append(1)
+            return Resp()
+
+        async def fake_acquire(exclude=None):
+            exclude = exclude or set()
+            for token in pool:
+                if token.access_token not in exclude:
+                    return token
+            raise CredentialError("every account is parked")
+
+        async def run(budget: int) -> None:
+            calls.clear()
+            with patch.object(upstream_mod.upstream, "startup", return_value=None), \
+                 patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
+                 patch.object(upstream_mod.token_manager, "acquire", fake_acquire), \
+                 patch.object(upstream_mod.token_manager, "park", lambda *a, **k: None), \
+                 patch.object(upstream_mod.token_manager, "_tokens", pool), \
+                 patch.object(upstream_mod.settings, "retry_attempts", budget), \
+                 patch.object(upstream_mod.asyncio, "sleep", lambda *a, **k: _noop()):
+                try:
+                    await upstream_mod.upstream._send({"model": "m", "messages": []}, False)
+                except Exception as exc:  # noqa: BLE001 - the count is what matters
+                    return exc
+            return None
+
+        return calls, run
+
+    async def _noop():
+        return None
+
+    # 5xx: 1 + retries attempts, then the last error comes back.
+    calls, run = build(503, 5)
+    asyncio.run(run(0))
+    assert len(calls) == 1, f"retry_attempts=0 must not retry, made {len(calls)}"
+    asyncio.run(run(2))
+    assert len(calls) == 3, f"retry_attempts=2 must try 3 times, made {len(calls)}"
+    # More budget than accounts: the pool runs dry and the same account is reused.
+    asyncio.run(run(6))
+    assert len(calls) == 7, f"budget above pool size should still be honoured, made {len(calls)}"
+
+    # Single account: no untried account is ever available, so every retry is a
+    # same-account retry — the reason this branch exists.
+    calls, run = build(503, 1)
+    asyncio.run(run(2))
+    assert len(calls) == 3, f"one-account pool must still retry, made {len(calls)}"
+
+    # 4xx that is the caller's fault: one attempt, whatever the budget says.
+    calls, run = build(400, 5)
+    asyncio.run(run(5))
+    assert len(calls) == 1, f"a 400 must not be retried, made {len(calls)}"
+
+    # 401/402 rotate accounts but never exceed the budget.
+    for status in (402, 429):
+        calls, run = build(status, 5)
+        asyncio.run(run(1))
+        assert len(calls) == 2, f"HTTP {status} with budget 1 tried {len(calls)} times"
+
+
+def test_runtime_config_is_writable_and_survives_a_restart() -> None:
+    """The console writes ``runtime.json``; a new process reads it back.
+
+    Nothing here needs a container recreate: every consumer reads
+    ``settings.<name>`` when it uses it, so assigning the attribute is the apply
+    step. ``None`` means "back to the .env value".
+    """
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from app.config import Settings
+
+    path = Path(tempfile.mkdtemp()) / "runtime.json"
+    with patch.dict(os.environ, {"RUNTIME_CONFIG": str(path), "RETRY_ATTEMPTS": "3"}):
+        first = Settings()
+        assert first.load_runtime() == []
+        assert first.retry_attempts == 3
+
+        applied, rejected = first.apply_runtime({"retry_attempts": 7, "probe_auto": False})
+        assert applied == {"retry_attempts": 7, "probe_auto": False}, applied
+        assert rejected == [], rejected
+        assert first.retry_attempts == 7 and first.probe_auto is False
+        saved = json.loads(path.read_text("utf-8"))
+        assert saved["retry_attempts"] == 7
+
+        # A "restart": a fresh instance replaying the same file.
+        second = Settings()
+        notes = second.load_runtime()
+        assert second.retry_attempts == 7, notes
+        assert second.probe_auto is False, notes
+        assert second.editable_state()["retry_attempts"]["source"] == "runtime"
+
+        # Out of range and read-only keys are refused, value untouched.
+        applied, rejected = second.apply_runtime({"retry_attempts": -1})
+        assert applied == {} and rejected and rejected[0][0] == "retry_attempts"
+        assert second.retry_attempts == 7
+        applied, rejected = second.apply_runtime({"api_keys": ["x"]})
+        assert applied == {} and rejected
+        applied, rejected = second.apply_runtime({"upstream_transport": "dialup"})
+        assert applied == {} and rejected
+
+        # None resets to the value .env gave, and the file forgets the override.
+        applied, _ = second.apply_runtime({"retry_attempts": None})
+        assert second.retry_attempts == 3
+        assert "retry_attempts" not in json.loads(path.read_text("utf-8"))
+
+        # A corrupt file is reported, not fatal.
+        path.write_text("{not json", "utf-8")
+        third = Settings()
+        notes = third.load_runtime()
+        assert notes and "读取失败" in notes[0], notes
+        assert third.retry_attempts == 3
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
@@ -1701,6 +1845,8 @@ def main() -> None:
         test_log_clock_uses_console_timezone,
         test_bad_model_is_not_blamed_on_the_balance,
         test_capacity_math,
+        test_retry_budget_comes_from_config,
+        test_runtime_config_is_writable_and_survives_a_restart,
     ]
     for test in tests:
         test()
