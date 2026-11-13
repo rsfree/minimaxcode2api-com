@@ -15,14 +15,15 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import platform
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import catalog, media, signin
+from . import catalog, logring, media, signin
 from .auth import Token, token_manager
 from .config import settings
-from .metrics import metrics
+from .metrics import metrics, stamp
 from .onboard import importer
 from .probe import probes
 from .security import authorized
@@ -35,7 +36,7 @@ def _guard(request: Request) -> None:
 
 router = APIRouter(prefix="/admin", tags=["console"], dependencies=[Depends(_guard)])
 
-VERSION = "console-2"
+VERSION = "console-3"
 SIGNIN_DAILY = 400  # credits a single account's check-in yields on a normal day
 
 
@@ -188,6 +189,91 @@ async def logs(limit: int = 200, offset: int = 0, q: str = "", outcome: str = ""
         "offset": max(0, offset),
         "buffered": page["buffered"],
         "source": page["source"],
+    }
+
+
+@router.get("/errors")
+async def error_groups(hours: float = 24, limit: int = 8) -> dict:
+    """Failure messages bucketed by text, most frequent first.
+
+    The request log answers "what happened to this call"; this answers "what
+    keeps happening", which is the question behind every 502 hunt.
+    """
+    hours = max(0.5, min(hours, 720))
+    limit = max(1, min(limit, 50))
+    groups = await asyncio.to_thread(metrics.error_groups, hours, limit)
+    for row in groups:
+        row["first"] = stamp(row["first_ts"]) if row.get("first_ts") else "—"
+        row["last"] = stamp(row["last_ts"]) if row.get("last_ts") else "—"
+    return {
+        "hours": hours,
+        "groups": groups,
+        "total_failures": sum(row.get("count", 0) for row in groups),
+    }
+
+
+@router.get("/diagnostics")
+async def diagnostics(lines: int = 80) -> dict:
+    """Everything this process knows about itself, in one report.
+
+    The console cannot tell "the gateway is broken" from "the browser could not
+    reach the gateway" on its own, and the two need opposite fixes. Pairing the
+    browser-side probes with this endpoint makes the difference visible: if the
+    browser sees a 502 the gateway never logged, the fault is in the path
+    between them.
+    """
+    lines = max(1, min(lines, 400))
+    pool = await asyncio.to_thread(token_manager.describe)
+    probe = probes.snapshot() if hasattr(probes, "snapshot") else {}
+    store_stats = store.stats()
+    recent = await asyncio.to_thread(metrics.recent_page, 6, 0, "", "error")
+    groups = await asyncio.to_thread(metrics.error_groups, 24, 6)
+    for row in groups:
+        row["first"] = stamp(row["first_ts"]) if row.get("first_ts") else "—"
+        row["last"] = stamp(row["last_ts"]) if row.get("last_ts") else "—"
+    return {
+        "generated_at": time.time(),
+        "service": {
+            "name": "minimax-code2api",
+            "version": VERSION,
+            "uptime_seconds": _uptime(),
+            "region": settings.region,
+            "base_url": settings.base_url,
+            "proxy": settings.upstream_proxy or "",
+            "transport": settings.upstream_transport,
+            "key_required": bool(settings.api_keys),
+            "python": platform.python_version(),
+            "pid": os.getpid(),
+            "timezone": settings.signin_timezone,
+            "server_time": stamp(time.time()),
+        },
+        "pool": {
+            "size": pool["pool_size"],
+            "usable": pool["usable"],
+            "cooling": pool["cooling"],
+            "disabled": pool["disabled"],
+            "in_flight": pool["in_flight"],
+        },
+        "store": store_stats,
+        "probes": {
+            "updated_at": probe.get("updated_at"),
+            "age_seconds": probe.get("age_seconds"),
+            "totals": probe.get("totals") or {},
+        },
+        "recent_errors": recent["rows"],
+        "error_groups": groups,
+        "log": [
+            dict(row, time_label=stamp(row["ts"]))
+            for row in logring.ring.tail(lines)
+        ],
+        "log_stats": logring.ring.stats(),
+        "hints": [
+            "浏览器报 502 而这里没有对应的「面板」行：请求没到网关，问题在浏览器到服务器之间"
+            "（公司代理、VPN、运营商、端口转发），不是网关返回的。",
+            "面板行有、但 status 0：网关没来得及回响应（进程重启或客户端中断）。",
+            "请求日志里 kind=面板 的行只在 4xx/5xx 或超过 1.5 秒时写入，正常轮询不占地方。",
+            "「服务端最近告警」是容器日志里 WARNING 以上的最后若干条，等同 docker logs 的关键部分。",
+        ],
     }
 
 

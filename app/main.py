@@ -37,7 +37,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import admin, media, metrics as metrics_mod, probe, security, store as store_mod
+from . import admin, logring, media, metrics as metrics_mod, probe, security, store as store_mod
 from .auth import CredentialError, token_manager
 from .security import UI_COOKIE, UI_COOKIE_MAX_AGE, authorized as _authorized, is_loopback as _is_loopback
 from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
@@ -65,6 +65,7 @@ async def lifespan(_: FastAPI):
     # what makes a redeploy legible instead of a fresh zero.
     store_mod.open_default()
     metrics_mod.metrics.attach(store_mod.store)
+    logring.install()
     await upstream.startup()
     try:
         await token_manager.get()
@@ -224,10 +225,81 @@ def _origin_form(path: str) -> str | None:
 app.add_middleware(AbsoluteTargetMiddleware)
 
 
+CONSOLE_SLOW_MS = 1500.0
+
+
+class ConsoleWatch:
+    """Land console-API trouble in the same history as the API traffic.
+
+    A page that fails to load its own data is the worst place to be blind: the
+    browser shows ``HTTP 502`` and the server log shows nothing at all, because
+    the request never arrived. Writing a row whenever a ``/admin`` call answers
+    4xx/5xx, raises, or takes longer than a second makes "no row" itself the
+    answer — the fault is between the browser and this process, not inside it.
+
+    Normal polling is deliberately not recorded: ``/admin/summary`` runs every
+    few seconds and would drown the history it is supposed to support.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or not scope.get("path", "").startswith("/admin"):
+            await self.inner(scope, receive, send)
+            return
+        started = time.perf_counter()
+        status = 0
+
+        async def watch(message: Any) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = int(message["status"])
+            await send(message)
+
+        try:
+            await self.inner(scope, receive, watch)
+        except Exception as exc:  # noqa: BLE001 - recorded, then re-raised for FastAPI
+            self._record(scope, 502, (time.perf_counter() - started) * 1000,
+                         f"{type(exc).__name__}: {exc}")
+            raise
+        elapsed = (time.perf_counter() - started) * 1000
+        if status >= 400 or status == 0 or elapsed >= CONSOLE_SLOW_MS:
+            self._record(scope, status, elapsed, "" if status < 400 else f"console API answered {status}")
+
+    @staticmethod
+    def _record(scope: Any, status: int, elapsed: float, error: str) -> None:
+        try:
+            headers = dict(scope.get("headers") or [])
+            forwarded = (headers.get(b"x-forwarded-for") or b"").decode().split(",")[0].strip()
+            client = scope.get("client") or ("", 0)
+            metrics_mod.metrics.record(
+                "console",
+                f"{scope.get('method', 'GET')} {scope.get('path', '')}",
+                account="-",
+                ok=0 < status < 400,
+                status=status,
+                latency_ms=elapsed,
+                error=error or f"slow console call ({elapsed:.0f} ms)",
+                client=forwarded or client[0] or "-",
+            )
+        except Exception:  # noqa: BLE001 - observability must never break a response
+            pass
+
+
+app.add_middleware(ConsoleWatch)
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 def error_response(status: int, message: str, code: str = "upstream_error") -> JSONResponse:
+    # ``status == 0`` means the transport died before a status line existed, and
+    # it can reach here when the pool runs out of accounts to retry. Zero is not
+    # a legal HTTP status, so the response used to fail to serialise and the
+    # caller saw a bare 500 with no message at all. 502 is what it means.
+    if status < 400 or status > 599:
+        status = 502
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": code, "code": code}},
@@ -644,22 +716,40 @@ async def anthropic_messages(request: Request):
         body["max_tokens"] = settings.default_max_tokens
     model = body["model"]
     started = time.time()
+    client = _client_tag(request)
 
     if body.get("stream"):
         try:
             response = await upstream.messages_stream(body)
         except UpstreamError as exc:
+            metrics_mod.metrics.record(
+                "messages.stream", model, account=getattr(exc, "account", "") or "-",
+                ok=False, status=exc.status,
+                latency_ms=(time.time() - started) * 1000, error=exc.message, client=client,
+            )
             return error_response(exc.status, exc.message)
 
+        account = response.account
+
         async def relay_raw():
+            failed = ""
             try:
                 # aiter_bytes() transparently un-gzips; the raw variant would
                 # leak compressed bytes into an SSE stream we do not label.
                 async for chunk in response.aiter_bytes():
                     yield chunk
+            except Exception as exc:  # noqa: BLE001 - record, then tell the caller
+                failed = str(exc)
+                raise
             finally:
                 await response.aclose()
                 _log_usage("messages.stream", model, {}, time.time() - started)
+                metrics_mod.metrics.record(
+                    "messages.stream", model, account=account or "-", ok=not failed,
+                    status=200 if not failed else 502,
+                    latency_ms=(time.time() - started) * 1000,
+                    error=failed, client=client,
+                )
 
         return StreamingResponse(
             relay_raw(),
@@ -674,9 +764,22 @@ async def anthropic_messages(request: Request):
     try:
         payload = await upstream.messages(body)
     except UpstreamError as exc:
+        metrics_mod.metrics.record(
+            "messages", model, account=getattr(exc, "account", "") or "-",
+            ok=False, status=exc.status,
+            latency_ms=(time.time() - started) * 1000, error=exc.message, client=client,
+        )
         return error_response(exc.status, exc.message)
 
     _log_usage("messages", model, payload, time.time() - started)
+    usage = payload.get("usage") or {}
+    metrics_mod.metrics.record(
+        "messages", model, account="-", ok=True, status=200,
+        latency_ms=(time.time() - started) * 1000,
+        prompt_tokens=usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
+        completion_tokens=usage.get("output_tokens") or usage.get("completion_tokens") or 0,
+        client=client,
+    )
     return JSONResponse(content=payload)
 
 

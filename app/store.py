@@ -261,6 +261,39 @@ class Store:
             params.extend([like] * 5)
         return (" WHERE " + " AND ".join(clauses) if clauses else ""), tuple(params)
 
+    def error_groups(self, hours: float = 24.0, limit: int = 8) -> list[dict]:
+        """Failures bucketed by message, newest window first.
+
+        Aggregated in SQL rather than by fetching rows: the point is to read the
+        shape of a problem (``HTTP 0`` ×40 at 05:20) without pulling the whole
+        window into the process.
+        """
+        if not self.available:
+            return []
+        floor = time.time() - hours * 3600
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return []
+            try:
+                rows = conn.execute(
+                    "SELECT error, COUNT(*), MIN(ts), MAX(ts), MAX(status) "
+                    "FROM calls WHERE ok = 0 AND ts >= ? "
+                    "GROUP BY error ORDER BY 2 DESC LIMIT ?",
+                    (floor, max(1, int(limit))),
+                ).fetchall()
+            except Exception as exc:  # noqa: BLE001
+                self.error = str(exc)[:200]
+                return []
+        out = []
+        for message, count, first, last, status in rows:
+            key = (message or "").strip() or f"HTTP {status or 0}"
+            out.append({
+                "error": key, "count": int(count), "status": int(status or 0),
+                "first_ts": float(first or 0), "last_ts": float(last or 0),
+            })
+        return out
+
     def window(self, hours: float) -> list[dict]:
         """Every row inside the last ``hours``, oldest first, capped."""
         if not self.available:

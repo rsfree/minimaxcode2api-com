@@ -294,6 +294,21 @@ class Upstream:
                     continue
                 raise err
 
+            if response.status_code == 0 or response.status_code >= 500:
+                # The request never reached a model: the connection died, or the
+                # edge answered 5xx with no body. Neither is the caller's fault
+                # nor that account's, so walk the pool instead of handing back a
+                # 502 on the first hiccup — a 30-account pool used to surface
+                # every transport blip as a hard failure.
+                body = await response.aread()
+                await response.aclose()
+                last = _error_from(response.status_code, body)
+                log.warning(
+                    "account %s hit a transport failure (%s); trying next",
+                    token.label or token.short, response.status_code,
+                )
+                continue
+
             if response.status_code in {401, 402, 403, 429}:
                 body = await response.aread()
                 await response.aclose()
@@ -343,7 +358,11 @@ class Upstream:
         body = await response.aread()
         await response.aclose()
         if response.status_code != 200:
-            raise _error_from(response.status_code, body)
+            err = _error_from(response.status_code, body)
+            # Without this the console shows "-" for the account that produced
+            # the failure, which is the one field that decides what to do next.
+            err.account = response.account
+            raise err
         try:
             return httpx.Response(200, content=body).json(), account
         except ValueError as exc:  # pragma: no cover - upstream contract change
@@ -354,7 +373,9 @@ class Upstream:
         if response.status_code != 200:
             body = await response.aread()
             await response.aclose()
-            raise _error_from(response.status_code, body)
+            err = _error_from(response.status_code, body)
+            err.account = response.account
+            raise err
         return response
 
     async def mcp(self, tool: str, payload: dict, timeout: float = 120.0,

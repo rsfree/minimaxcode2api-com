@@ -113,7 +113,9 @@ async def call_ex(
         data, served = await upstream.mcp_ex(tool, payload, timeout=timeout, account=account)
     except UpstreamError as exc:
         metrics.record(
-            f"mcp:{tool}", tool, account=account or "-", ok=False, status=exc.status,
+            f"mcp:{tool}", tool,
+            account=account or getattr(exc, "account", "") or "-",
+            ok=False, status=exc.status,
             latency_ms=(time.time() - started) * 1000, error=exc.message,
         )
         raise MediaError(exc.status, exc.message, payload=exc.payload) from exc
@@ -126,7 +128,7 @@ async def call_ex(
         # would otherwise show a 100% success rate while generation never works.
         metrics.record(
             f"mcp:{tool}", tool, account=label, ok=False, status=_status_for(code),
-            latency_ms=(time.time() - started) * 1000, error=str(message)[:200],
+            latency_ms=(time.time() - started) * 1000, error=str(message),
         )
         raise MediaError(_status_for(code), str(message), code=code, payload=data)
 

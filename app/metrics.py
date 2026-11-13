@@ -107,6 +107,11 @@ def _clock(ts: float) -> str:
     return datetime.fromtimestamp(ts, _tz()).strftime("%m-%d %H:%M:%S")
 
 
+def stamp(ts: float) -> str:
+    """Public clock for endpoints that format their own timestamps."""
+    return _clock(ts)
+
+
 def _percentile(values: list[int], q: float) -> int:
     if not values:
         return 0
@@ -158,7 +163,10 @@ class Metrics:
                 request_id=f"{int(time.time() * 1000):x}-{self._seq:x}",
                 prompt_tokens=max(0, int(prompt_tokens or 0)),
                 completion_tokens=max(0, int(completion_tokens or 0)),
-                error=(error or "")[:300],
+                # 800, not 300: a 502's payload is the whole point of keeping the
+                # row, and truncating it mid-sentence made the log useless for
+                # exactly the failures people open it for.
+                error=(error or "")[:800],
                 client=client,
             )
             self._rows.append(row)
@@ -226,6 +234,32 @@ class Metrics:
 
     def recent(self, limit: int = 200, query: str = "", outcome: str = "") -> list[dict]:
         return self.recent_page(limit=limit, query=query, outcome=outcome)["rows"]
+
+    def error_groups(self, hours: float = 24, limit: int = 8) -> list[dict]:
+        """Failures bucketed by message.
+
+        One failing row tells you a request broke; the same message forty times
+        tells you *what is breaking*. That distinction is the whole reason a
+        request log exists, and reading it row by row is how it gets lost.
+        """
+        if self._durable():
+            return self._store.error_groups(hours, limit)
+        floor = time.time() - hours * 3600
+        buckets: dict[str, dict] = {}
+        for row in self.rows():
+            if row.ok or row.ts < floor:
+                continue
+            key = (row.error or "").strip() or f"HTTP {row.status}"
+            slot = buckets.setdefault(key, {
+                "error": key, "count": 0, "status": row.status,
+                "first_ts": row.ts, "last_ts": row.ts, "kinds": {},
+            })
+            slot["count"] += 1
+            slot["first_ts"] = min(slot["first_ts"], row.ts)
+            slot["last_ts"] = max(slot["last_ts"], row.ts)
+            slot["kinds"][row.kind] = slot["kinds"].get(row.kind, 0) + 1
+        ordered = sorted(buckets.values(), key=lambda s: s["count"], reverse=True)[:limit]
+        return ordered
 
     @staticmethod
     def _dump_row(row: dict) -> dict:
