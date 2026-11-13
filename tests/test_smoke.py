@@ -990,6 +990,107 @@ def test_admin_logs_pagination() -> None:
         settings.api_keys = original
 
 
+def test_redaction_hides_accounts_and_tokens() -> None:
+    """Caller-facing errors keep the reason and lose the identity.
+
+    The 503 path interpolates the pool's own CredentialError, and that text says
+    "account <label> has no refresh token" — the label *is* the mailbox. The
+    request log may name it (that is the field an operator needs); a caller may
+    not, so the filtering happens on the way out.
+    """
+    from app.main import error_response, media_error_response
+    from app.media import MediaError
+    from app.redact import leaks, scrub
+
+    raw = (
+        "no usable account: account aav2dfsmiw@mail.giie.eu.org has no refresh token; "
+        "refresh failed for ops+alerts@sub.example.co.uk: HTTP 400 "
+        "refresh_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4"
+    )
+    clean = scrub(raw)
+    assert not leaks(clean), clean
+    assert "@" not in clean
+    assert "<account>" in clean
+    assert "eyJ" not in clean
+    # The diagnosis survives: the caller still learns what to do.
+    assert clean.startswith("no usable account:")
+
+    # Ordinary prose must not be mangled into uselessness.
+    plain = "upstream HTTP 502 while reading the response body"
+    assert scrub(plain) == plain
+
+    body = json.loads(error_response(503, raw).body)
+    assert body["error"]["code"] == "upstream_error"
+    assert "giie.eu.org" not in body["error"]["message"]
+    assert "@" not in body["error"]["message"]
+
+    media = json.loads(media_error_response(MediaError(402, "credit gone for x@y.com, code 1008")).body)
+    assert media["error"]["type"] == "insufficient_quota"
+    assert "x@y.com" not in media["error"]["message"]
+    assert "1008" in media["error"]["message"]
+
+
+def test_redaction_masks_bare_token_prefixes() -> None:
+    """``Token.short`` is ``access_token[:12]`` — too short for a regex, too real
+    to ship. The pool's live values are replaced by identity, not by pattern."""
+    from unittest.mock import patch
+
+    from app import auth
+    from app.redact import leaks, scrub
+
+    class FakeToken:
+        label = ""
+        access_token = "sk-abcdef1234567890"
+        refresh_token = "rt-99887766554433"
+
+    with patch.object(auth.token_manager, "_tokens", [FakeToken()]):
+        dirty = "account sk-abcdef1234567890 failed; retry forced"
+        clean = scrub(dirty)
+        assert "sk-abcdef" not in clean, clean
+        assert "<redacted>" in clean
+        assert clean.endswith("failed; retry forced")
+        assert leaks(dirty) and not leaks(clean)
+
+
+def test_pool_exhaustion_never_names_the_mailbox_to_the_caller() -> None:
+    """End to end: 503 says the pool is dry, the log says which mailbox broke."""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from app import upstream as upstream_mod
+    from app.auth import CredentialError
+    from app.config import settings
+    from app.main import app
+    from app.metrics import metrics
+
+    async def dry_pool(exclude=None):
+        raise CredentialError("account leak@mail.example.org has no refresh token")
+
+    original = settings.api_keys
+    settings.api_keys = ["unit-test-key"]
+    try:
+        with TestClient(app) as client:
+            with patch.object(upstream_mod.token_manager, "acquire", dry_pool):
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"x-api-key": "unit-test-key"},
+                    json={"model": "MiniMax-M3", "messages": [{"role": "user", "content": "hi"}]},
+                )
+    finally:
+        settings.api_keys = original
+
+    assert response.status_code == 503, response.text
+    assert "mail.example.org" not in response.text
+    assert "@" not in response.text
+    assert "no usable account" in response.text
+
+    # ...but the history row still carries the address, which is what makes the
+    # console useful when a pool quietly loses its refresh token.
+    rows = metrics.recent(limit=50)
+    assert any("leak@mail.example.org" in (row.get("error") or "") for row in rows), rows[:3]
+
+
 def test_transport_status_never_escapes_as_http() -> None:
     """A dead socket reports status 0; that must leave as 502, not a bare 500.
 
@@ -1538,6 +1639,9 @@ def main() -> None:
         test_request_history_survives_restart,
         test_store_degrades_to_memory,
         test_admin_logs_pagination,
+        test_redaction_hides_accounts_and_tokens,
+        test_redaction_masks_bare_token_prefixes,
+        test_pool_exhaustion_never_names_the_mailbox_to_the_caller,
         test_transport_status_never_escapes_as_http,
         test_curl_fallback_expires_instead_of_latching_forever,
         test_curl_transport_keeps_bodies_out_of_argv,

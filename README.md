@@ -410,6 +410,30 @@ curl -s -H "Authorization: Bearer $KEY" "$BASE/admin/diagnostics?lines=80"      
 最近 6 条失败、失败聚合、**容器日志里 WARNING 以上的最后 N 条**（等于不用 ssh 看 `docker logs`），
 以及一组「怎么读这些数字」的提示。
 
+#### 账号身份只在日志里，不在响应里
+
+排查需要「哪个号坏了」，调用方不需要知道。所以同一条错误在两处长得不一样：
+
+| 位置 | 内容 |
+|---|---|
+| 请求日志 / `metrics` / `docker logs` | 原文：`no usable account: account aav2dfsmiw@mail.giie.eu.org has no refresh token`，账号列也是完整邮箱 |
+| 返回给调用方的 `error.message` | `no usable account: account <account> has no refresh token` |
+
+出口统一过滤（`app/redact.py`）：邮箱 → `<account>`，`Bearer xxx` / JWT / 长串 token /
+表单里的 `refresh_token=…` → `<redacted>`，号池里现存的 label 与 access token 前缀
+（`Token.short` 是 `access_token[:12]`，正则认不出来）按实际值替换。
+**出口一处、入口一处都不留**：`error_response`、`media_error_response`、SSE 中途的错误帧、
+视频查询的错误体都过同一个 `scrub()`；`/admin/*` 不过滤，管理员要看到原文。
+
+想验证：
+
+```bash
+# 响应里不该出现任何邮箱：打印 LEAK 就是有漏
+curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}' \
+  "$BASE/v1/chat/completions" | grep -q '@' && echo LEAK || echo clean
+```
+
 #### 时间显示用哪个时区
 
 控制台的时间戳按 `SIGNIN_TIMEZONE`（默认 `Asia/Shanghai`）格式化，**不依赖容器 TZ** ——

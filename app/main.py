@@ -37,7 +37,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import admin, logring, media, metrics as metrics_mod, probe, security, store as store_mod
+from . import admin, logring, media, metrics as metrics_mod, probe, redact, security, store as store_mod
 from .auth import CredentialError, token_manager
 from .security import UI_COOKIE, UI_COOKIE_MAX_AGE, authorized as _authorized, is_loopback as _is_loopback
 from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
@@ -302,7 +302,10 @@ def error_response(status: int, message: str, code: str = "upstream_error") -> J
         status = 502
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": code, "code": code}},
+        # Everything that reaches a caller goes through one filter. The raw text
+        # is already in the request log (metrics.record); this copy must not name
+        # an account or echo a credential.
+        content={"error": {"message": redact.scrub(message), "type": code, "code": code}},
     )
 
 
@@ -310,11 +313,12 @@ def media_error_response(exc: MediaError) -> JSONResponse:
     """Surface a media tool failure with the upstream message intact.
 
     The 402 text from this channel is the only notice that the account balance is
-    gone, so it is passed through verbatim instead of being rewritten.
+    gone, so it is passed through verbatim instead of being rewritten — minus
+    anything that identifies the account behind the gateway.
     """
     body: dict[str, Any] = {
         "error": {
-            "message": exc.message,
+            "message": redact.scrub(exc.message),
             "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
             "code": exc.code,
         }
@@ -650,7 +654,8 @@ async def chat_completions(request: Request):
             except Exception as exc:  # noqa: BLE001 - surface to the client
                 failed = str(exc)
                 log.warning("stream aborted: %s", exc)
-                payload = {"error": {"message": str(exc), "type": "upstream_error"}}
+                # Same filter as error_response: an SSE frame is still caller-facing.
+                payload = {"error": {"message": redact.scrub(str(exc)), "type": "upstream_error"}}
                 yield f"data: {json.dumps(payload)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
@@ -1126,7 +1131,7 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
     except MediaError as exc:
         body = {
             "error": {
-                "message": exc.message,
+                "message": redact.scrub(exc.message),
                 "type": "upstream_error",
                 "code": exc.code,
             },

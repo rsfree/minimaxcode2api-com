@@ -298,7 +298,11 @@ class Upstream:
                     last.account = last.account or current
                     raise last from exc
                 # 503, not 502: nothing is wrong with the upstream, the pool itself
-                # has nothing to spend. The message says when the reset lands.
+                # has nothing to spend. The message says when the reset lands —
+                # but the pool-level detail (which mailbox has no refresh token,
+                # what the token endpoint said) stays in this log line: the
+                # caller gets a reason, never an account identity.
+                log.warning("no usable account: %s", exc)
                 raise UpstreamError(503, f"no usable account: {exc}") from exc
             tried.add(token.access_token or token.label)
             current = token.label or token.short
