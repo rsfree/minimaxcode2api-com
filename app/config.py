@@ -69,7 +69,7 @@ EDITABLE: dict[str, dict] = {
     },
     "media_min_credits": {
         "kind": "float", "min": 0, "max": 100000,
-        "note": "派生成任务前要求的最低积分（一张图按此值 × 张数）。0 = 不按余额预筛",
+        "note": "派生成任务前要求的最低积分（一张 1K 图约 115，按张数乘）。0 = 不按余额预筛",
     },
     "request_timeout": {
         "kind": "float", "min": 5, "max": 3600,
@@ -211,7 +211,7 @@ class Settings:
     # pre-filters media candidates on the probed balance instead of spending a
     # 300 s round trip to collect a 402. 0 turns the filter off.
     media_min_credits: float = field(
-        default_factory=lambda: float(_env("MEDIA_MIN_CREDITS", "100") or 100)
+        default_factory=lambda: float(_env("MEDIA_MIN_CREDITS", "115") or 115)
     )
 
     def __post_init__(self) -> None:

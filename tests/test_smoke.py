@@ -937,6 +937,12 @@ def test_media_prefilter_uses_the_probed_balance() -> None:
     else:
         raise AssertionError("expected CredentialError(402) when no account can pay")
 
+    # The panel's "images available" count must use the same rule, otherwise it
+    # advertises accounts that provably cannot pay.
+    described = pool.describe()
+    assert described["usable_media"] == 1, described["usable_media"]
+    assert described["usable"] == 2, "chat still counts both"
+
     # Unknown balance (probe never ran, or the probe failed) = allowed to try.
     blind = TokenPool()
     unknown = Token(access_token="tok-u", label="u@x", pooled=True)

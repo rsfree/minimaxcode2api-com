@@ -313,7 +313,7 @@ PROBE_AUTO=1                      # 后台探针（控制台的余额/签到状�
 PROBE_INTERVAL=300                # 探针间隔秒数，最小 60；0 或 PROBE_AUTO=0 = 只手动刷新
 DEFAULT_MAX_TOKENS=8192
 RETRY_ATTEMPTS=3                  # 一次调用最多重试几次（0 = 不重试），面板可在线改
-MEDIA_MIN_CREDITS=100             # 派生图/视频前要求的最低积分（一张图 × 张数），0 = 不预筛
+MEDIA_MIN_CREDITS=115             # 派生图/视频前要求的最低积分（一张图 × 张数），0 = 不预筛
 GATEWAY_PORT=8080
 ```
 
@@ -580,7 +580,7 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | `502 upstream error` + 具体 message | 上游返回的业务错误，原文透传 | 按 message 处理 |
 | 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（原文是 `plan balance has run out`，网关会换成中性文案） | 桌面端充值；该号只停图片通道 15 分钟，对话照常。全池都不够时才会把 402 返给你 |
 | 对话 `503 no usable account: every account is out of quota until the daily reset at 00:10` | 全池都撞了 1008，免费额度按天重置 | 等次日重置（网关会自动签到并解除冷却），或加号 / 充值 |
-| 号还有积分但生图一直 402 | 余额够聊天、不够一次生成：1 张 1K 图约 115 credits | 看面板积分列；低于 `MEDIA_MIN_CREDITS`（默认 100）的号会被自动跳过，调低门槛没用，得充值/签到 |
+| 号还有积分但生图一直 402 | 余额够聊天、不够一次生成：1 张 1K 图约 115 credits | 看面板积分列；低于 `MEDIA_MIN_CREDITS`（默认 115）的号会被自动跳过，调低门槛没用，得充值/签到 |
 | 对话 `503 no usable account: every account is out of quota until the daily reset at 00:10` | 全池都撞了 1008，免费额度按天重置 | 等次日重置（网关会自动签到并解除冷却），或加号 / 充值 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单（H3 4s = 320 credits） | 充值，或改用 `MiniMax-Hailuo-2.3` 6s |
 | 视频提交 `503 temporarily unavailable` | **该账号没有视频权限**（按账号给，不是按 key） | 池里只要有一个号能提交就没事，网关自动换号；日志会打印 `cannot use this tool (503)` |

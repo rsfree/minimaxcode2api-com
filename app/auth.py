@@ -812,9 +812,12 @@ class TokenPool:
             # Media is counted separately: an account parked for chat can still
             # draw, and vice versa. A single number here is what made the panel
             # claim an account was unusable when only one budget was empty.
+            # The balance is part of the test: an account holding 0.8 credits is
+            # not "available for images", it just has not been told so yet.
             "usable_media": sum(
                 1 for t in self._tokens
                 if t.access_token and not t.disabled and not t.is_cooling(CAPABILITY_MEDIA)
+                and t.can_afford(settings.media_min_credits)
             ),
             "cooling_media": sum(
                 1 for t in self._tokens if (not t.disabled) and t.is_cooling(CAPABILITY_MEDIA)
@@ -826,7 +829,8 @@ class TokenPool:
                     "label": t.label or t.short,
                     "usable": bool(t.access_token) and not t.disabled and not t.is_cooling(),
                     "usable_media": bool(t.access_token) and not t.disabled
-                    and not t.is_cooling(CAPABILITY_MEDIA),
+                    and not t.is_cooling(CAPABILITY_MEDIA)
+                    and t.can_afford(settings.media_min_credits),
                     "disabled": t.disabled,
                     "expires_at_ms": t.expires_at_ms,
                     "cooling_for": round(max(0.0, t.cooldown_until - now)),
