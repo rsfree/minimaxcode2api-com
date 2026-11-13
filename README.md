@@ -262,6 +262,7 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/healthz | python -m json.tool
 |---|---|
 | `401` | 先尝试刷新一次；仍失败则停用该账号 10 分钟，换下一个 |
 | `402` / `429` | 停用 15 分钟 / 1 分钟，换下一个 |
+| 业务码 `402`（包在 HTTP 200 里，MCP 工具） | 与上面一致：停用该号并换下一个。以前这种 402 会直接抛给调用方、其它号闲置，是图片偶发「额度不足」的真因 |
 | `400 unknown model` | 该号没有这个模型的权限，换下一个账号重试 |
 | `307` 跳转 | 直接报配置错误，提示换出口代理（跳转会丢 Authorization） |
 
@@ -690,7 +691,7 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 |---|---|
 | `model` | 只认 `minimax-h3-image` 及其别名（`minimax-image` / `image-01` / `h3-image` 等，大小写与下划线不敏感）；缺省即该值，响应回显规范名；**其它值 → `400 unknown image model`** |
 | `prompt` | 必填；缺失或空白 → `400 prompt is required` |
-| `image` | 支持 `string` 或 `string[]`。公网 URL 直传；`data:image/...;base64,` 先上传到通道 CDN 再喂给工具，裸 base64 也认 |
+| `image` | 支持 `string` 或 `string[]`，**一次可传多张**（实测 2 / 3 / 4 / 6 张均正常，`usage.input_images` 如实回显；10 张撞过单号 402，换号后带过）。各项可以是公网 URL、`data:image/...;base64,`、裸 base64，也认 `[{"image_url": {"url": …}}]` 这种 OpenAI 形状。URL 必须上游能直接下载，base64 会先转存到通道 CDN |
 | `size` | 档位 `1K` / `1.5K` / `2K` / `3K` / `4K`，或 `宽x高`。**是建议值**，换算见下 |
 | `response_format` | `url`（默认）或 `b64_json`，都支持；其它值 → `400` |
 | `sequential_image_generation` + `sequential_image_generation_options.max_images` | 支持：`auto` 时按 `max_images` 出图，范围 1–15 |
@@ -747,6 +748,8 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 
 **成本：一张 1K 图 = 115 credits**（实测某号 277.4 → 162.4）。4K 是 1K 的 17 倍面积，价格更高；
 余额不够时上游直接回 `402`，文案里会出现 `plan balance has run out`。
+**图片 / 视频 / 语音这类 MCP 工具的 402 是包在 HTTP 200 里的业务码**：以前它直接抛给调用方、
+另外 29 个号闲置；现在与 HTTP 402 一样处理——停用该号、换下一个，整池都空才把 402 交给调用方。
 
 #### 这里的「模型名」是什么
 

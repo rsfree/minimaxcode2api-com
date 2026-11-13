@@ -850,13 +850,30 @@ async def favicon() -> PlainTextResponse:
 # multimodal — image / video / speech / music
 # ---------------------------------------------------------------------------
 def _as_url_list(value: Any) -> list[str]:
+    """Coerce Ark's ``image`` / ``reference_images`` into a list of URLs.
+
+    Ark takes a bare string or an array of strings. Some clients send the
+    OpenAI-shaped parts instead — ``[{"image_url": {"url": "..."}}]`` — and
+    those used to be dropped silently, so a caller asking for four references
+    got zero and could not tell why. Pull the URL out of the object instead.
+    """
     if not value:
         return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(item) for item in value if isinstance(item, str) and item]
-    return []
+    items = value if isinstance(value, list) else [value]
+    urls: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            if item:
+                urls.append(item)
+            continue
+        if isinstance(item, dict):
+            nested = item.get("image_url")
+            if isinstance(nested, dict):
+                nested = nested.get("url")
+            candidate = nested or item.get("url") or item.get("image_url")
+            if isinstance(candidate, str) and candidate:
+                urls.append(candidate)
+    return urls
 
 
 @app.get("/v1/media/models")

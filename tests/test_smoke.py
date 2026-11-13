@@ -1600,6 +1600,138 @@ def test_ark_inline_image_is_uploaded() -> None:
         media.upload_image = original
 
 
+def test_image_accepts_multiple_references() -> None:
+    """``image`` is a list, and a list must survive the whole path.
+
+    Two shapes matter: Ark's own ``["url", "url"]`` and the OpenAI-style
+    ``[{"image_url": {"url": ...}}]`` that some clients send. The second used to
+    be dropped on the floor — the caller asked for three references, the tool
+    got none, and nothing said so.
+    """
+    from fastapi.testclient import TestClient
+
+    from app import main as main_mod
+    from app import media as media_mod
+    from app.config import settings
+
+    seen: dict = {}
+
+    async def fake_generate(**kwargs):
+        seen.update(kwargs)
+        return {
+            "images": [
+                {"url": "https://cdn.test/1.png"},
+                {"url": "https://cdn.test/2.png"},
+            ],
+            "raw": {},
+        }
+
+    async def fake_describe(url):
+        return {"output_format": "png", "size": "1024x1024"}
+
+    original_keys = settings.api_keys
+    original_generate = media_mod.image_generate
+    original_describe = media_mod.describe_asset
+    settings.api_keys = ["unit-test-key"]
+    media_mod.image_generate = fake_generate
+    media_mod.describe_asset = fake_describe
+    try:
+        client = TestClient(main_mod.app)
+        headers = {"x-api-key": "unit-test-key"}
+        response = client.post(
+            "/v1/images/generations",
+            headers=headers,
+            json={
+                "model": "minimax-h3-image",
+                "prompt": "combine these",
+                "image": [
+                    "https://example.test/a.png",
+                    {"image_url": {"url": "https://example.test/b.png"}},
+                    {"url": "https://example.test/c.png"},
+                ],
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert seen["reference_urls"] == [
+            "https://example.test/a.png",
+            "https://example.test/b.png",
+            "https://example.test/c.png",
+        ]
+        assert response.json()["usage"]["input_images"] == 3
+
+        # A single string still works — that is what most callers send.
+        client.post(
+            "/v1/images/generations",
+            headers=headers,
+            json={"prompt": "x", "image": "https://example.test/only.png"},
+        )
+        assert seen["reference_urls"] == ["https://example.test/only.png"]
+    finally:
+        settings.api_keys = original_keys
+        media_mod.image_generate = original_generate
+        media_mod.describe_asset = original_describe
+
+
+def test_business_402_rotates_to_a_fresh_account() -> None:
+    """A drained account answers HTTP 200 with ``code: 402`` inside.
+
+    That envelope is the only signal the balance is gone, and it used to be
+    handed straight to the caller while the other 29 accounts sat idle. It must
+    rotate, and the drained account must be parked so the next request does not
+    pick it again.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from app import upstream as upstream_mod
+    from app.auth import CredentialError, Token
+
+    pool = [Token(access_token=f"tok{i}", label=f"t{i}@x") for i in range(3)]
+    state = {"calls": 0}
+    parked: list[int] = []
+
+    class Resp:
+        status_code = 200
+        headers: dict = {}
+
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        async def aread(self):
+            return self._payload
+
+        async def aclose(self):
+            pass
+
+    async def fake_dispatch(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return Resp(b'{"code":402,"message":"weekly limit reached"}')
+        return Resp(b'{"code":0,"message":"ok","success_items":[]}')
+
+    async def fake_acquire(exclude=None):
+        exclude = exclude or set()
+        for token in pool:
+            if token.access_token not in exclude:
+                return token
+        raise CredentialError("every account is parked")
+
+    async def main() -> dict:
+        with patch.object(upstream_mod.upstream, "startup", return_value=None), \
+             patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
+             patch.object(upstream_mod.token_manager, "acquire", fake_acquire), \
+             patch.object(upstream_mod.token_manager, "park",
+                          lambda token, status, message: parked.append(status)), \
+             patch.object(upstream_mod.token_manager, "_tokens", pool), \
+             patch.object(upstream_mod.settings, "retry_attempts", 3):
+            return await upstream_mod.upstream.mcp("image_synthesize", {})
+
+    body = asyncio.run(main())
+    assert body["code"] == 0
+    assert state["calls"] == 2, f"402 must walk to the next account, made {state['calls']}"
+    assert parked == [402], f"the drained account must be parked, got {parked}"
+
+
 def test_ark_image_endpoint_contract() -> None:
     """`/v1/images/generations` answers in Ark's shape, not OpenAI's.
 
@@ -1851,6 +1983,8 @@ def main() -> None:
         test_ark_size_and_measured_image_info,
         test_image_model_mapping,
         test_ark_inline_image_is_uploaded,
+        test_image_accepts_multiple_references,
+        test_business_402_rotates_to_a_fresh_account,
         test_ark_image_endpoint_contract,
         test_system_and_text,
         test_tool_roundtrip,

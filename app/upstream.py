@@ -42,7 +42,7 @@ CURL_LATCH_SECONDS = 300.0
 # succeeds on a sibling. Only creation tools rotate — for
 # ``query_video_generation`` a 503 genuinely means "file not staged yet" and
 # the caller has to keep polling the same task.
-ROTATABLE_CODES = {503}
+ROTATABLE_CODES = {402, 503}
 ROTATABLE_TOOLS = {
     "image_synthesize",
     "submit_video_generation",
@@ -610,6 +610,13 @@ class Upstream:
                     int(code), decoded.get("message") or f"{tool} unavailable on this account"
                 )
                 last.account = last_account
+                if code == 402:
+                    # Balance is charged per account and only the check-in job
+                    # can clear it, so parking is what stops the next request
+                    # from picking the same drained account and failing again.
+                    # HTTP 402 is parked the same way a few lines above; the
+                    # business code rides inside a 200 and used to be missed.
+                    token_manager.park(token, 402, last.message)
                 log.warning(
                     "mcp %s: account %s cannot use this tool (%s), trying the next",
                     tool, token.label or token.short, code,
