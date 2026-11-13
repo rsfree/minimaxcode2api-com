@@ -1836,7 +1836,8 @@ async function loadLogs(keepOffset) {
       '<td class="num">' + (r.total_tokens ? num(r.total_tokens) : "—") + "</td>" +
       '<td><div class="cellerr' + (err ? "" : " none") + '" title="' + esc(err || "—") + '">' +
         esc(err || (r.ok ? "—" : "（没有错误正文）")) + "</div></td>" +
-      '<td class="mono dim" style="font-size:11px">' + esc(r.request_id) + "</td></tr>";
+      '<td class="mono dim" style="font-size:11px;white-space:nowrap;max-width:110px;overflow:hidden;text-overflow:ellipsis" title="' +
+        esc(r.request_id) + '">' + esc(r.request_id) + "</td></tr>";
   }).join("");
   return true;
 }
