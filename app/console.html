@@ -400,6 +400,7 @@ pre.out { background: var(--surface-2); border: 1px solid var(--line); border-ra
               <select id="imgSize">
                 <option>1024x1024</option><option>1792x1024</option><option>1024x1792</option>
                 <option>1280x720</option><option>720x1280</option>
+                <option>2K</option><option>4K</option>
               </select>
             </label>
             <label class="fld"><span class="lb">张数</span>
@@ -1949,10 +1950,14 @@ $("btnImage").addEventListener("click", async () => {
       const fig = document.createElement("figure");
       fig.innerHTML = '<a href="' + esc(src) + '" target="_blank" rel="noreferrer">' +
         '<img src="' + esc(src) + '" alt="" loading="lazy"></a>' +
-        "<figcaption>" + esc((it.url || "base64").split("/").pop()) + "</figcaption>";
+        "<figcaption>" + esc(it.size || (it.url || "base64").split("/").pop()) +
+        (it.output_format ? " · " + esc(it.output_format) : "") + "</figcaption>";
       box.prepend(fig);
     }
-    $("imgNote").textContent = items.length + " 张 · " + $("imgSize").value;
+    // The response reports what the tool actually produced, which is not always
+    // what was asked for: pixels snap to the nearest supported ratio and tier.
+    const produced = items[0].size ? " · 实际 " + items[0].size : "";
+    $("imgNote").textContent = items.length + " 张" + produced;
   } catch (e) {
     $("imgNote").textContent = "";
     toast(e.message || String(e), "bad");

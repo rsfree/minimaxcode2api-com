@@ -81,7 +81,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY
 
 | 能力 | 上游工具 | 网关端点 | 实测状态 |
 |---|---|---|---|
-| 文生图 / 图生图 | `image_synthesize` | `POST /v1/images/generations` | ✅ 200，1 张 1K 实测 27–94 秒（随上游负载波动） |
+| 文生图 / 图生图 | `image_synthesize` | `POST /v1/images/generations`（**Ark / Seedream 协议**） | ✅ 200，1 张 1K 实测 27–94 秒（随上游负载波动） |
 | 文生视频 / 图生视频 | `submit_video_generation` + `query_video_generation` | `POST /v1/videos/generations` | ✅ 提交成功（202 + task_id），查询状态流转 `running → succeeded`；**文件交付环节见 §3.7** |
 | 语音合成 | `synthesize_speech` | `POST /v1/audio/speech` | 端点与参数已验证；实测时余额已耗尽（402） |
 | 音色列表 | `get_voice_list` | `GET /v1/audio/voices` | ✅ 200，332 个音色 |
@@ -563,54 +563,93 @@ export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3.1-Flash
 | `POST /admin/accounts/import` | `{"text": "邮箱 密码\n..."}` 批量开通并进池（后台任务，一次一个）；密码不落盘 |
 | `GET /admin/accounts/import` | 当前 / 上次导入任务的分账号进度（控制台轮询这个） |
 
-### 3.4 文生图
+### 3.4 文生图（Ark / Seedream 协议）
 
 ```
 POST /v1/images/generations
 ```
 
-OpenAI 同样式的请求体，只改 `base_url` 就能用现成的图片客户端。
+请求与响应都按火山方舟（Volcengine Ark）`POST /api/v3/images/generations` 的形状来：
+**只改 `base_url` 和 key**，把 Seedream 客户端指过来就能跑。
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/images/generations \
   -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
-  -d '{"prompt":"a red apple on a white table, product photo","n":1,"size":"1024x1024"}'
+  -d '{
+    "model": "doubao-seedream-5-5-261028",
+    "prompt": "充满活力的特写编辑肖像，工作室灯光效果强烈",
+    "size": "2K",
+    "output_format": "png",
+    "response_format": "url",
+    "watermark": true
+  }'
 ```
 
 ```json
 {
+  "model": "doubao-seedream-5-5-261028",
   "created": 1794452319,
-  "data": [{"url": "https://agent-cdn.minimax.io/mcp/u576.../image_tool/output/1794452319_8d06712a.png"}],
-  "model": "image"
+  "data": [
+    {
+      "url": "https://agent-cdn.minimax.io/mcp/u576.../image_tool/output/1794452319_8d06712a.png",
+      "output_format": "jpeg",
+      "size": "2048x2048"
+    }
+  ],
+  "usage": {
+    "generated_images": 1,
+    "output_tokens": 16384,
+    "total_tokens": 16384
+  }
 }
 ```
 
-| 参数 | 说明 |
+#### 请求字段
+
+| 字段 | 网关行为 |
 |---|---|
-| `prompt` | 必填 |
-| `n` | 1–10，一次调用内部批量生成 |
-| `size` | `1024x1024`、`1792x1024` 等。网关把它换算成上游的 `aspect_ratio` + `resolution` |
-| `resolution` | 直接指定 `1K` / `2K` / `4K`（覆盖 `size` 推导结果） |
-| `aspect_ratio` | 直接指定 `16:9`、`1:1`、`9:16` 等（覆盖 `size` 推导结果） |
-| `reference_images` | 参考图 URL 数组，最多 4 张（图生图） |
-| `response_format` | `url`（默认，直接给 CDN 链接）或 `b64_json`（网关下载后转 base64） |
+| `model` | **必填项不校验，取值一律忽略**：回显到响应里，没传填 `minimax-image` |
+| `prompt` | 必填；缺失或空白 → `400 prompt is required` |
+| `image` | 支持 `string` 或 `string[]`。公网 URL 直传；`data:image/...;base64,` 先上传到通道 CDN 再喂给工具，裸 base64 也认 |
+| `size` | 档位 `1K` / `1.5K` / `2K` / `3K` / `4K`，或 `宽x高`。**是建议值**，换算见下 |
+| `response_format` | `url`（默认）或 `b64_json`，都支持；其它值 → `400` |
+| `sequential_image_generation` + `sequential_image_generation_options.max_images` | 支持：`auto` 时按 `max_images` 出图，范围 1–15 |
+| `n` | OpenAI 兼容保留，1–15（优先级低于上面的 `max_images`） |
 
-⚠️ **实测发现**：返回的 URL 后缀是 `.png`、CDN 的 `Content-Type` 也是 `image/png`，
-但**实际字节是 JPEG**（`ff d8 ff e1`，带 AIGC 水印 Exif）。这是上游工具的行为，网关无法改——
-对比过：传不传 `output_file` 完全一样，不是我们给的文件名带偏的。
-按扩展名或 Content-Type 判断格式的程序会被误导——**靠文件头判断**。
+以下字段 Ark 客户端默认会带，**网关接受但忽略**（不报错），响应用实际值回答：
 
-**参数边界与成本（每条都实跑过）**：
+| 字段 | 忽略原因 |
+|---|---|
+| `output_format` | 工具固定产出 JPEG（扩展名与 `Content-Type` 都谎称 png），改不了 |
+| `background` | 工具不支持生成透明通道；`transparent` 不会生效 |
+| `watermark` | 上游固定写入 AIGC 水印 Exif，关不掉 |
+| `stream` | 始终返回非流式 JSON |
+| `layer_decomposition` / `layer_decomposition_options` | 工具没有图层拆分能力 |
+| `optimize_prompt_options` | 提示词优化由上游内部决定 |
+| `tools`（`web_search`） | 工具没有联网搜索入参 |
+| `safety_identifier` | 通道没有该透传字段 |
 
-| 传入 | 上游行为 | 实际输出 |
-|---|---|---|
-| `resolution=1K` + `aspect_ratio=1:1` | 接受 | `1024×1024`（≈1.0 MP），411 KB |
-| `resolution=4K` + `aspect_ratio=16:9` | 接受 | `5504×3072`（≈16.9 MP），8.5 MB |
-| `aspect_ratio=3:2` | schema 的 enum 只列了 `1:1 16:9 9:16 4:3 3:4 21:9`，**但服务端不校验**，照样受理 | `1264×848` |
-| 额外塞 `model=image-01` | **静默忽略**，`code: 0` 正常出图 | 仍是 `1024×1024`，模型没变 |
-| `output_file=slot_0.png` | 只在回包 `output_file` 字段里回显 | 命名与格式都不受影响 |
+#### `size` 怎么换算
 
-`resolution` 是**面积档**不是短边：1K≈1024²、2K≈2048²、4K≈4096²。
+上游只有三个面积档 `1K` / `2K` / `4K`，和九个宽高比，所以：
+
+| 传入 | 处理 |
+|---|---|
+| `1K` → `4K` | 直接用 |
+| `1.5K` | 落到 `2K`（面积更近） |
+| `3K` | 落到 `4K`（面积更近） |
+| `宽x高` | 先按比例吸附到最近的宽高比，再按面积（`2 MP` / `8 MP` 为界）选档 |
+| 非法值 | `400 invalid size` |
+
+**返回值才是真相**：`data[].size` 和 `data[].output_format` 由网关读取图片字节得出，不是照抄请求。
+实测 `resolution=1K` + `aspect_ratio=1:1` → `1024×1024`；`4K` + `16:9` → `5504×3072`；
+`3:2` 档位 → `1264×848`。要精确像素，上游做不到，只能拿到最接近的一档。
+
+`usage.output_tokens` 按 Ark 的口径算：`sum(宽×高) / 256` 取整。
+
+⚠️ **`data[].url` 的后缀是 `.png`、CDN 的 `Content-Type` 也是 `image/png`，但实际字节是 JPEG**
+（`ff d8 ff e1`，带 AIGC 水印 Exif）。对比过：传不传 `output_file` 完全一样，不是文件名带偏的。
+**按文件头判断格式**，响应里的 `output_format` 就是网关读文件头得到的答案。
 
 **成本：一张 1K 图 = 115 credits**（实测某号 277.4 → 162.4）。4K 是 1K 的 17 倍面积，价格更高；
 余额不够时上游直接回 `402`，文案里会出现 `plan balance has run out`。
@@ -629,11 +668,11 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 `additionalProperties: false`，压根没有模型字段；出图返回里也没有模型标识，`clean_oss_key`
 一律是 `.../image_tool/output/...`。所以：
 
-- 请求体里的 `model` **完全被忽略**——传 `minimax-image`、`h3-image` 还是随便什么，结果一样；
-  响应里的 `"model"` 只是把客户端传的名字回显，没传就填 `"image"`；
+- 请求体里的 `model` **完全被忽略**——传 `doubao-seedream-5-5-261028`、`minimax-image`、
+  `h3-image` 结果都一样，响应只是回显你传的名字；
 - **`h3-image` 在这条通道不存在**。`H3` 是**视频**模型（`MiniMax-H3` → `matrix_gen_videos`），
   和图像无关；
-- 图像风格/画质只能通过 `prompt`、`aspect_ratio`、`resolution` 控制，选不了具体图像模型。
+- 图像风格/画质只能通过 `prompt`、`size`（换算成 `aspect_ratio` + `resolution`）控制。
 
 ### 3.5 文生视频 / 图生视频
 

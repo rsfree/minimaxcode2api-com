@@ -39,6 +39,7 @@ log = logging.getLogger("minimax.media")
 # Generation can run for minutes: the client allows 10 min for image/video/TTS
 # and the MCP proxy itself caps the request there too.
 IMAGE_TIMEOUT = 300.0
+UPLOAD_TIMEOUT = 120.0
 VIDEO_SUBMIT_TIMEOUT = 120.0
 VIDEO_QUERY_TIMEOUT = 90.0
 SPEECH_TIMEOUT = 300.0
@@ -139,28 +140,175 @@ async def call_ex(
 # ---------------------------------------------------------------------------
 # image
 # ---------------------------------------------------------------------------
+# Ark's `size` speaks in tiers: 1K / 1.5K / 2K / 3K / 4K per model family. The
+# synthesiser only has three buckets, picked by total area, so the tiers in
+# between land on the nearer one instead of being rejected.
+_SIZE_TIERS = {
+    "1k": "1K",
+    "1.5k": "2K",
+    "2k": "2K",
+    "3k": "4K",
+    "4k": "4K",
+}
+_AREA_1K = 1024 * 1024
+_AREA_2K = 2048 * 2048
+
+
 def size_to_params(size: str | None) -> tuple[str, str]:
-    """Translate an OpenAI ``WxH`` size into ``(aspect_ratio, resolution)``."""
+    """Translate Ark's ``size`` (tier or ``WxH``) into (aspect_ratio, resolution).
+
+    Tiers fix the resolution and leave the ratio alone; ``WxH`` snaps to the
+    nearest supported ratio and the nearest area bucket, which is as close as
+    this channel can get — the returned pixels are whatever the tool produces,
+    and the response reports that truthfully rather than echoing the request.
+    """
     if not size:
         return "1:1", "1K"
+    text = str(size).strip().lower().replace(" ", "")
+    if not text or text == "auto":
+        return "1:1", "1K"
+    if text in _SIZE_TIERS:
+        return "1:1", _SIZE_TIERS[text]
+
     try:
-        width_text, height_text = size.lower().replace(" ", "").split("x", 1)
+        width_text, height_text = text.split("x", 1)
         width, height = int(width_text), int(height_text)
         if width <= 0 or height <= 0:
             raise ValueError
     except (ValueError, AttributeError):
-        return "1:1", "1K"
+        raise MediaError(
+            400, f"invalid size {size!r}: use a tier (1K/2K/4K) or 'WxH'", code=400
+        ) from None
 
     ratio = width / height
     best = min(_ASPECT_PRESETS, key=lambda pair: abs(math.log(ratio) - math.log(pair[0] / pair[1])))
-    longest = max(width, height)
-    if longest <= 1280:
+    area = width * height
+    if area <= 2 * _AREA_1K:
         resolution = "1K"
-    elif longest <= 2560:
+    elif area <= 2 * _AREA_2K:
         resolution = "2K"
     else:
         resolution = "4K"
     return f"{best[0]}:{best[1]}", resolution
+
+
+def _jpeg_size(raw: bytes) -> tuple[int, int] | None:
+    index = 2
+    length = len(raw)
+    while index + 9 < length:
+        if raw[index] != 0xFF:
+            index += 1
+            continue
+        marker = raw[index + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        if marker == 0xDA:  # start of scan: no more headers after this
+            return None
+        segment = int.from_bytes(raw[index + 2:index + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            height = int.from_bytes(raw[index + 5:index + 7], "big")
+            width = int.from_bytes(raw[index + 7:index + 9], "big")
+            return width, height
+        if segment < 2:
+            return None
+        index += 2 + segment
+    return None
+
+
+def image_info(raw: bytes) -> dict[str, Any]:
+    """Format and pixel size read from the bytes themselves.
+
+    The asset URL ends in ``.png`` and the CDN answers ``image/png``, but the
+    payload is JPEG with an AIGC watermark in Exif. The bytes are the only
+    trustworthy source, and Ark's response carries the real format and size, so
+    they are read from here rather than guessed from the request.
+    """
+    info: dict[str, Any] = {}
+    if len(raw) >= 4 and raw[:3] == b"\xff\xd8\xff":
+        info["output_format"] = "jpeg"
+        size = _jpeg_size(raw)
+    elif len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n":
+        info["output_format"] = "png"
+        size = (int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big"))
+    elif len(raw) >= 30 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        info["output_format"] = "webp"
+        size = None
+        if raw[12:16] == b"VP8X":
+            size = (
+                int.from_bytes(raw[24:27], "little") + 1,
+                int.from_bytes(raw[27:30], "little") + 1,
+            )
+    else:
+        return {}
+    if size and size[0] and size[1]:
+        info["size"] = f"{size[0]}x{size[1]}"
+    return info
+
+
+async def describe_asset(url: str, timeout: float = 20.0) -> dict[str, Any]:
+    """Read only the head of a generated asset to learn its format and pixels.
+
+    A ranged GET keeps this at a few kilobytes instead of the 8 MB a 4K image
+    weighs; the CDN honours the range, and when it does not the stream is
+    abandoned as soon as the header is parsed.
+    """
+    await upstream.startup()
+    try:
+        async with upstream.client.stream(
+            "GET",
+            url,
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"range": "bytes=0-131071"},
+        ) as response:
+            if response.status_code not in (200, 206):
+                return {}
+            head = b""
+            async for chunk in response.aiter_bytes():
+                head += chunk
+                info = image_info(head)
+                if info or len(head) >= 262144:
+                    return info
+            return image_info(head)
+    except Exception as exc:  # noqa: BLE001 - metadata is a nicety, never fatal
+        log.debug("cannot describe asset %s: %s", url, exc)
+        return {}
+
+
+async def upload_image(
+    data: str, mime_type: str = "image/png", filename: str | None = None
+) -> str:
+    """Push a base64 image to the channel's own CDN and return its URL.
+
+    Ark accepts ``image`` as a URL *or* a ``data:`` URI. The generation tool only
+    reads URLs, so an inline image has to be materialised first — this tool is
+    the only way to do that without a caller-visible bucket.
+    """
+    payload: dict[str, Any] = {"data": data, "mime_type": mime_type}
+    if filename:
+        payload["filename"] = filename
+    result = await call("upload_to_cdn", payload, UPLOAD_TIMEOUT)
+    url = result.get("cdn_url") or ""
+    if not url:
+        raise MediaError(502, "image upload returned no cdn_url", payload=result)
+    return url
+
+
+async def resolve_reference(value: str, index: int = 0) -> str:
+    """Turn a URL or an inline base64 image into something the tool can read."""
+    text = (value or "").strip()
+    if not text:
+        raise MediaError(400, "empty image reference", code=400)
+    if text.startswith("data:"):
+        header, _, blob = text.partition(",")
+        mime = (header[5:].split(";")[0] or "image/png").strip().lower()
+        extension = mime.rsplit("/", 1)[-1].replace("jpg", "jpeg")
+        return await upload_image(blob, mime, f"ref_{index}.{extension}")
+    if "://" in text:
+        return text
+    # Bare base64: some Ark SDKs drop the data: prefix on the way through.
+    return await upload_image(text, "image/png", f"ref_{index}.png")
 
 
 async def image_generate(
@@ -174,14 +322,20 @@ async def image_generate(
 ) -> dict:
     """Run ``image_synthesize`` and return the raw envelope plus a clean item list."""
     derived_aspect, derived_resolution = size_to_params(size)
-    aspect = aspect_ratio or derived_aspect
-    res = resolution or derived_resolution
+    aspect = (aspect_ratio or "").strip() or derived_aspect
+    if aspect == "auto":
+        aspect = derived_aspect
+    res = _SIZE_TIERS.get((resolution or "").strip().lower()) or (resolution or "").strip().upper() or derived_resolution
+
+    resolved_refs: list[str] = []
+    for index, reference in enumerate(reference_urls or []):
+        resolved_refs.append(await resolve_reference(reference, index))
 
     requests: list[dict[str, Any]] = []
     for index in range(max(1, n)):
         item: dict[str, Any] = {"prompt": prompt, "output_file": f"slot_{index}.png"}
-        if reference_urls:
-            item["input_urls"] = reference_urls
+        if resolved_refs:
+            item["input_urls"] = resolved_refs
         item["aspect_ratio"] = aspect
         item["resolution"] = res
         requests.append(item)

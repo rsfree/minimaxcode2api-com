@@ -431,16 +431,16 @@ curl -s $BASE/v1/audio/voices -H "Authorization: Bearer $KEY" \
 
 期望：能力清单 4 项（image / video / speech / music）；音色数约为 **332**。
 
-**⑨ 文生图（会扣额度，约 20 秒）**
+**⑨ 文生图（Ark / Seedream 协议，会扣额度，约 20 秒）**
 
 ```bash
 curl -s $BASE/v1/images/generations -H "Authorization: Bearer $KEY" \
   -H 'content-type: application/json' \
-  -d '{"prompt":"a red apple on a white table","size":"1024x1024"}'
+  -d '{"model":"doubao-seedream-5-5-261028","prompt":"a red apple on a white table","size":"1K"}'
 ```
 
-期望 `data[0].url` 是一个 `agent-cdn.minimax.io` 链接，能直接下载。
-返回 `402` 说明账号额度用完了，不是部署问题 —— 看下面 `402` 那行。
+期望 `data[0].url` 是一个 `agent-cdn.minimax.io` 链接，能直接下载，旁边带 `size` / `output_format`
+（网关读图片字节得出的真实值）。返回 `402` 说明账号额度用完了，不是部署问题 —— 看下面 `402` 那行。
 
 **⑩ 文生视频（异步，最省的一档）**
 

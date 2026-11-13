@@ -5,7 +5,7 @@ Surface:
 * ``POST /v1/chat/completions`` — OpenAI-compatible, streaming and buffered.
 * ``POST /v1/messages``         — Anthropic Messages passthrough.
 * ``GET  /v1/models``           — catalogue for client pickers.
-* ``POST /v1/images/generations`` — OpenAI-compatible image generation.
+* ``POST /v1/images/generations`` — image generation, Ark / Seedream request shape.
 * ``POST /v1/videos/generations`` — async video submit; ``GET .../{task_id}`` polls.
 * ``POST /v1/audio/speech``     — text to speech (mp3).
 * ``GET  /v1/audio/voices``     — voice catalogue for the speech endpoint.
@@ -250,6 +250,30 @@ def media_error_response(exc: MediaError) -> JSONResponse:
     if exc.status_field:
         body["status"] = exc.status_field
     return JSONResponse(status_code=exc.status, content=body)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+    """Give every 500 a traceback and a history row.
+
+    A caller relayed ``status_code=500, bad response status code 500`` while the
+    console showed nothing at all: the only rows we wrote were successes and
+    ``UpstreamError``s, so an unhandled exception left no evidence. That made a
+    systematic bug look like an occasional 502. Now the traceback goes to the
+    container log and one ``error`` row lands in the history, which is what the
+    caller's ref number points at.
+    """
+    log.exception("unhandled %s on %s %s", type(exc).__name__, request.method, request.url.path)
+    try:
+        row = metrics_mod.metrics.record(
+            "error", f"{request.method} {request.url.path}", ok=False, status=500,
+            error=f"{type(exc).__name__}: {exc}",
+            client=_client_tag(request),
+        )
+        ref = row.request_id
+    except Exception:  # noqa: BLE001 - never let the handler mask the original
+        ref = ""
+    return error_response(500, f"internal error (ref {ref})", "internal_error")
 
 
 async def _read_json(request: Request) -> dict:
@@ -709,11 +733,14 @@ async def list_media_models() -> dict:
                 "type": "image",
                 "endpoint": "POST /v1/images/generations",
                 "options": {
-                    "n": "1-10 per call",
-                    "size": "e.g. 1024x1024, 1792x1024, 1024x1792",
-                    "resolution": "1K | 2K | 4K",
-                    "aspect_ratio": "21:9 16:9 3:2 4:3 1:1 4:5 3:4 2:3 9:16",
-                    "reference_images": "public https URLs, up to 4",
+                    "protocol": "Volcengine Ark POST /api/v3/images/generations",
+                    "prompt": "required",
+                    "image": "public URL or data: base64; string or array",
+                    "size": "1K | 2K | 4K (1.5K/3K snap to the nearer tier) or WxH",
+                    "response_format": "url | b64_json",
+                    "sequential_image_generation": "auto + options.max_images, 1-15",
+                    "ignored": "output_format background watermark stream layer_decomposition "
+                               "optimize_prompt_options tools safety_identifier",
                 },
             },
             {
@@ -749,9 +776,56 @@ async def list_media_models() -> dict:
     }
 
 
+def _image_count(body: dict[str, Any]) -> int:
+    """How many images to produce.
+
+    Ark has no ``n``: quantity comes from ``sequential_image_generation: auto``
+    plus ``sequential_image_generation_options.max_images``. Both that and the
+    OpenAI-style ``n`` are honoured, and 15 is Ark's own ceiling.
+    """
+    raw: Any = body.get("n")
+    if raw in (None, "", 0):
+        mode = str(body.get("sequential_image_generation") or "").strip().lower()
+        options = body.get("sequential_image_generation_options")
+        if mode == "auto" and isinstance(options, dict):
+            raw = options.get("max_images")
+    if raw in (None, ""):
+        raw = 1
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        raise ConversionError("n must be an integer") from None
+    if count < 1:
+        raise ConversionError("n must be at least 1")
+    return min(count, 15)
+
+
+def _pixel_count(size_text: str) -> int:
+    try:
+        width_text, _, height_text = str(size_text).partition("x")
+        return int(width_text) * int(height_text)
+    except (TypeError, ValueError):
+        return 0
+
+
 @app.post("/v1/images/generations")
 @app.post("/images/generations")
 async def images_generations(request: Request):
+    """Image generation with Ark's request and response shape.
+
+    Modelled on ``POST /api/v3/images/generations`` (Volcengine Ark, Seedream):
+    ``prompt`` / ``image`` / ``size`` / ``response_format`` in, and
+    ``model`` / ``created`` / ``data[]`` / ``usage`` out, where each item carries
+    ``url`` or ``b64_json`` plus the real ``size`` and ``output_format``.
+
+    Fields this channel cannot honour are accepted and ignored rather than
+    rejected, because a client written against Ark sends them by default:
+    ``output_format`` (the tool always returns JPEG), ``background``,
+    ``watermark``, ``stream``, ``layer_decomposition`` and its options,
+    ``optimize_prompt_options``, ``tools``, ``safety_identifier``. ``size`` is
+    advisory — pixels snap to the nearest supported ratio and area tier — and
+    the response says what was actually produced.
+    """
     if not _authorized(request):
         return error_response(401, "invalid gateway api key", "authentication_error")
     try:
@@ -764,46 +838,70 @@ async def images_generations(request: Request):
         return error_response(400, "prompt is required", "invalid_request_error")
 
     try:
-        n = int(body.get("n") or 1)
-    except (TypeError, ValueError):
-        return error_response(400, "n must be an integer", "invalid_request_error")
-    n = max(1, min(n, 10))
+        count = _image_count(body)
+    except ConversionError as exc:
+        return error_response(400, str(exc), "invalid_request_error")
+
+    response_format = str(body.get("response_format") or "url").strip().lower()
+    if response_format not in {"url", "b64_json"}:
+        return error_response(
+            400, "response_format must be 'url' or 'b64_json'", "invalid_request_error"
+        )
 
     reference_urls = _as_url_list(
-        body.get("reference_images") or body.get("image") or body.get("input_urls")
+        body.get("image") or body.get("reference_images") or body.get("input_urls")
     )
-    response_format = (body.get("response_format") or "url").lower()
 
     started = time.time()
     try:
         result = await media.image_generate(
             prompt=prompt,
-            n=n,
+            n=count,
             size=body.get("size"),
             aspect_ratio=body.get("aspect_ratio"),
             resolution=body.get("resolution"),
             reference_urls=reference_urls,
         )
+        images = result["images"]
+        if response_format == "b64_json":
+            blobs = await asyncio.gather(*(media.download(image["url"]) for image in images))
+            infos = [media.image_info(blob) for blob in blobs]
+        else:
+            blobs = []
+            infos = await asyncio.gather(
+                *(media.describe_asset(image["url"]) for image in images)
+            )
     except MediaError as exc:
         return media_error_response(exc)
 
     data: list[dict[str, Any]] = []
-    if response_format == "b64_json":
-        for image in result["images"]:
-            try:
-                raw = await media.download(image["url"])
-            except MediaError as exc:
-                return media_error_response(exc)
-            data.append({"b64_json": base64.b64encode(raw).decode("ascii")})
-    else:
-        data = [{"url": image["url"]} for image in result["images"]]
+    pixels = 0
+    for index, image in enumerate(images):
+        if blobs:
+            entry: dict[str, Any] = {"b64_json": base64.b64encode(blobs[index]).decode("ascii")}
+        else:
+            entry = {"url": image["url"]}
+        entry.update(infos[index] or {})
+        if image.get("revised_prompt"):
+            entry["revised_prompt"] = image["revised_prompt"]
+        pixels += _pixel_count(entry.get("size", ""))
+        data.append(entry)
+
+    usage: dict[str, Any] = {"generated_images": len(data)}
+    if reference_urls:
+        usage["input_images"] = len(reference_urls)
+    if pixels:
+        # Ark bills output tokens as sum(width * height) / 256, rounded down.
+        usage["output_tokens"] = pixels // 256
+        usage["total_tokens"] = usage["output_tokens"]
 
     log.info("ok kind=image n=%d %.2fs", len(data), time.time() - started)
     return JSONResponse(
         content={
+            "model": body.get("model") or "minimax-image",
             "created": int(time.time()),
             "data": data,
-            "model": body.get("model") or "image",
+            "usage": usage,
         }
     )
 

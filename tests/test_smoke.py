@@ -1098,11 +1098,167 @@ def test_capacity_math() -> None:
         settings.api_keys = original
 
 
+def _jpeg_header(width: int, height: int) -> bytes:
+    """A JPEG whose SOF0 carries ``width`` and ``height`` — no pixel data."""
+    app1 = b"\xff\xe1" + (0x0010).to_bytes(2, "big") + b"\x00" * 14
+    sof = (
+        b"\xff\xc0"
+        + (17).to_bytes(2, "big")
+        + b"\x08"
+        + height.to_bytes(2, "big")
+        + width.to_bytes(2, "big")
+        + b"\x03\x00" * 3
+    )
+    return b"\xff\xd8" + app1 + sof + b"\xff\xd9"
+
+
+def test_ark_size_and_measured_image_info() -> None:
+    """Ark's `size` tiers, and the size/format read from the produced bytes.
+
+    Ark clients send a tier (1K/1.5K/2K/3K/4K) or "宽x高"; the synthesiser only
+    has three area buckets, so the tiers in between land on the nearer one.
+    And the bytes lie about their format — the asset URL and Content-Type both
+    say png while the payload is JPEG — so the response must not be built from
+    the request.
+    """
+    from app.media import MediaError, image_info, size_to_params
+
+    assert size_to_params(None) == ("1:1", "1K")
+    assert size_to_params("2K") == ("1:1", "2K")
+    assert size_to_params("1.5K") == ("1:1", "2K")
+    assert size_to_params("3K") == ("1:1", "4K")
+    assert size_to_params("1024x1024") == ("1:1", "1K")
+    assert size_to_params("2048x1152") == ("16:9", "2K")
+    assert size_to_params("5504x3072") == ("16:9", "4K")
+    try:
+        size_to_params("big")
+    except MediaError as exc:
+        assert exc.status == 400 and "invalid size" in exc.message
+    else:
+        raise AssertionError("a nonsense size must not silently become 1:1")
+
+    assert image_info(_jpeg_header(1024, 1024)) == {"output_format": "jpeg", "size": "1024x1024"}
+    png = b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR" + (2048).to_bytes(
+        4, "big"
+    ) + (1152).to_bytes(4, "big")
+    assert image_info(png) == {"output_format": "png", "size": "2048x1152"}
+    assert image_info(b"not an image") == {}
+
+
+def test_ark_inline_image_is_uploaded() -> None:
+    """Ark allows `image` as a data: URI; the tool only reads URLs."""
+    from app import media
+
+    seen: dict = {}
+
+    async def fake_upload(data, mime_type="image/png", filename=None):
+        seen.update({"data": data, "mime": mime_type, "name": filename})
+        return "https://agent-cdn.example/ref.png"
+
+    original = media.upload_image
+    media.upload_image = fake_upload
+    try:
+        url = asyncio.run(media.resolve_reference("data:image/webp;base64,AAAA", 3))
+        assert url == "https://agent-cdn.example/ref.png"
+        assert seen == {"data": "AAAA", "mime": "image/webp", "name": "ref_3.webp"}
+        # A real URL must never be re-uploaded.
+        assert asyncio.run(media.resolve_reference("https://x.test/y.png")) == "https://x.test/y.png"
+    finally:
+        media.upload_image = original
+
+
+def test_ark_image_endpoint_contract() -> None:
+    """`/v1/images/generations` answers in Ark's shape, not OpenAI's.
+
+    Request: model / prompt / image / size / response_format, plus the fields
+    this channel ignores. Response: model / created / data[{url|b64_json, size,
+    output_format}] / usage{generated_images, output_tokens, total_tokens}.
+    """
+    from fastapi.testclient import TestClient
+
+    from app import main as main_mod
+    from app import media as media_mod
+    from app.config import settings
+
+    seen: dict = {}
+
+    async def fake_generate(**kwargs):
+        seen.update(kwargs)
+        return {"images": [{"url": "https://cdn.test/a.png"}], "raw": {}}
+
+    async def fake_describe(url):
+        return {"output_format": "jpeg", "size": "2048x2048"}
+
+    original_keys = settings.api_keys
+    original_generate = media_mod.image_generate
+    original_describe = media_mod.describe_asset
+    settings.api_keys = ["unit-test-key"]
+    media_mod.image_generate = fake_generate
+    media_mod.describe_asset = fake_describe
+    try:
+        client = TestClient(main_mod.app)
+        headers = {"x-api-key": "unit-test-key"}
+        response = client.post(
+            "/v1/images/generations",
+            headers=headers,
+            json={
+                "model": "doubao-seedream-5-5-261028",
+                "prompt": "a red cube",
+                "image": "https://example.test/ref.png",
+                "size": "2K",
+                "response_format": "url",
+                # Accepted and ignored — an Ark client sends these by default.
+                "output_format": "png",
+                "background": "transparent",
+                "watermark": True,
+                "stream": False,
+                "optimize_prompt_options": {"mode": "standard"},
+                "sequential_image_generation": "auto",
+                "sequential_image_generation_options": {"max_images": 2},
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["model"] == "doubao-seedream-5-5-261028"
+        assert isinstance(body["created"], int)
+        assert body["data"] == [
+            {"url": "https://cdn.test/a.png", "output_format": "jpeg", "size": "2048x2048"}
+        ]
+        assert body["usage"] == {
+            "generated_images": 1,
+            "input_images": 1,
+            "output_tokens": 2048 * 2048 // 256,
+            "total_tokens": 2048 * 2048 // 256,
+        }
+        # Quantity came from Ark's sequential block, size passed through verbatim,
+        # and the reference image reached the generator.
+        assert seen["n"] == 2 and seen["size"] == "2K"
+        assert seen["reference_urls"] == ["https://example.test/ref.png"]
+
+        missing = client.post("/v1/images/generations", headers=headers, json={"size": "1K"})
+        assert missing.status_code == 400 and "prompt is required" in missing.text
+
+        bad_format = client.post(
+            "/v1/images/generations",
+            headers=headers,
+            json={"prompt": "x", "response_format": "bytes"},
+        )
+        assert bad_format.status_code == 400
+        assert "response_format" in bad_format.text
+    finally:
+        settings.api_keys = original_keys
+        media_mod.image_generate = original_generate
+        media_mod.describe_asset = original_describe
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
         test_model_catalogue_complete,
         test_video_model_enum_matches_upstream,
+        test_ark_size_and_measured_image_info,
+        test_ark_inline_image_is_uploaded,
+        test_ark_image_endpoint_contract,
         test_system_and_text,
         test_tool_roundtrip,
         test_response_translation,
