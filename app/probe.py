@@ -201,6 +201,7 @@ class ProbeCache:
                         probe_one, token, label, settings.region, settings.signin_timezone
                     )
                     self._items[label] = item
+                    _release_if_topped_up(item)
 
             await asyncio.gather(*(one(label, token) for label, token in pairs))
             self._updated_at = time.time()
@@ -279,6 +280,42 @@ def token_pool_ref():
     from .auth import token_manager
 
     return token_manager
+
+
+# Lifting a park is a small bet: the balance says the account can spend again,
+# but the reading may predate the spend that got it parked. Bet once per half
+# hour at most, so a wrong guess costs one failed request instead of a loop of
+# park → probe → park that burns one call every PROBE_INTERVAL.
+_LIFT_INTERVAL = 1800.0
+_last_lift: dict[str, float] = {}
+
+
+def _release_if_topped_up(item: AccountProbe) -> None:
+    """Put a parked account back in rotation as soon as the balance is positive.
+
+    Parks were lifted in exactly one place: the check-in sweep, right after it
+    claimed. That missed every other way an account gets topped up — importing a
+    batch that was already claimed elsewhere, a manual claim in the browser, a
+    pack landing late — and the console then contradicted itself: "积分 400" in
+    one column, "冷却至 00:10" and "insufficient balance (1008)" in the next,
+    for the rest of the day.
+
+    The probe already reads that balance every cycle, so let it lift the park.
+    """
+    if item.error:
+        return
+    try:
+        credit = float((item.membership or {}).get("credit"))
+    except (TypeError, ValueError):
+        return
+    if credit <= 0:
+        return
+    now = time.time()
+    if now - _last_lift.get(item.label, 0.0) < _LIFT_INTERVAL:
+        return
+    if token_pool_ref().clear_quota_cooldown(item.label):
+        _last_lift[item.label] = now
+        log.info("probe: %s holds %.0f credits, lifted the quota park", item.label, credit)
 
 
 probes = ProbeCache()

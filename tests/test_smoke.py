@@ -1732,6 +1732,65 @@ def test_business_402_rotates_to_a_fresh_account() -> None:
     assert parked == [402], f"the drained account must be parked, got {parked}"
 
 
+def test_probe_lifts_a_quota_park_once_the_balance_is_back() -> None:
+    """A positive balance disproves the park, and the probe is who sees it.
+
+    The check-in sweep used to be the only thing that could lift a quota park, so
+    an account imported with 400 credits already claimed — or topped up in the
+    browser — sat out the rest of the day: "积分 400" next to "冷却至 00:10" and
+    "insufficient balance (1008)" on the same row.
+    """
+    from app import probe as probe_mod
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def clear_quota_cooldown(self, label: str) -> bool:
+            self.calls.append(label)
+            return True
+
+    pool = FakePool()
+    original = probe_mod.token_pool_ref
+    original_last = dict(probe_mod._last_lift)
+    probe_mod.token_pool_ref = lambda: pool
+    probe_mod._last_lift.clear()
+    try:
+        # 400 credits: the park must go.
+        probe_mod._release_if_topped_up(
+            probe_mod.AccountProbe(label="a@x", membership={"credit": 400.0})
+        )
+        assert pool.calls == ["a@x"]
+
+        # A zero balance says nothing new — park stays.
+        pool.calls.clear()
+        probe_mod._release_if_topped_up(
+            probe_mod.AccountProbe(label="a@x", membership={"credit": 0.0})
+        )
+        assert pool.calls == []
+
+        # A probe that failed to read the balance must not lift anything.
+        probe_mod._release_if_topped_up(
+            probe_mod.AccountProbe(label="a@x", membership={"credit": 400.0}, error="boom")
+        )
+        assert pool.calls == []
+
+        # Throttled: the guess was already made this half hour, and repeating it
+        # on every probe cycle would burn a request each time it is wrong.
+        probe_mod._release_if_topped_up(
+            probe_mod.AccountProbe(label="b@x", membership={"credit": 400.0})
+        )
+        assert pool.calls == ["b@x"]
+        probe_mod._release_if_topped_up(
+            probe_mod.AccountProbe(label="b@x", membership={"credit": 400.0})
+        )
+        assert pool.calls == ["b@x"]
+    finally:
+        probe_mod.token_pool_ref = original
+        probe_mod._last_lift.clear()
+        probe_mod._last_lift.update(original_last)
+
+
 def test_ark_image_endpoint_contract() -> None:
     """`/v1/images/generations` answers in Ark's shape, not OpenAI's.
 
@@ -1984,6 +2043,7 @@ def main() -> None:
         test_image_model_mapping,
         test_ark_inline_image_is_uploaded,
         test_image_accepts_multiple_references,
+        test_probe_lifts_a_quota_park_once_the_balance_is_back,
         test_business_402_rotates_to_a_fresh_account,
         test_ark_image_endpoint_contract,
         test_system_and_text,
