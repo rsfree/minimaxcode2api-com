@@ -67,6 +67,10 @@ EDITABLE: dict[str, dict] = {
         "kind": "int", "min": 0, "max": 50,
         "note": "一次调用最多重试几次（换号或同号重试）。0 = 只试一次",
     },
+    "media_min_credits": {
+        "kind": "float", "min": 0, "max": 100000,
+        "note": "派生成任务前要求的最低积分（一张图按此值 × 张数）。0 = 不按余额预筛",
+    },
     "request_timeout": {
         "kind": "float", "min": 5, "max": 3600,
         "note": "上游超时（秒），改完立即重建连接池",
@@ -199,6 +203,16 @@ class Settings:
     # account left a transient failure (5xx, connection reset) reuses the last
     # one instead of giving up. 0 = one attempt, no retry.
     retry_attempts: int = field(default_factory=lambda: _env_int("RETRY_ATTEMPTS", 3))
+
+    # Media work is billed per call against the same credit balance chat uses,
+    # but in far bigger slices: one 1K image costs about 115 credits and one
+    # video about 320, while a chat turn costs a handful. An account holding 40
+    # credits is perfectly usable for chat and cannot draw anything, so the pool
+    # pre-filters media candidates on the probed balance instead of spending a
+    # 300 s round trip to collect a 402. 0 turns the filter off.
+    media_min_credits: float = field(
+        default_factory=lambda: float(_env("MEDIA_MIN_CREDITS", "100") or 100)
+    )
 
     def __post_init__(self) -> None:
         self.region = self.region if self.region in REGION_ACCOUNT_BASE else "en"

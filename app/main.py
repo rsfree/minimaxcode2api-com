@@ -342,7 +342,9 @@ def media_error_response(exc: MediaError) -> JSONResponse:
         "error": {
             "message": redact.for_caller(exc.message, exc.status),
             "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
-            "code": exc.code,
+            # A plain HTTP 402 carries no business code; reporting the status is
+            # more useful than `null` and matches the shape callers parse.
+            "code": exc.code if exc.code is not None else exc.status,
         }
     }
     if exc.status_field:
@@ -1189,7 +1191,7 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
             "error": {
                 "message": redact.for_caller(exc.message, exc.status),
                 "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
-                "code": exc.code,
+                "code": exc.code if exc.code is not None else exc.status,
             },
             "id": task_id,
             "object": "video.generation",

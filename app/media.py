@@ -31,6 +31,7 @@ import time
 from typing import Any
 
 from .auth import token_manager
+from .config import settings
 from .metrics import metrics
 from .upstream import UpstreamError, upstream
 
@@ -92,9 +93,31 @@ def _status_for(code: int) -> int:
     return 502
 
 
-async def call(tool: str, payload: dict, timeout: float, account: str | None = None) -> dict:
+def _min_credits() -> float:
+    """Floor below which an account provably cannot pay for one media job."""
+    try:
+        return max(0.0, float(settings.media_min_credits))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def image_credit_need(count: int) -> float:
+    """Credits a ``count``-image request is expected to cost, as a lower bound.
+
+    One 1K image measured at ~115 credits, so the configured floor is a
+    *sufficiency* test, not a price list: an account below it cannot pay, while
+    an account above it may still be short for a 4K or multi-image job. That
+    second case is what the media park is for.
+    """
+    return _min_credits() * max(1, int(count))
+
+
+async def call(
+    tool: str, payload: dict, timeout: float, account: str | None = None,
+    need_credits: float = 0.0,
+) -> dict:
     """Invoke one MCP tool and unwrap the business-code envelope."""
-    data, _ = await call_ex(tool, payload, timeout, account)
+    data, _ = await call_ex(tool, payload, timeout, account, need_credits)
     return data
 
 
@@ -105,12 +128,15 @@ def _account_label(served: str) -> str:
 
 
 async def call_ex(
-    tool: str, payload: dict, timeout: float, account: str | None = None
+    tool: str, payload: dict, timeout: float, account: str | None = None,
+    need_credits: float = 0.0,
 ) -> tuple[dict, str]:
     """Same as :func:`call`, but also returns the account that served it."""
     started = time.time()
     try:
-        data, served = await upstream.mcp_ex(tool, payload, timeout=timeout, account=account)
+        data, served = await upstream.mcp_ex(
+            tool, payload, timeout=timeout, account=account, need_credits=need_credits
+        )
     except UpstreamError as exc:
         metrics.record(
             f"mcp:{tool}", tool,
@@ -403,7 +429,10 @@ async def image_generate(
         item["resolution"] = res
         requests.append(item)
 
-    data = await call("image_synthesize", {"requests": requests}, IMAGE_TIMEOUT)
+    data = await call(
+        "image_synthesize", {"requests": requests}, IMAGE_TIMEOUT,
+        need_credits=image_credit_need(len(requests)),
+    )
 
     images: list[dict[str, Any]] = []
     for item in data.get("success_items") or []:
@@ -455,7 +484,9 @@ def normalize_video_model(model: str | None) -> str:
 
 async def video_submit(payload: dict, account: str | None = None) -> tuple[dict, str]:
     """Submit a video task; returns ``(response, account that owns the task)``."""
-    return await call_ex("submit_video_generation", payload, VIDEO_SUBMIT_TIMEOUT, account)
+    return await call_ex(
+        "submit_video_generation", payload, VIDEO_SUBMIT_TIMEOUT, account, _min_credits()
+    )
 
 
 async def video_query(task_id: str, model: str, account: str | None = None) -> dict:
@@ -495,7 +526,9 @@ async def speech(
     if emotion:
         payload["emotion"] = emotion
 
-    data = await call("synthesize_speech", payload, SPEECH_TIMEOUT)
+    data = await call(
+        "synthesize_speech", payload, SPEECH_TIMEOUT, need_credits=_min_credits()
+    )
     url = data.get("output_url")
     if not url:
         raise MediaError(502, "upstream returned no audio", payload=data)
@@ -525,7 +558,10 @@ async def music(
             item["format"] = audio_format
         requests.append(item)
 
-    data = await call("batch_text_to_music", {"requests": requests}, MUSIC_TIMEOUT)
+    data = await call(
+        "batch_text_to_music", {"requests": requests}, MUSIC_TIMEOUT,
+        need_credits=_min_credits() * max(1, len(requests)),
+    )
 
     tracks: list[dict[str, Any]] = []
     for item in data.get("success_items") or []:

@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 
 from . import curl_transport
-from .auth import CredentialError, token_manager
+from .auth import CAPABILITY_MEDIA, CredentialError, token_manager
 from .config import API_KEY_PLACEHOLDER, settings
 
 log = logging.getLogger("minimax.upstream")
@@ -495,24 +495,30 @@ class Upstream:
         return response
 
     async def mcp(self, tool: str, payload: dict, timeout: float = 120.0,
-                  account: str | None = None) -> dict:
+                  account: str | None = None, need_credits: float = 0.0) -> dict:
         """POST a desktop MCP tool call and return the decoded JSON body.
 
         Generation tools answer ``200`` with a business ``code`` inside the
         envelope, so a 200 here does not mean success — ``media.call`` owns that
         check.
         """
-        body, _ = await self.mcp_ex(tool, payload, timeout, account)
+        body, _ = await self.mcp_ex(tool, payload, timeout, account, need_credits)
         return body
 
     async def mcp_ex(self, tool: str, payload: dict, timeout: float = 120.0,
-                     account: str | None = None) -> tuple[dict, str]:
+                     account: str | None = None,
+                     need_credits: float = 0.0) -> tuple[dict, str]:
         """Same as :meth:`mcp`, but also reports which account served it.
 
         ``account`` pins the call to one pooled account — needed by the async
         video flow, whose ``task_id`` is only visible to the account that
         submitted it. Any other account answers
         ``404 task was not found or does not belong to the current caller``.
+
+        ``need_credits`` is the balance this job is expected to cost. Accounts
+        whose last probe says they cannot cover it are skipped for this call
+        only — they remain fully usable for chat, which is the whole reason the
+        media channel has its own park.
         """
         await self.startup()
         url = f"{settings.mcp_url}/{tool}"
@@ -531,8 +537,15 @@ class Upstream:
                     token = pinned
             if token is None:
                 try:
-                    token = await token_manager.acquire(exclude=tried)
+                    token = await token_manager.acquire(
+                        exclude=tried, capability=CAPABILITY_MEDIA, need=need_credits
+                    )
                 except CredentialError as exc:
+                    # The pool is not broken, it is too poor for this job. A 502
+                    # would tell the caller the gateway failed; 402 tells them
+                    # the truth without naming an account.
+                    if getattr(exc, "status", None) == 402:
+                        raise UpstreamError(402, str(exc)) from exc
                     # Same rule as the chat path: an account that is merely
                     # cooling down can still be the one that owns this task.
                     if last is not None and _transient(last) and attempt + 1 < tries:
@@ -569,7 +582,10 @@ class Upstream:
                 if status != 200:
                     last = _error_from(status, body)
                     last.account = last_account
-                    token_manager.park(token, status, last.message if last else f"HTTP {status}")
+                    token_manager.park(
+                        token, status, last.message if last else f"HTTP {status}",
+                        capability=CAPABILITY_MEDIA,
+                    )
                     log.warning("mcp %s: account %s failed (%s)", tool, token.label or token.short, status)
                     continue
 
@@ -616,7 +632,9 @@ class Upstream:
                     # from picking the same drained account and failing again.
                     # HTTP 402 is parked the same way a few lines above; the
                     # business code rides inside a 200 and used to be missed.
-                    token_manager.park(token, 402, last.message)
+                    # Scoped to media: this says "cannot pay for an image", not
+                    # "cannot answer a prompt".
+                    token_manager.park(token, 402, last.message, capability=CAPABILITY_MEDIA)
                 log.warning(
                     "mcp %s: account %s cannot use this tool (%s), trying the next",
                     tool, token.label or token.short, code,

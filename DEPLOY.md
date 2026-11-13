@@ -313,13 +313,14 @@ PROBE_AUTO=1                      # 后台探针（控制台的余额/签到状�
 PROBE_INTERVAL=300                # 探针间隔秒数，最小 60；0 或 PROBE_AUTO=0 = 只手动刷新
 DEFAULT_MAX_TOKENS=8192
 RETRY_ATTEMPTS=3                  # 一次调用最多重试几次（0 = 不重试），面板可在线改
+MEDIA_MIN_CREDITS=100             # 派生图/视频前要求的最低积分（一张图 × 张数），0 = 不预筛
 GATEWAY_PORT=8080
 ```
 
 ### 哪些配置能在线改、哪些必须重建
 
-面板「配置 → 运行配置」可以**不改 `.env`、不重建容器**直接改这 11 项：
-`RETRY_ATTEMPTS`、`UPSTREAM_TIMEOUT`、`DEFAULT_MAX_TOKENS`、`UPSTREAM_TRANSPORT`、
+面板「配置 → 运行配置」可以**不改 `.env`、不重建容器**直接改这 12 项：
+`RETRY_ATTEMPTS`、`MEDIA_MIN_CREDITS`、`UPSTREAM_TIMEOUT`、`DEFAULT_MAX_TOKENS`、`UPSTREAM_TRANSPORT`、
 `TOKEN_POOL_WATCH`、`PROBE_AUTO`/`PROBE_INTERVAL`、`SIGNIN_AUTO`/`SIGNIN_INTERVAL_HOURS`、
 `METRICS_RETENTION_DAYS`、`EXPOSE_RETIRED_MODELS`。
 
@@ -376,8 +377,9 @@ curl -s -H "X-API-Key: $KEY" $BASE/healthz
 # {"status":"ok","region":"en","pool_size":8,"accounts":[{"label":"aaa@mail.example.com","usable":true,...}]}
 ```
 
-池子里 `usable:true` 的条数就是还能用的账号数；`cooling_for` 是剩余冷却秒数，
-`last_error` 是上次被摘下来的原因。
+池子里 `usable:true` 的条数就是还能**对话**的账号数；`cooling_for` 是对话通道的剩余冷却秒数，
+`media_cooling_for` / `usable_media` 是图片 / 视频通道的同一组数字（两条通道分开记，
+「不能画图」不代表「不能聊天」）；`last_error` 是上次被摘下来的原因。
 
 **② 鉴权生效：无 key 必须 401**
 
@@ -576,7 +578,9 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | 首字很慢（10s+） | M3.1-Flash 强制思考，先出 `thinking` | 正常；或换 `MiniMax-M2.5-highspeed` |
 | `429` / 限流 | 账号额度或并发限制 | 降并发、错峰，或换账号 |
 | `502 upstream error` + 具体 message | 上游返回的业务错误，原文透传 | 按 message 处理 |
-| 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（文案：`plan balance has run out`） | 桌面端充值，重试无效；对话路径会把这个号冷却到次日 00:10 |
+| 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（原文是 `plan balance has run out`，网关会换成中性文案） | 桌面端充值；该号只停图片通道 15 分钟，对话照常。全池都不够时才会把 402 返给你 |
+| 对话 `503 no usable account: every account is out of quota until the daily reset at 00:10` | 全池都撞了 1008，免费额度按天重置 | 等次日重置（网关会自动签到并解除冷却），或加号 / 充值 |
+| 号还有积分但生图一直 402 | 余额够聊天、不够一次生成：1 张 1K 图约 115 credits | 看面板积分列；低于 `MEDIA_MIN_CREDITS`（默认 100）的号会被自动跳过，调低门槛没用，得充值/签到 |
 | 对话 `503 no usable account: every account is out of quota until the daily reset at 00:10` | 全池都撞了 1008，免费额度按天重置 | 等次日重置（网关会自动签到并解除冷却），或加号 / 充值 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单（H3 4s = 320 credits） | 充值，或改用 `MiniMax-Hailuo-2.3` 6s |
 | 视频提交 `503 temporarily unavailable` | **该账号没有视频权限**（按账号给，不是按 key） | 池里只要有一个号能提交就没事，网关自动换号；日志会打印 `cannot use this tool (503)` |

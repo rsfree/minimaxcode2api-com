@@ -347,7 +347,8 @@ async def claim_signin(request: Request) -> dict:
             return {"label": name, "claimed": False, "error": str(exc)[:200]}
 
     results = await asyncio.gather(*(one(t) for t in tokens))
-    # 签到的意义就是回血：签完把这些号从「额度冷却到次日」里放出来。
+    # 签到的意义就是回血：签完把这些号从「额度冷却」里放出来（对话和图片两条通道都解，
+    # 它们花的是同一份积分）。
     for row in results:
         if not row.get("error"):
             token_manager.clear_quota_cooldown(row.get("label"))

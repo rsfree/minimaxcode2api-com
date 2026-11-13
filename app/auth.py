@@ -49,6 +49,21 @@ REASON_AUTH = "auth"
 REASON_QUOTA = "quota"
 REASON_RATE = "rate"
 
+# Two capabilities, two budgets. Chat is metered in small slices of the same
+# credit balance; image/video work is billed per call (one 1K image is ~115
+# credits, one video ~320). An account holding 40 credits therefore answers chat
+# perfectly well and cannot draw a single picture — which is why a 402 on the
+# media path must not take the account out of rotation for chat, and a 402 on
+# chat (balance genuinely gone) does say something about media.
+CAPABILITY_TEXT = "text"
+CAPABILITY_MEDIA = "media"
+
+# How stale a probed balance may be before the pool stops trusting it. The probe
+# sweep is minutes apart; anything older than this is treated as unknown, which
+# errs on the side of *sending the request* rather than starving the pool on old
+# data.
+CREDIT_HINT_TTL = 1800.0
+
 
 def seconds_until_next_day(tz_name: str, buffer_minutes: int = 10) -> float:
     """Seconds until the next midnight in ``tz_name``, plus a settle buffer.
@@ -88,6 +103,12 @@ def next_reset_label(tz_name: str, buffer_minutes: int = 10) -> str:
 class CredentialError(RuntimeError):
     """Raised when no usable credential can be produced."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        # 402 when the pool is healthy but too poor for the request at hand; the
+        # media path turns that into a caller-facing 402 instead of a 502.
+        self.status = status
+
 
 @dataclass
 class Token:
@@ -99,8 +120,19 @@ class Token:
     position: int = 0               # index inside that file (one file may hold an array)
     index: int = 0
     pooled: bool = False            # True only for records read from TOKEN_POOL
+    # Text-channel park. Auth and rate-limit failures are pool-wide and are
+    # written to both this and the media pair below.
     cooldown_until: float = 0.0
     cooldown_reason: str = ""       # auth / quota / rate — see REASON_*
+    # Media-channel park, kept separate because the two budgets are separate:
+    # "cannot afford one image" is not "cannot answer a prompt".
+    media_cooldown_until: float = 0.0
+    media_cooldown_reason: str = ""
+    # Balance as last read by the probe sweep, plus when it was read. Used to
+    # skip accounts that provably cannot pay for the job instead of spending a
+    # 300 s round trip to be told so.
+    credit: float | None = None
+    credit_at: float = 0.0
     last_error: str = ""
     uses: int = 0
     # Console-facing counters. They live on the token so the pool page can show
@@ -118,8 +150,35 @@ class Token:
             return False
         return time.time() * 1000 + skew_ms >= self.expires_at_ms
 
-    def is_cooling(self) -> bool:
-        return self.cooldown_until > time.time()
+    def is_cooling(self, capability: str = CAPABILITY_TEXT) -> bool:
+        until = self.media_cooldown_until if capability == CAPABILITY_MEDIA else self.cooldown_until
+        return until > time.time()
+
+    def cooldown(self, capability: str = CAPABILITY_TEXT) -> tuple[float, str]:
+        """``(until, reason)`` for one capability."""
+        if capability == CAPABILITY_MEDIA:
+            return self.media_cooldown_until, self.media_cooldown_reason
+        return self.cooldown_until, self.cooldown_reason
+
+    def credit_hint(self) -> float | None:
+        """The probed balance, or None when it was never read or is stale."""
+        if self.credit is None:
+            return None
+        if time.time() - self.credit_at > CREDIT_HINT_TTL:
+            return None
+        return self.credit
+
+    def can_afford(self, need: float) -> bool:
+        """Whether a media job costing ``need`` credits may be sent here.
+
+        Unknown balances answer True on purpose: refusing work because the probe
+        has not run yet would starve a pool that is in fact solvent, and one
+        failed call is cheaper than a pool-wide outage.
+        """
+        if need <= 0:
+            return True
+        hint = self.credit_hint()
+        return hint is None or hint >= need
 
     @property
     def short(self) -> str:
@@ -496,10 +555,14 @@ class TokenPool:
             )
         return response.status_code, response.content
 
-    async def _usable(self, token: Token) -> Token | None:
+    async def _usable(
+        self, token: Token, capability: str = CAPABILITY_TEXT, need: float = 0.0
+    ) -> Token | None:
         if token.disabled:
             return None
-        if token.is_cooling():
+        if token.is_cooling(capability):
+            return None
+        if capability == CAPABILITY_MEDIA and not token.can_afford(need):
             return None
         if token.is_expired() and token.refresh_token:
             try:
@@ -515,8 +578,19 @@ class TokenPool:
         return token
 
     # -- public API --------------------------------------------------------
-    async def acquire(self, exclude: set[str] | None = None) -> Token:
-        """Return the next usable account, round-robin."""
+    async def acquire(
+        self,
+        exclude: set[str] | None = None,
+        capability: str = CAPABILITY_TEXT,
+        need: float = 0.0,
+    ) -> Token:
+        """Return the next usable account, round-robin.
+
+        ``capability`` picks which park to respect, and for ``media`` ``need``
+        filters out accounts whose last probed balance cannot pay for the job.
+        That filter is a skip, not a park: the account stays in rotation for
+        chat, and the next probe may lift it back into the media pool.
+        """
         async with self._lock:
             self._ensure()
             if not self._tokens:
@@ -532,12 +606,26 @@ class TokenPool:
                 key = token.access_token or token.label
                 if key in skip:
                     continue
-                usable = await self._usable(token)
+                usable = await self._usable(token, capability, need)
                 if usable is not None:
                     token.uses += 1
                     return token
-            cooling = [t for t in self._tokens if not t.disabled and t.is_cooling()]
-            if cooling and all(t.cooldown_reason == REASON_QUOTA for t in cooling):
+            warm = [
+                t for t in self._tokens
+                if not t.disabled and not t.is_cooling(capability) and t.access_token
+            ]
+            if capability == CAPABILITY_MEDIA and warm:
+                # Every warm account was skipped by the balance filter. Say so
+                # precisely: "all cooling" would send an operator looking for a
+                # quota reset when what is needed is a top-up.
+                best = max((t.credit_hint() or 0.0) for t in warm)
+                raise CredentialError(
+                    f"no account can afford this media job (need {need:.0f} credits, "
+                    f"best probed balance {best:.0f})",
+                    status=402,
+                )
+            cooling = [t for t in self._tokens if not t.disabled and t.is_cooling(capability)]
+            if cooling and all(t.cooldown(capability)[1] == REASON_QUOTA for t in cooling):
                 raise CredentialError(
                     "every account is out of quota until the daily reset at "
                     f"{next_reset_label(settings.signin_timezone)} "
@@ -577,6 +665,7 @@ class TokenPool:
         status: int | None = None,
         reason: str = "",
         next_day: bool = False,
+        capability: str = CAPABILITY_TEXT,
     ) -> None:
         """Temporarily remove an account from rotation.
 
@@ -585,38 +674,78 @@ class TokenPool:
         One-off charges (media, where a single video costs 320 credits) keep the
         short cooldown — being too poor for one expensive job says nothing about
         the text quota.
+
+        ``capability`` scopes a 402 to one budget. A media 402 only proves the
+        account cannot pay for an image; it can still answer chat, so parking the
+        text channel for 15 minutes because of it was silently costing the pool
+        usable capacity. 401 and 429 are different: a dead or throttled
+        credential is dead for both, so those two write to both channels.
         """
-        if next_day and status == 402:
-            delay = seconds_until_next_day(settings.signin_timezone)
-            token.cooldown_reason = REASON_QUOTA
-        elif status == 401:
-            delay = COOLDOWN_UNAUTHORIZED
-            token.cooldown_reason = REASON_AUTH
+        if status == 401:
+            delay, tag = COOLDOWN_UNAUTHORIZED, REASON_AUTH
         elif status == 402:
-            delay = COOLDOWN_EXHAUSTED
-            token.cooldown_reason = REASON_QUOTA
+            tag = REASON_QUOTA
+            delay = (
+                seconds_until_next_day(settings.signin_timezone)
+                if next_day and capability == CAPABILITY_TEXT
+                else COOLDOWN_EXHAUSTED
+            )
         else:
-            delay = COOLDOWN_RATE_LIMITED
-            token.cooldown_reason = REASON_RATE
-        token.cooldown_until = time.time() + delay
-        token.last_error = reason[:200] or f"HTTP {status}"
-        log.warning("parked %s for %.0fs (%s): %s",
-                    token.label or token.short, delay, token.cooldown_reason, token.last_error)
+            delay, tag = COOLDOWN_RATE_LIMITED, REASON_RATE
+
+        until = time.time() + delay
+        message = reason[:200] or f"HTTP {status}"
+        scopes = [CAPABILITY_TEXT, CAPABILITY_MEDIA] if status in {401, 429} else [capability]
+        # Chat's 402 says the balance itself is gone, so images cannot be paid for
+        # either; parking media too saves discovering that 300 s later.
+        if status == 402 and capability == CAPABILITY_TEXT:
+            scopes.append(CAPABILITY_MEDIA)
+        for scope in scopes:
+            if scope == CAPABILITY_MEDIA:
+                token.media_cooldown_until = until
+                token.media_cooldown_reason = tag
+            else:
+                token.cooldown_until = until
+                token.cooldown_reason = tag
+        token.last_error = message
+        log.warning("parked %s for %.0fs (%s/%s): %s",
+                    token.label or token.short, delay, capability, tag, token.last_error)
 
     def clear_quota_cooldown(self, key: str | None) -> bool:
         """Put an account back in rotation after a top-up (sign-in).
 
         Only quota parks are lifted: a dead token or a rate limit has nothing to
-        do with a claim, and clearing it would just produce another 401.
+        do with a claim, and clearing it would just produce another 401. Both
+        channels are cleared — a top-up refills the one balance they share.
         """
         token = self.find(key)
-        if token is None or token.cooldown_reason != REASON_QUOTA:
+        if token is None:
             return False
-        token.cooldown_until = 0.0
-        token.cooldown_reason = ""
-        token.last_error = ""
-        log.info("unparked %s after top-up", token.label or token.short)
-        return True
+        cleared = False
+        if token.cooldown_reason == REASON_QUOTA:
+            token.cooldown_until = 0.0
+            token.cooldown_reason = ""
+            cleared = True
+        if token.media_cooldown_reason == REASON_QUOTA:
+            token.media_cooldown_until = 0.0
+            token.media_cooldown_reason = ""
+            cleared = True
+        if cleared:
+            token.last_error = ""
+            log.info("unparked %s after top-up", token.label or token.short)
+        return cleared
+
+    def set_credit_hint(self, key: str | None, credit: float | None) -> None:
+        """Record the probed balance so the media path can pre-filter on it."""
+        token = self.find(key)
+        if token is None or credit is None:
+            return
+        try:
+            value = float(credit)
+        except (TypeError, ValueError):
+            return
+        token.credit = value
+        token.credit_at = time.time()
 
     # -- console-facing bookkeeping ----------------------------------------
     def note_success(self, token: Token, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
@@ -680,17 +809,33 @@ class TokenPool:
                 1 for t in self._tokens
                 if (not t.disabled) and t.is_cooling() and t.cooldown_reason == REASON_QUOTA
             ),
+            # Media is counted separately: an account parked for chat can still
+            # draw, and vice versa. A single number here is what made the panel
+            # claim an account was unusable when only one budget was empty.
+            "usable_media": sum(
+                1 for t in self._tokens
+                if t.access_token and not t.disabled and not t.is_cooling(CAPABILITY_MEDIA)
+            ),
+            "cooling_media": sum(
+                1 for t in self._tokens if (not t.disabled) and t.is_cooling(CAPABILITY_MEDIA)
+            ),
             "in_flight": sum(t.in_flight for t in self._tokens),
             "pool_watch_seconds": settings.pool_watch if settings.token_pool else 0,
             "accounts": [
                 {
                     "label": t.label or t.short,
                     "usable": bool(t.access_token) and not t.disabled and not t.is_cooling(),
+                    "usable_media": bool(t.access_token) and not t.disabled
+                    and not t.is_cooling(CAPABILITY_MEDIA),
                     "disabled": t.disabled,
                     "expires_at_ms": t.expires_at_ms,
                     "cooling_for": round(max(0.0, t.cooldown_until - now)),
                     "cooldown_until": t.cooldown_until or None,
                     "cooldown_reason": t.cooldown_reason or None,
+                    "media_cooling_for": round(max(0.0, t.media_cooldown_until - now)),
+                    "media_cooldown_until": t.media_cooldown_until or None,
+                    "media_cooldown_reason": t.media_cooldown_reason or None,
+                    "credit": t.credit,
                     "uses": t.uses,
                     "ok": t.ok_count,
                     "fail": t.fail_count,

@@ -201,6 +201,7 @@ class ProbeCache:
                         probe_one, token, label, settings.region, settings.signin_timezone
                     )
                     self._items[label] = item
+                    _publish_balance(item)
                     _release_if_topped_up(item)
 
             await asyncio.gather(*(one(label, token) for label, token in pairs))
@@ -288,6 +289,21 @@ def token_pool_ref():
 # park → probe → park that burns one call every PROBE_INTERVAL.
 _LIFT_INTERVAL = 1800.0
 _last_lift: dict[str, float] = {}
+
+
+def _publish_balance(item: AccountProbe) -> None:
+    """Hand the probed balance to the pool.
+
+    The media path needs it before the request goes out: an account with 40
+    credits can chat for a long time and cannot pay for one image (~115), so
+    without a balance the only way to learn that is a 300 s round trip that
+    ends in a 402. The hint is advisory — a stale or missing value never blocks
+    a request, it only lets a *known* shortfall be skipped.
+    """
+    credit = (item.membership or {}).get("credit")
+    if credit is None:
+        return
+    token_pool_ref().set_credit_hint(item.label, credit)
 
 
 def _release_if_topped_up(item: AccountProbe) -> None:

@@ -830,6 +830,222 @@ def test_membership_payload_is_not_unwrapped() -> None:
         signin.subprocess.run = original
 
 
+def test_a_poor_account_still_answers_chat_but_not_images() -> None:
+    """The two budgets are separate; a 402 on one must not silence the other.
+
+    Image work is billed per call (~115 credits for one 1K image) while chat
+    spends single-digit slices of the same balance, so an account holding 40
+    credits is a perfectly good chat account and a useless image account. The
+    gateway used to conflate them: a media 402 parked the account for
+    everything, and the next chat request was told "out of quota until the daily
+    reset" while that account sat there able to talk.
+    """
+    import time
+
+    from app.auth import (
+        CAPABILITY_MEDIA,
+        CAPABILITY_TEXT,
+        REASON_QUOTA,
+        CredentialError,
+        Token,
+        TokenPool,
+    )
+
+    pool = TokenPool()
+    rich = Token(access_token="tok-rich", label="rich@x", pooled=True)
+    poor = Token(access_token="tok-poor", label="poor@x", pooled=True)
+    pool._tokens = [rich, poor]
+    pool._loaded = True
+
+    # A media 402 parks media only — chat on the same account keeps working.
+    pool.park(rich, 402, "insufficient balance (1008)", capability=CAPABILITY_MEDIA)
+    assert rich.is_cooling(CAPABILITY_MEDIA) is True
+    assert rich.is_cooling(CAPABILITY_TEXT) is False
+    assert rich.cooldown_reason == ""
+    assert rich.media_cooldown_reason == REASON_QUOTA
+    assert rich.media_cooldown_until - time.time() <= 901, "media parks are short, not daily"
+    chosen = {
+        asyncio.run(pool.acquire(capability=CAPABILITY_TEXT)).label for _ in range(4)
+    }
+    assert chosen == {"rich@x", "poor@x"}, "chat must still reach both accounts"
+
+    # A chat 402 does mean the balance is gone: both channels go down.
+    fresh = Token(access_token="tok-f", label="f@x", pooled=True)
+    solo = TokenPool()
+    solo._tokens = [fresh]
+    solo._loaded = True
+    solo.park(fresh, 402, "1008", next_day=True)
+    assert fresh.is_cooling(CAPABILITY_TEXT) is True
+    assert fresh.is_cooling(CAPABILITY_MEDIA) is True
+    assert fresh.cooldown_until - time.time() > 3600
+
+    # Auth and rate limits are pool-wide: one dead credential is dead for both.
+    dead = Token(access_token="tok-d", label="d@x", pooled=True)
+    solo._tokens = [dead]
+    solo.park(dead, 401, "invalid access token")
+    assert dead.is_cooling(CAPABILITY_TEXT) is True
+    assert dead.is_cooling(CAPABILITY_MEDIA) is True
+
+    # A top-up lifts both, because they share one balance. A 401 is not a quota
+    # park, so clearing must refuse it.
+    assert solo.clear_quota_cooldown("d@x") is False
+
+
+def test_media_prefilter_uses_the_probed_balance() -> None:
+    """An account that provably cannot pay is skipped, not parked.
+
+    The skip has to be scoped to media: the same account keeps serving chat. And
+    an unknown balance must let the request through — refusing work because the
+    probe has not run yet would turn a warm-up into an outage.
+    """
+    from app.auth import (
+        CAPABILITY_MEDIA,
+        CAPABILITY_TEXT,
+        CredentialError,
+        Token,
+        TokenPool,
+    )
+
+    pool = TokenPool()
+    poor = Token(access_token="tok-p", label="poor@x", pooled=True)
+    rich = Token(access_token="tok-r", label="rich@x", pooled=True)
+    pool._tokens = [poor, rich]
+    pool._loaded = True
+    pool.set_credit_hint("poor@x", 40)
+    pool.set_credit_hint("rich@x", 400)
+
+    # 100 credits needed (one 1K image): only the solvent account is offered,
+    # even across several round-robin laps.
+    for _ in range(5):
+        assert asyncio.run(
+            pool.acquire(capability=CAPABILITY_MEDIA, need=100)
+        ).label == "rich@x"
+
+    # Chat ignores the balance: both accounts are eligible.
+    labels = {
+        asyncio.run(pool.acquire(capability=CAPABILITY_TEXT)).label for _ in range(6)
+    }
+    assert labels == {"poor@x", "rich@x"}
+    assert poor.is_cooling(CAPABILITY_TEXT) is False, "a skip must not become a park"
+
+    # Nobody can afford it: a 402 with a reason, not a 502 and not "cooling".
+    try:
+        asyncio.run(pool.acquire(capability=CAPABILITY_MEDIA, need=5000))
+    except CredentialError as exc:
+        assert exc.status == 402, exc
+        assert "afford" in str(exc) and "5000" in str(exc), exc
+    else:
+        raise AssertionError("expected CredentialError(402) when no account can pay")
+
+    # Unknown balance (probe never ran, or the probe failed) = allowed to try.
+    blind = TokenPool()
+    unknown = Token(access_token="tok-u", label="u@x", pooled=True)
+    blind._tokens = [unknown]
+    blind._loaded = True
+    assert asyncio.run(
+        blind.acquire(capability=CAPABILITY_MEDIA, need=100)
+    ).label == "u@x"
+    assert unknown.credit_hint() is None
+
+
+def test_image_cost_floor_scales_with_the_batch() -> None:
+    """`n` images multiply the floor, and 0 turns the pre-filter off."""
+    from app import media as media_mod
+    from app.config import settings
+
+    original = settings.media_min_credits
+    try:
+        settings.media_min_credits = 100
+        assert media_mod.image_credit_need(1) == 100
+        assert media_mod.image_credit_need(4) == 400
+        assert media_mod.image_credit_need(0) == 100, "a request always bills at least one image"
+        settings.media_min_credits = 0
+        assert media_mod.image_credit_need(3) == 0
+    finally:
+        settings.media_min_credits = original
+
+
+def test_image_request_lands_on_a_solvent_account() -> None:
+    """End to end: two poor accounts, one solvent, one image request.
+
+    The pre-filter has to apply inside the real dispatch loop, not just in
+    ``acquire``: this is the path a caller's picture actually takes.
+    """
+    import time
+    from unittest.mock import patch
+
+    from app import upstream as upstream_mod
+    from app.auth import Token, token_manager
+
+    tokens = [Token(access_token=f"tok{i}", label=f"t{i}@x", pooled=True) for i in range(3)]
+    for token, credit in zip(tokens, (40.0, 60.0, 400.0)):
+        token.credit = credit
+        token.credit_at = time.time()
+    served: list[str] = []
+
+    class Resp:
+        status_code = 200
+        headers: dict = {}
+        account = ""
+
+        async def aread(self):
+            return b'{"code":0,"message":"ok"}'
+
+        async def aclose(self):
+            pass
+
+    async def fake_dispatch(url, payload, headers, stream, timeout=None):
+        served.append(headers.get("authorization", ""))
+        return Resp()
+
+    async def run():
+        with patch.object(upstream_mod.upstream, "startup", return_value=None), \
+             patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
+             patch.object(token_manager, "_tokens", tokens), \
+             patch.object(token_manager, "_loaded", True):
+            return await upstream_mod.upstream.mcp("image_synthesize", {}, need_credits=100)
+
+    body = asyncio.run(run())
+    assert body["code"] == 0
+    assert served == ["Bearer tok2"], f"the 40/60-credit accounts must not be tried, got {served}"
+
+
+def test_probe_publishes_a_balance_the_media_path_can_use() -> None:
+    """The probe is the only reader of the balance; the pool needs it too."""
+    import time
+
+    from app import probe as probe_mod
+    from app.auth import CREDIT_HINT_TTL, Token, TokenPool
+
+    pool = TokenPool()
+    token = Token(access_token="tok", label="a@x", pooled=True)
+    pool._tokens = [token]
+    pool._loaded = True
+
+    original = probe_mod.token_pool_ref
+    probe_mod.token_pool_ref = lambda: pool
+    try:
+        probe_mod._publish_balance(
+            probe_mod.AccountProbe(label="a@x", membership={"credit": 399.99})
+        )
+        assert token.credit_hint() == 399.99
+        assert token.can_afford(115) is True
+        assert token.can_afford(500) is False
+
+        # A stale reading is treated as unknown: send the request rather than
+        # starve the pool on numbers that may be hours old.
+        token.credit_at = time.time() - CREDIT_HINT_TTL - 60
+        assert token.credit_hint() is None
+        assert token.can_afford(500) is True
+
+        # A probe that failed to read a balance must not publish a fake one.
+        token.credit = None
+        probe_mod._publish_balance(probe_mod.AccountProbe(label="a@x", membership={}))
+        assert token.credit is None
+    finally:
+        probe_mod.token_pool_ref = original
+
+
 def test_quota_park_lasts_until_reset() -> None:
     """1008 is a *daily* allowance: parking for 15 minutes just buys another fail.
 
@@ -1688,7 +1904,7 @@ def test_business_402_rotates_to_a_fresh_account() -> None:
 
     pool = [Token(access_token=f"tok{i}", label=f"t{i}@x") for i in range(3)]
     state = {"calls": 0}
-    parked: list[int] = []
+    parked: list[tuple[int, str]] = []
 
     class Resp:
         status_code = 200
@@ -1709,7 +1925,7 @@ def test_business_402_rotates_to_a_fresh_account() -> None:
             return Resp(b'{"code":402,"message":"weekly limit reached"}')
         return Resp(b'{"code":0,"message":"ok","success_items":[]}')
 
-    async def fake_acquire(exclude=None):
+    async def fake_acquire(exclude=None, capability="text", need=0.0):
         exclude = exclude or set()
         for token in pool:
             if token.access_token not in exclude:
@@ -1721,7 +1937,8 @@ def test_business_402_rotates_to_a_fresh_account() -> None:
              patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
              patch.object(upstream_mod.token_manager, "acquire", fake_acquire), \
              patch.object(upstream_mod.token_manager, "park",
-                          lambda token, status, message: parked.append(status)), \
+                          lambda token, status, message, capability="text", **kw:
+                          parked.append((status, capability))), \
              patch.object(upstream_mod.token_manager, "_tokens", pool), \
              patch.object(upstream_mod.settings, "retry_attempts", 3):
             return await upstream_mod.upstream.mcp("image_synthesize", {})
@@ -1729,7 +1946,7 @@ def test_business_402_rotates_to_a_fresh_account() -> None:
     body = asyncio.run(main())
     assert body["code"] == 0
     assert state["calls"] == 2, f"402 must walk to the next account, made {state['calls']}"
-    assert parked == [402], f"the drained account must be parked, got {parked}"
+    assert parked == [(402, "media")], f"the drained account must be parked for media only, got {parked}"
 
 
 def test_probe_lifts_a_quota_park_once_the_balance_is_back() -> None:
@@ -2043,6 +2260,11 @@ def main() -> None:
         test_image_model_mapping,
         test_ark_inline_image_is_uploaded,
         test_image_accepts_multiple_references,
+        test_a_poor_account_still_answers_chat_but_not_images,
+        test_media_prefilter_uses_the_probed_balance,
+        test_image_cost_floor_scales_with_the_batch,
+        test_image_request_lands_on_a_solvent_account,
+        test_probe_publishes_a_balance_the_media_path_can_use,
         test_probe_lifts_a_quota_park_once_the_balance_is_back,
         test_business_402_rotates_to_a_fresh_account,
         test_ark_image_endpoint_contract,

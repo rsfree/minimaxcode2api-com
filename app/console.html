@@ -1223,7 +1223,7 @@ function renderAccounts() {
   let list = rows.filter((a) => {
     if (q && !(a.label || "").toLowerCase().includes(q)) return false;
     if (accState.filter === "usable" && !a.usable) return false;
-    if (accState.filter === "cooling" && !(a.cooling_for > 0)) return false;
+    if (accState.filter === "cooling" && !(a.cooling_for > 0) && !(a.media_cooling_for > 0)) return false;
     if (accState.filter === "disabled" && !a.disabled) return false;
     return true;
   });
@@ -1269,6 +1269,17 @@ function renderAccounts() {
       : a.usable ? '<span class="tag ok">可用</span>'
       : cooling ? '<span class="tag warn"' + (coolWhy ? ' title="' + esc(coolWhy) + '"' : "") + ">冷却 " + coolText + "</span>"
       : '<span class="tag bad">不可用</span>';
+    // 图片/视频走的积分是另一本账：一张 1K 图约 115 积分，文本一轮只要个位数，
+    // 所以「积分不够生成」不等于「这个号废了」。只有图片通道被停时才显示这一行，
+    // 免得每行都多一个标记。
+    const mediaCool = (a.media_cooling_for || 0) > 0;
+    const mediaWhy = a.media_cooldown_reason === "quota" ? "积分不够一次生成（文本仍可用）"
+      : a.media_cooldown_reason === "auth" ? "凭证失效，等网关自动续期"
+      : a.media_cooldown_reason === "rate" ? "被上游限流" : "";
+    const mediaTag = mediaCool
+      ? '<div style="margin-top:4px"><span class="tag mute" style="font-size:11px" title="' +
+        esc(mediaWhy) + '">图 ' + dur(a.media_cooling_for) + "</span></div>"
+      : "";
     // 余额来自会员接口，0 与负数都是真实值；只有「没采到」才是破折号。
     const bal = a.balance || null;
     const credit = bal && bal.credit != null ? bal.credit : null;
@@ -1287,7 +1298,7 @@ function renderAccounts() {
     return '<tr class="' + cls + '"><td class="mark"><i></i></td>' +
       '<td class="who"><div class="nm"' + err + ">" + esc(a.label || "—") + "</div>" +
       '<div class="id">' + (a.last_error ? esc(String(a.last_error).slice(0, 42)) : "expires " + (a.expires_at_ms ? new Date(a.expires_at_ms).toLocaleDateString("zh-CN") : "—")) + "</div></td>" +
-      "<td>" + tag + "</td>" +
+      "<td>" + tag + mediaTag + "</td>" +
       '<td class="num">' + cr + "</td>" +
       '<td class="num">' + (a.ok || 0) + " / " + (a.fail ? '<span style="color:var(--bad)">' + a.fail + "</span>" : "0") +
         (a.attempts_total != null && a.attempts_total > (a.ok || 0) + (a.fail || 0)
@@ -1945,7 +1956,8 @@ function renderDiagFacts(d) {
     ["运行", dur(s.uptime_seconds)],
     ["区域", s.region + (s.proxy ? " · proxy" : "") + " · " + s.transport],
     ["服务器时间", s.server_time],
-    ["号池", (p.usable || 0) + "/" + (p.size || 0) + " 可用 · 冷却 " + (p.cooling || 0) +
+    ["号池", (p.usable || 0) + "/" + (p.size || 0) + " 可对话 · 冷却 " + (p.cooling || 0) +
+      " · 图片可用 " + (p.usable_media == null ? "—" : p.usable_media) +
       " · 禁用 " + (p.disabled || 0) + " · 在途 " + (p.in_flight || 0)],
     ["历史", (st.mode || "?") + " · " + num(st.rows || 0) + " 行 · 队列 " + (st.queued || 0) +
       (st.error ? " · 错误 " + st.error : "")],
