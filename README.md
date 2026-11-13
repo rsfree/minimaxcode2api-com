@@ -28,23 +28,31 @@
 
 ### 可用模型（清单直接取自上游 provider config）
 
-`GET https://agent.minimax.io/mavis/api/v1/models` 是这个通道自己的权威清单，白名单里只有
-`MiniMax-M3.1-Flash` 和 `MiniMax-M3`（512K 上下文 / 128K 输出，输入支持文本 + 图片 + 视频）。
-M2.5 / M2.7 / M2 / M2.1 已不在白名单，但上游仍然服务（实测都能出结果），所以保留为 `legacy`。
+`GET https://agent.minimax.io/mavis/api/v1/models` 是这个通道自己的权威清单：`providers[0].config`
+里的 `whitelist` 和 `model_order` **都只有两个** —— `MiniMax-M3.1-Flash` 和 `MiniMax-M3`
+（512K 上下文 / 128K 输出，输入支持文本 + 图片 + 视频）。两者的 `context_window_options` 还带一个
+`1000000`（标注 `higher_usage`），网关不透传该选项，所以对外按 512K 报。
+M2.7 / M2.5 已不在白名单，但**实测仍返回 200 和真实补全**，保留为 `legacy`；
+M2 / M2.1 是真的下线了（`404 The model "MiniMax-M2" is no longer available. (2069)`），默认不列出。
 
-| 模型 | 类型 | 上下文 | 最大输出 | 输入 | 思考 | 备注 |
+| 模型 | 类型 | 上下文 | 最大输出 | 输入 | 思考 | 实测结果 |
 |---|---|---|---|---|---|---|
-| `MiniMax-M3.1-Flash` | 对话 | 512,000 | 128,000 | 文本/图片/视频 | **强制开启** | 默认模型、客户端首选 |
-| `MiniMax-M3` | 对话 | 512,000 | 128,000 | 文本/图片/视频 | 可切换 | 唯一能关思考的大上下文模型 |
-| `MiniMax-M2.7` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | legacy，上游仍可用 |
-| `MiniMax-M2.5` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | legacy，上游仍可用 |
-| `MiniMax-M2` / `M2.1` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | legacy，上游仍可用 |
+| `MiniMax-M3.1-Flash` | 对话 | 512,000（另有 1M 选项） | 128,000 | 文本/图片/视频 | **强制开启** | `200`，白名单 + 默认 |
+| `MiniMax-M3` | 对话 | 512,000（另有 1M 选项） | 128,000 | 文本/图片/视频 | 可切换 | `200`，白名单 |
+| `MiniMax-M2.7` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | `200`，非白名单 |
+| `MiniMax-M2.5` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | `200`，非白名单 |
+| `MiniMax-M2` / `M2.1` / `M1` / `Text-01` | 对话 | — | — | — | — | `404 ... no longer available (2069)` |
 | `minimax-image` | 图像 | — | — | 文本/图片 | — | `POST /v1/images/generations` |
 | `minimax-speech` / `minimax-music` | 语音 | — | — | 文本 | — | `/v1/audio/speech`、`/v1/music/generations` |
-| `MiniMax-H3` / `MiniMax-Hailuo-2.3` | 视频 | — | — | 文本/图片 | — | `POST /v1/videos/generations` |
+| `MiniMax-H3` / `MiniMax-H3-Max` / `MiniMax-Hailuo-2.3` | 视频 | — | — | 文本/图片 | — | `POST /v1/videos/generations` |
 
-`GET /v1/models` 默认就把 **13 个** 全列出来（8 对话 + 5 多模态），每条带 `type`、`context_length`、
+`GET /v1/models` 默认列出 **12 个**（6 对话 + 6 多模态），每条带 `type`、`context_length`、
 `capabilities`、`legacy`；只要对话模型就加 `?include_media=0`。
+
+**这就是这条通道的全部模型面**：图像、语音、音乐三条链路的上游工具**没有 `model` 参数**
+（图像只有 `prompt` / `reference_images` / `aspect_ratio` / `area`，TTS 只有 `voice_id`），
+模型由后端默认路由；唯一能在参数层换模型的是视频。想用 `image-01`、`image-01-live`、
+`MiniMax-H3-Image-Highspeed` 这些，只能直连开放平台 `POST /v1/image_generation` 自己带 `model`。
 
 **调试时怎么选**：
 
@@ -628,21 +636,26 @@ curl -s "http://127.0.0.1:8080/v1/videos/generations/462436026450282?model=MiniM
 # → {"status":"running", ...} → {"status":"succeeded","video_url":"https://..."}
 ```
 
-| 模型 | 时长 | 分辨率 | 特点 |
-|---|---|---|---|
-| `MiniMax-H3` | 4–15 秒（整数） | `768P` / `2K` | 原生同步音频，支持首尾帧 + 多模态参考（图 1-9、视频 1-3、音频 1-3） |
-| `MiniMax-Hailuo-2.3` | 仅 `6` 或 `10` 秒 | `768P` / `1080P` | 只吃一张首帧图，便宜 |
+| 模型 | 时长 | 分辨率 | 计费 | 特点 |
+|---|---|---|---|---|
+| `MiniMax-H3` | 4–15 秒（整数） | `768P` / `2K`（默认 2K） | 4 秒实测报价 **320 credits** | 质量最好，原生同步音频，支持首尾帧 + 多模态参考（图 1-9、视频 1-3、音频 1-3） |
+| `MiniMax-H3-Max` | 5–15 秒（整数） | `480P` / `768P`（**不支持 2K**） | 5 秒 480P 实测报价 **250 credits** | H3 的高速版，约 20 秒出片 |
+| `MiniMax-Hailuo-2.3` | 仅 `6` 或 `10` 秒 | `768P` / `1080P`（1080P 只支持 6 秒） | 走 legacy Token Plan 额度 | 只吃一张首帧图，打包账号实际能跑的就是这条（也是默认模型） |
+
+H3 和 H3-Max **不吃 legacy Token Plan 额度**，只从 M Plan 周额度或账号积分扣；不够就回
+`402 the remaining M Plan weekly limit and account credits cannot cover this MiniMax-H3 video generation ...
+this task costs 250 credits`。所以免费号上想跑 H3 只能靠账号里剩下的积分。
 
 请求字段：
 
 | 字段 | 说明 |
 |---|---|
-| `prompt` | 必填，≤7000 字符 |
-| `image` | 首帧图（公网 URL）。MiniMax-Hailuo-2.3 只接受一张 |
-| `last_frame_image` | 尾帧图，**仅 H3** |
-| `reference_images` / `reference_videos` / `reference_audios` | **仅 H3**，公网 URL 数组 |
-| `ratio` | `21:9 16:9 4:3 1:1 3:4 9:16 adaptive`；H3 纯文本模式不接受 `adaptive` |
-| `resolution` | H3 默认 `2K`；Hailuo 默认 `768P`（10 秒只能 768P） |
+| `prompt` | 必填，H3 / H3-Max ≤7000 字符，Hailuo-2.3 ≤3000 字符（H3 系还会驱动原生音轨） |
+| `image` | 首帧图（公网 URL）。Hailuo-2.3 只接受一张；H3 系可用 `reference_type: first_frame / last_frame` |
+| `last_frame_image` | 尾帧图，**仅 H3 / H3-Max**，且必须先给首帧 |
+| `reference_images` / `reference_videos` / `reference_audios` | **仅 H3**，公网 URL 数组（图 1-9、视频 1-3、音频 1-3，合计 ≤12），不能与首尾帧混用 |
+| `ratio` | `21:9 16:9 4:3 1:1 3:4 9:16 adaptive`，**仅 H3 / H3-Max**；纯文本模式必须给具体比例，不接受 `adaptive` |
+| `resolution` | H3：`768P` / `2K`（默认 2K）；H3-Max：`480P` / `768P`（默认 768P，**无 2K**）；Hailuo：默认 `768P`，`1080P` 仅 6 秒 |
 
 #### 多账号池下的两个坑（网关已处理）
 

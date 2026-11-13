@@ -6,11 +6,13 @@ The authoritative source is the channel's own provider config::
     -> providers[0].config.whitelist / model_order / models
 
 At the time of writing it whitelists exactly ``MiniMax-M3.1-Flash`` and
-``MiniMax-M3``, both 512K context / 128K output, text + image + video input.
-The M2.5/M2.7 family is no longer in that whitelist but the upstream still
-serves it, so it stays listed (``legacy=True``) to keep existing clients
-working. Retired ids (M2, M2.1) answer with an empty completion and are only
-exposed with ``EXPOSE_RETIRED_MODELS=1``.
+``MiniMax-M3``, both 512K context / 128K output, text + image + video input,
+with a 1M context option the gateway does not forward. The M2.5/M2.7 family is
+no longer in that whitelist but the upstream still serves it (verified: HTTP 200
+with real completions), so it stays listed (``legacy=True``) to keep existing
+clients working. M2 and M2.1 are genuinely gone — they answer
+``404 The model ... is no longer available. (2069)`` — and are only exposed
+with ``EXPOSE_RETIRED_MODELS=1``.
 """
 
 from __future__ import annotations
@@ -126,6 +128,7 @@ MODELS: tuple[Model, ...] = (
         vision=False,
         thinking="switchable",
         legacy=True,
+        retired=True,
         **_CHAT,
     ),
     Model(
@@ -135,6 +138,7 @@ MODELS: tuple[Model, ...] = (
         vision=False,
         thinking="switchable",
         legacy=True,
+        retired=True,
         **_CHAT,
     ),
 )
@@ -172,6 +176,15 @@ MEDIA_MODELS: tuple[Model, ...] = (
     ),
     Model(
         id="MiniMax-H3",
+        owned_by="minimax",
+        context_window=0,
+        max_output=0,
+        vision=True,
+        thinking="off",
+        kind="video",
+    ),
+    Model(
+        id="MiniMax-H3-Max",
         owned_by="minimax",
         context_window=0,
         max_output=0,

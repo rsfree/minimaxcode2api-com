@@ -53,10 +53,17 @@ def test_model_catalogue_complete() -> None:
         "MiniMax-M2.7-highspeed",
         "MiniMax-M2.5",
         "MiniMax-M2.5-highspeed",
-        "MiniMax-M2",
-        "MiniMax-M2.1",
     ):
         assert name in chat and chat[name].legacy
+
+    # M2 / M2.1 answer 404 "no longer available (2069)": listing them would
+    # hand a client a model that can only fail.
+    from app.catalog import MODELS
+
+    all_ids = {model.id: model for model in MODELS}
+    for name in ("MiniMax-M2", "MiniMax-M2.1"):
+        assert all_ids[name].retired
+        assert name not in chat
 
     # Multimodal entries exist for every media endpoint, with the right kind.
     assert {"minimax-image", "minimax-speech", "minimax-music"} <= set(media_models)
@@ -67,6 +74,30 @@ def test_model_catalogue_complete() -> None:
     row = chat["MiniMax-M3"].to_openai()
     assert row["type"] == "chat" and row["context_length"] == 512_000
     assert row["capabilities"]["vision"] is True
+
+
+def test_video_model_enum_matches_upstream() -> None:
+    """The upstream tool schema is the authority on which video models exist.
+
+    ``GET {mcp}/tools`` declares exactly three, with per-model duration and
+    resolution rules. H3-Max was missing from this gateway, so asking for the
+    fast variant returned a 400 the upstream would have accepted.
+    """
+    from app import media
+
+    assert media.VIDEO_MODELS == ("MiniMax-H3", "MiniMax-H3-Max", "MiniMax-Hailuo-2.3")
+    assert media.normalize_video_model("h3-max") == "MiniMax-H3-Max"
+    assert media.normalize_video_model("MINIMAX-H3-MAX") == "MiniMax-H3-Max"
+    assert media.normalize_video_model("h3") == "MiniMax-H3"
+    assert media.normalize_video_model(None) == media.DEFAULT_VIDEO_MODEL
+
+    try:
+        media.normalize_video_model("H4")
+    except media.MediaError as exc:
+        assert exc.status == 400
+        assert "5-15s" in exc.message, exc.message
+    else:
+        raise AssertionError("an unknown video model must be rejected")
 
 
 def test_system_and_text() -> None:
@@ -1071,6 +1102,7 @@ def main() -> None:
     tests = [
         test_model_aliases,
         test_model_catalogue_complete,
+        test_video_model_enum_matches_upstream,
         test_system_and_text,
         test_tool_roundtrip,
         test_response_translation,

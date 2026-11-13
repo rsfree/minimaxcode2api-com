@@ -45,7 +45,13 @@ SPEECH_TIMEOUT = 300.0
 MUSIC_TIMEOUT = 600.0
 VOICES_TIMEOUT = 60.0
 
-VIDEO_MODELS = ("MiniMax-H3", "MiniMax-Hailuo-2.3")
+# The upstream tool's `model` enum, verbatim:
+#   MiniMax-H3        4–15s, 768P or 2K        — best quality, paid
+#   MiniMax-H3-Max    5–15s, 480P or 768P      — fast variant (~20s), paid
+#   MiniMax-Hailuo-2.3 6 or 10s, 768P (1080P only at 6s) — the free-ish default
+# H3 / H3-Max bill against the M Plan weekly limit and answer 402 with a long
+# explanation when that is spent; Hailuo is what the bundled accounts can run.
+VIDEO_MODELS = ("MiniMax-H3", "MiniMax-H3-Max", "MiniMax-Hailuo-2.3")
 DEFAULT_VIDEO_MODEL = "MiniMax-Hailuo-2.3"
 
 # Aspect ratios the image synthesiser accepts, as width:height prime pairs.
@@ -219,9 +225,15 @@ def normalize_video_model(model: str | None) -> str:
     # Accept the short aliases the docs use.
     if lowered in {"h3", "h3.0", "minimax-h3"}:
         return "MiniMax-H3"
+    if lowered in {"h3-max", "h3max", "minimax-h3-max", "h3-max-fast"}:
+        return "MiniMax-H3-Max"
     if lowered in {"h2.3", "hailuo", "hailuo-2.3", "minimax-hailuo-2.3"}:
         return "MiniMax-Hailuo-2.3"
-    raise MediaError(400, f"unknown video model {model!r}; use one of {', '.join(VIDEO_MODELS)}")
+    raise MediaError(
+        400,
+        f"unknown video model {model!r}; use one of {', '.join(VIDEO_MODELS)} "
+        "(H3: 4-15s, 768P/2K; H3-Max: 5-15s, 480P/768P; Hailuo-2.3: 6/10s, 768P/1080P)",
+    )
 
 
 async def video_submit(payload: dict, account: str | None = None) -> tuple[dict, str]:
