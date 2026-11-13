@@ -596,8 +596,24 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 | `response_format` | `url`（默认，直接给 CDN 链接）或 `b64_json`（网关下载后转 base64） |
 
 ⚠️ **实测发现**：返回的 URL 后缀是 `.png`、CDN 的 `Content-Type` 也是 `image/png`，
-但**实际字节是 JPEG**（`ff d8 ff e1`，带 AIGC 水印 Exif）。这是上游工具的行为，网关无法改。
+但**实际字节是 JPEG**（`ff d8 ff e1`，带 AIGC 水印 Exif）。这是上游工具的行为，网关无法改——
+对比过：传不传 `output_file` 完全一样，不是我们给的文件名带偏的。
 按扩展名或 Content-Type 判断格式的程序会被误导——**靠文件头判断**。
+
+**参数边界与成本（每条都实跑过）**：
+
+| 传入 | 上游行为 | 实际输出 |
+|---|---|---|
+| `resolution=1K` + `aspect_ratio=1:1` | 接受 | `1024×1024`（≈1.0 MP），411 KB |
+| `resolution=4K` + `aspect_ratio=16:9` | 接受 | `5504×3072`（≈16.9 MP），8.5 MB |
+| `aspect_ratio=3:2` | schema 的 enum 只列了 `1:1 16:9 9:16 4:3 3:4 21:9`，**但服务端不校验**，照样受理 | `1264×848` |
+| 额外塞 `model=image-01` | **静默忽略**，`code: 0` 正常出图 | 仍是 `1024×1024`，模型没变 |
+| `output_file=slot_0.png` | 只在回包 `output_file` 字段里回显 | 命名与格式都不受影响 |
+
+`resolution` 是**面积档**不是短边：1K≈1024²、2K≈2048²、4K≈4096²。
+
+**成本：一张 1K 图 = 115 credits**（实测某号 277.4 → 162.4）。4K 是 1K 的 17 倍面积，价格更高；
+余额不够时上游直接回 `402`，文案里会出现 `plan balance has run out`。
 
 #### 这里的「模型名」是什么
 
@@ -768,7 +784,7 @@ flowchart LR
 | `404 ... no longer available (2069)` | 模型已下线（M2 / M2.1） | 换 M2.5 及以上 |
 | `503` on `/healthz` | 没有可用凭证 | 用 `python -m app.login` 登录，或挂载 `auth.json` |
 | 流式到一半断 | 反代缓冲或读超时 | nginx 关 `proxy_buffering`，`proxy_read_timeout` 拉长 |
-| 生图 / TTS 返回 `402` | 账号额度耗尽，文案里会写 `plan balance has run out` | 桌面端充值；**重试无效**。注意这条**与 credits 余额无关**：实测一个余额 184.69 的号生图照样 402——媒体走的是 plan 的日额度，控制台那个积分数字看不出它还剩几张图 |
+| 生图 / TTS 返回 `402` | 账号额度耗尽，文案里会写 `plan balance has run out` | 桌面端充值；**重试无效**。生图真实成本：**一张 1K 图扣 115 credits**（实测 277.4 → 162.4），4K 更贵；控制台积分归零的号最先报这个 |
 | 视频查询 `503` 但 `status: succeeded` | 任务渲染完成，服务端没备好文件交付 | 隔几分钟轮询同一 `task_id`；不要重新提交（会再扣一次） |
 | 视频提交 `503 temporarily unavailable` | **该账号没有视频权限**，不是上游故障 | 仓库池里有别的号能提交就行，网关会自动换号；全池都没有就充 M Plan |
 | 视频查询 `404 does not belong to the current caller` | 提交和查询用到了不同账号；或网关重启丢了映射 | 用同一个网关实例查；重启后再查只能重新提交 |
