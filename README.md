@@ -42,7 +42,7 @@ M2 / M2.1 是真的下线了（`404 The model "MiniMax-M2" is no longer availabl
 | `MiniMax-M2.7` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | `200`，非白名单 |
 | `MiniMax-M2.5` / `-highspeed` | 对话 | 204,800 | 131,072 | 文本 | 可切换 | `200`，非白名单 |
 | `MiniMax-M2` / `M2.1` / `M1` / `Text-01` | 对话 | — | — | — | — | `404 ... no longer available (2069)` |
-| `minimax-image` | 图像 | — | — | 文本/图片 | — | `POST /v1/images/generations` |
+| `minimax-h3-image`（别名 `minimax-image` / `image-01`） | 图像 | — | — | 文本/图片 | — | `POST /v1/images/generations` |
 | `minimax-speech` / `minimax-music` | 语音 | — | — | 文本 | — | `/v1/audio/speech`、`/v1/music/generations` |
 | `MiniMax-H3` / `MiniMax-H3-Max` / `MiniMax-Hailuo-2.3` | 视频 | — | — | 文本/图片 | — | `POST /v1/videos/generations` |
 
@@ -656,7 +656,7 @@ POST /v1/images/generations
 curl -s http://127.0.0.1:8080/v1/images/generations \
   -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
   -d '{
-    "model": "doubao-seedream-5-5-261028",
+    "model": "minimax-h3-image",
     "prompt": "充满活力的特写编辑肖像，工作室灯光效果强烈",
     "size": "2K",
     "output_format": "png",
@@ -667,7 +667,7 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 
 ```json
 {
-  "model": "doubao-seedream-5-5-261028",
+  "model": "minimax-h3-image",
   "created": 1794452319,
   "data": [
     {
@@ -688,7 +688,7 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 
 | 字段 | 网关行为 |
 |---|---|
-| `model` | **必填项不校验，取值一律忽略**：回显到响应里，没传填 `minimax-image` |
+| `model` | 只认 `minimax-h3-image` 及其别名（`minimax-image` / `image-01` / `h3-image` 等，大小写与下划线不敏感）；缺省即该值，响应回显规范名；**其它值 → `400 unknown image model`** |
 | `prompt` | 必填；缺失或空白 → `400 prompt is required` |
 | `image` | 支持 `string` 或 `string[]`。公网 URL 直传；`data:image/...;base64,` 先上传到通道 CDN 再喂给工具，裸 base64 也认 |
 | `size` | 档位 `1K` / `1.5K` / `2K` / `3K` / `4K`，或 `宽x高`。**是建议值**，换算见下 |
@@ -715,15 +715,29 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 
 | 传入 | 处理 |
 |---|---|
-| `1K` → `4K` | 直接用 |
+| `1K` / `2K` / `4K` | 直接用 |
 | `1.5K` | 落到 `2K`（面积更近） |
 | `3K` | 落到 `4K`（面积更近） |
-| `宽x高` | 先按比例吸附到最近的宽高比，再按面积（`2 MP` / `8 MP` 为界）选档 |
+| `宽x高` | 先按比例吸附到最近的宽高比（9 种），再按面积选档：≤ `2×1024²`（2.1 MP）→ `1K`；≤ `2×2048²`（8.4 MP）→ `2K`；再大 → `4K` |
 | 非法值 | `400 invalid size` |
 
+**没把 `宽x高` 直接透传给上游**，原因实测过（同一 prompt，2026-11-13）：
+
+| 传给上游 | 实际输出 |
+|---|---|
+| `width=1280, height=720`（不给比例/档位） | `1408×768` |
+| `width=3840, height=2160` + `resolution=1K` + `aspect_ratio=1:1` | `1024×1024` ← 比例/档位**完胜**，WxH 被忽略 |
+| `resolution=2K` + `aspect_ratio=16:9` | `2752×1536` |
+| `resolution=4K` + `aspect_ratio=16:9` | `5504×3072` |
+
+上游确实收 `width`/`height`，但只要有 `resolution`/`aspect_ratio` 它们就不起作用，单独用又会吸附到
+它自己的预设尺寸。所以网关统一换算成「比例 + 档位」，同一诉求只有一个答案：
+`size=1280x720` 恒等于 `16:9 @ 1K` → `1376×768`，而不是时好时坏的 1408×768。
+
+注意 `3840×2160` 只有 8.29 MP，按面积落在 **2K**（4K 档从 16.9 MP 起）。要 4K 就写
+`size=4K` 或 `resolution=4K`，别指望像素值等于档位。
+
 **返回值才是真相**：`data[].size` 和 `data[].output_format` 由网关读取图片字节得出，不是照抄请求。
-实测 `resolution=1K` + `aspect_ratio=1:1` → `1024×1024`；`4K` + `16:9` → `5504×3072`；
-`3:2` 档位 → `1264×848`。要精确像素，上游做不到，只能拿到最接近的一档。
 
 `usage.output_tokens` 按 Ark 的口径算：`sum(宽×高) / 256` 取整。
 
@@ -736,23 +750,23 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 
 #### 这里的「模型名」是什么
 
-`minimax-image` 只是网关给这条链路起的**别名**，不是上游模型。整条链路没有模型选择：
+对外名字叫 **`minimax-h3-image`**，但它是网关自己起的名字——上游这条链路根本没有模型字段：
 
 | 层 | 实际名字 |
 |---|---|
-| 网关对外（`/v1/models` 里的 id） | `minimax-image` |
+| 网关对外（`/v1/models` 的 id、请求里的 `model`） | `minimax-h3-image` |
 | 上游 MCP 工具 | `matrix_generate_image`（`endpoint: "image_synthesize"`） |
-| 上游入参 | 只有 `prompt` / `input_files` / `input_urls` / `aspect_ratio` / `resolution`，**没有 `model`** |
+| 上游入参 | 只有 `prompt` / `input_files` / `input_urls` / `aspect_ratio` / `resolution` /（可选的 `width`/`height`），**没有 `model`** |
 
-上游工具清单（`GET {mcp_base}/tools`）里 `matrix_generate_image` 的 `input_schema_json` 是
-`additionalProperties: false`，压根没有模型字段；出图返回里也没有模型标识，`clean_oss_key`
-一律是 `.../image_tool/output/...`。所以：
+上游工具清单里 `matrix_generate_image` 的 `input_schema_json` 是 `additionalProperties: false`，
+没有模型字段；出图返回也没有模型标识。所以名字是**网关发给自己客户的**，规则是：
 
-- 请求体里的 `model` **完全被忽略**——传 `doubao-seedream-5-5-261028`、`minimax-image`、
-  `h3-image` 结果都一样，响应只是回显你传的名字；
-- **`h3-image` 在这条通道不存在**。`H3` 是**视频**模型（`MiniMax-H3` → `matrix_gen_videos`），
-  和图像无关；
-- 图像风格/画质只能通过 `prompt`、`size`（换算成 `aspect_ratio` + `resolution`）控制。
+- **认别名**：`minimax-h3-image`、`minimax-image`、`image-01`、`h3-image`、`minimax_h3_image`
+  等（大小写、下划线、空格不敏感）都折叠成 `minimax-h3-image`，响应回显规范名；
+- **未知名字直接 `400 unknown image model`**。这里以前是"传什么都忽略、原样回显"，
+  结果客户以为自己换了个模型其实还是同一后端——这比报错更坑；
+- `MiniMax-H3`（不带 `-image`）是**视频**模型，别混用；
+- 画质与风格只能靠 `prompt` 和 `size`（换算成 `aspect_ratio` + `resolution`）控制。
 
 ### 3.5 文生视频 / 图生视频
 

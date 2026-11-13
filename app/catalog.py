@@ -148,7 +148,7 @@ MODELS: tuple[Model, ...] = (
 # `type` field keeps them apart from the chat picker.
 MEDIA_MODELS: tuple[Model, ...] = (
     Model(
-        id="minimax-image",
+        id="minimax-h3-image",
         owned_by="minimax",
         context_window=0,
         max_output=0,

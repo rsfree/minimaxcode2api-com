@@ -142,6 +142,48 @@ async def call_ex(
 # ---------------------------------------------------------------------------
 # image
 # ---------------------------------------------------------------------------
+# One canonical model name for this channel. The tool itself takes no model at
+# all — a request carrying ``model=image-01`` is silently ignored — so the name
+# is ours to define. Callers arrive with several spellings, so they are folded
+# onto one id and the response always echoes the canonical one.
+IMAGE_MODELS = ("minimax-h3-image",)
+DEFAULT_IMAGE_MODEL = IMAGE_MODELS[0]
+_IMAGE_ALIASES = {
+    "minimax-h3-image",
+    "h3-image",
+    "h3image",
+    "minimax-image",
+    "minimaximage",
+    "minimax-image-01",
+    "minimaximage01",
+    "image-01",
+    "image01",
+    "mini-image",
+    "miniimage",
+}
+
+
+def normalize_image_model(model: str | None) -> str:
+    """Fold a caller's model name onto the one id this channel serves.
+
+    An unknown name is a 400 rather than a silent fallback: answering 200 while
+    quietly ignoring ``model`` is how a caller ends up believing they are on a
+    model they are not.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return DEFAULT_IMAGE_MODEL
+    key = model.strip().lower().replace("_", "-").replace(" ", "")
+    key = key.replace("--", "-")
+    if key in _IMAGE_ALIASES:
+        return DEFAULT_IMAGE_MODEL
+    raise MediaError(
+        400,
+        f"unknown image model {model!r}; this channel serves "
+        f"{', '.join(IMAGE_MODELS)} (aliases: minimax-image, image-01)",
+        code=400,
+    )
+
+
 # Ark's `size` speaks in tiers: 1K / 1.5K / 2K / 3K / 4K per model family. The
 # synthesiser only has three buckets, picked by total area, so the tiers in
 # between land on the nearer one instead of being rejected.
@@ -163,6 +205,21 @@ def size_to_params(size: str | None) -> tuple[str, str]:
     nearest supported ratio and the nearest area bucket, which is as close as
     this channel can get — the returned pixels are whatever the tool produces,
     and the response reports that truthfully rather than echoing the request.
+
+    Why the pair instead of forwarding ``width``/``height``: the tool does accept
+    them, but they lose to ``resolution``/``aspect_ratio`` whenever those are
+    present, and on their own they still get snapped. Measured on this channel
+    (2026-11-13, same prompt):
+
+        resolution=1K + aspect_ratio=1:1   -> 1024x1024
+        resolution=1K + aspect_ratio=16:9  -> 1376x768
+        resolution=2K + aspect_ratio=16:9  -> 2752x1536
+        resolution=4K + aspect_ratio=16:9  -> 5504x3072
+        width=1280 height=720, no ratio    -> 1408x768
+        width=3840 height=2160 + 1K + 1:1  -> 1024x1024   (pair wins)
+
+    So ``1280x720`` here means "16:9 at the 1K bucket" (1376x768) — one stable
+    answer, instead of 1408x768 through one path and 1376x768 through another.
     """
     if not size:
         return "1:1", "1K"

@@ -871,6 +871,7 @@ async def list_media_models() -> dict:
                 "type": "image",
                 "endpoint": "POST /v1/images/generations",
                 "options": {
+                    "models": list(media.IMAGE_MODELS),
                     "protocol": "Volcengine Ark POST /api/v3/images/generations",
                     "prompt": "required",
                     "image": "public URL or data: base64; string or array",
@@ -975,6 +976,14 @@ async def images_generations(request: Request):
     if not isinstance(prompt, str) or not prompt.strip():
         return error_response(400, "prompt is required", "invalid_request_error")
 
+    # The tool takes no model name, so this channel publishes one of its own and
+    # folds the aliases callers arrive with onto it. Rejecting an unknown name
+    # beats silently generating on whatever the channel happens to have.
+    try:
+        model = media.normalize_image_model(body.get("model"))
+    except media.MediaError as exc:
+        return error_response(400, str(exc), "invalid_request_error")
+
     try:
         count = _image_count(body)
     except ConversionError as exc:
@@ -1034,7 +1043,7 @@ async def images_generations(request: Request):
     log.info("ok kind=image n=%d %.2fs", len(data), time.time() - started)
     return JSONResponse(
         content={
-            "model": body.get("model") or "minimax-image",
+            "model": model,
             "created": int(time.time()),
             "data": data,
             "usage": usage,

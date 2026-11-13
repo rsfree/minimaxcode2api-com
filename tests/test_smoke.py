@@ -66,9 +66,9 @@ def test_model_catalogue_complete() -> None:
         assert name not in chat
 
     # Multimodal entries exist for every media endpoint, with the right kind.
-    assert {"minimax-image", "minimax-speech", "minimax-music"} <= set(media_models)
+    assert {"minimax-h3-image", "minimax-speech", "minimax-music"} <= set(media_models)
     assert {m.id for m in media_models.values() if m.kind == "video"} == set(media.VIDEO_MODELS)
-    assert media_models["minimax-image"].kind == "image"
+    assert media_models["minimax-h3-image"].kind == "image"
 
     # /v1/models carries the fields a picker needs.
     row = chat["MiniMax-M3"].to_openai()
@@ -1531,6 +1531,12 @@ def test_ark_size_and_measured_image_info() -> None:
     assert size_to_params("1024x1024") == ("1:1", "1K")
     assert size_to_params("2048x1152") == ("16:9", "2K")
     assert size_to_params("5504x3072") == ("16:9", "4K")
+    # The pair that the doc advertises: 1280x720 means "16:9 at 1K", which the
+    # tool renders as 1376x768 — measured, not guessed.
+    assert size_to_params("1280x720") == ("16:9", "1K")
+    # 3840x2160 is 8.3 MP; the 4K bucket starts at 16.9 MP, so "4K UHD" lands on
+    # 2K by area. Callers who want the 4K bucket say resolution=4K instead.
+    assert size_to_params("3840x2160") == ("16:9", "2K")
     try:
         size_to_params("big")
     except MediaError as exc:
@@ -1544,6 +1550,32 @@ def test_ark_size_and_measured_image_info() -> None:
     ) + (1152).to_bytes(4, "big")
     assert image_info(png) == {"output_format": "png", "size": "2048x1152"}
     assert image_info(b"not an image") == {}
+
+
+def test_image_model_mapping() -> None:
+    """One published image model, several accepted spellings, 400 for the rest.
+
+    The tool has no model of its own — ``model=image-01`` is silently ignored
+    upstream — so the gateway owns the name and must not pretend to serve
+    anything else.
+    """
+    from app.media import MediaError, normalize_image_model
+
+    assert normalize_image_model(None) == "minimax-h3-image"
+    assert normalize_image_model("") == "minimax-h3-image"
+    assert normalize_image_model("minimax-h3-image") == "minimax-h3-image"
+    assert normalize_image_model("MiniMax-H3-Image") == "minimax-h3-image"
+    assert normalize_image_model("minimax_h3_image") == "minimax-h3-image"
+    assert normalize_image_model("h3-image") == "minimax-h3-image"
+    assert normalize_image_model("minimax-image") == "minimax-h3-image"
+    assert normalize_image_model("image-01") == "minimax-h3-image"
+    for bad in ("MiniMax-H3", "gpt-image-1", "seedream-4-0"):
+        try:
+            normalize_image_model(bad)
+        except MediaError as exc:
+            assert exc.status == 400 and "unknown image model" in exc.message
+        else:
+            raise AssertionError(f"{bad} must not be accepted by the image channel")
 
 
 def test_ark_inline_image_is_uploaded() -> None:
@@ -1608,7 +1640,7 @@ def test_ark_image_endpoint_contract() -> None:
             "/v1/images/generations",
             headers=headers,
             json={
-                "model": "doubao-seedream-5-5-261028",
+                "model": "MiniMax-H3-Image",
                 "prompt": "a red cube",
                 "image": "https://example.test/ref.png",
                 "size": "2K",
@@ -1625,7 +1657,7 @@ def test_ark_image_endpoint_contract() -> None:
         )
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["model"] == "doubao-seedream-5-5-261028"
+        assert body["model"] == "minimax-h3-image"
         assert isinstance(body["created"], int)
         assert body["data"] == [
             {"url": "https://cdn.test/a.png", "output_format": "jpeg", "size": "2048x2048"}
@@ -1651,6 +1683,16 @@ def test_ark_image_endpoint_contract() -> None:
         )
         assert bad_format.status_code == 400
         assert "response_format" in bad_format.text
+
+        # A model this channel does not serve must fail loudly, not silently
+        # generate on the only backend it has.
+        wrong_model = client.post(
+            "/v1/images/generations",
+            headers=headers,
+            json={"model": "doubao-seedream-5-5-261028", "prompt": "x"},
+        )
+        assert wrong_model.status_code == 400
+        assert "unknown image model" in wrong_model.text
     finally:
         settings.api_keys = original_keys
         media_mod.image_generate = original_generate
@@ -1807,6 +1849,7 @@ def main() -> None:
         test_model_catalogue_complete,
         test_video_model_enum_matches_upstream,
         test_ark_size_and_measured_image_info,
+        test_image_model_mapping,
         test_ark_inline_image_is_uploaded,
         test_ark_image_endpoint_contract,
         test_system_and_text,
