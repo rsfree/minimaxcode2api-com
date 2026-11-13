@@ -42,8 +42,36 @@ _NAMED = re.compile(
     r"(\s*[=:]\s*)(\"?)[^\s\",}]{6,}\3"
 )
 
+# The subscription the pool is billed against. A 402 body reads
+#
+#   the remaining M Plan weekly limit and account credits cannot cover this
+#   MiniMax-H3 video generation; ... upgrade your plan ...
+#
+# which tells a caller which plan we buy, how it is metered and what it costs to
+# do better. None of that is a retry hint: they cannot top up an account they do
+# not own. The raw line stays in ``metrics`` for the operator; the caller gets a
+# status and a retry hint.
+_PLAN = re.compile(r"(?i)\bM[\s\-]*Plan\b")
+
 ACCOUNT = "<account>"
 SECRET = "<redacted>"
+PLAN = "<plan>"
+
+# What every 402 says to a caller, whatever the upstream wrote. Kept short and
+# free of numbers: the account, the balance and the model are all ours.
+QUOTA = "upstream quota exhausted for this account; please retry later"
+
+
+def for_caller(text: str, status: int = 0) -> str:
+    """The only way an error message should leave the process.
+
+    ``status`` decides whether the text is worth rewriting: an exhausted balance
+    is described upstream in terms of our own subscription, so the whole sentence
+    is replaced instead of filtered.
+    """
+    if status == 402:
+        return QUOTA
+    return scrub(text)
 
 
 def _known_values() -> list[str]:
@@ -79,6 +107,9 @@ def scrub(text: str) -> str:
     out = _JWT.sub(SECRET, out)
     out = _NAMED.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{SECRET}{m.group(3)}", out)
     out = _OPAQUE.sub(SECRET, out)
+    # Fallback for a path that never learned the status code: at least the plan
+    # name does not ship, even if the surrounding billing prose does.
+    out = _PLAN.sub(PLAN, out)
     for value in _known_values():
         if value in out:
             # An address keeps its placeholder spelling; a credential does not
@@ -96,6 +127,7 @@ def leaks(text: str) -> bool:
         or _BEARER.search(text)
         or _JWT.search(text)
         or _OPAQUE.search(text)
+        or _PLAN.search(text)
     ):
         return True
     return any(value in text for value in _known_values())

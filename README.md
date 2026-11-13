@@ -423,7 +423,27 @@ curl -s -H "Authorization: Bearer $KEY" "$BASE/admin/diagnostics?lines=80"      
 表单里的 `refresh_token=…` → `<redacted>`，号池里现存的 label 与 access token 前缀
 （`Token.short` 是 `access_token[:12]`，正则认不出来）按实际值替换。
 **出口一处、入口一处都不留**：`error_response`、`media_error_response`、SSE 中途的错误帧、
-视频查询的错误体都过同一个 `scrub()`；`/admin/*` 不过滤，管理员要看到原文。
+视频查询的错误体都过同一个 `redact.for_caller()`；`/admin/*` 不过滤，管理员要看到原文。
+
+#### 额度错误也不说我们买的是哪个套餐
+
+上游 402 的原话是给我们看的账本，不是给调用方的建议：
+
+```
+the remaining M Plan weekly limit and account credits cannot cover this
+MiniMax-H3 video generation; ... upgrade your plan
+```
+
+这句话同时交代了我们买的是哪个订阅、按什么计费、想升级该买什么——调用方既充不了
+我们的号，也不该知道号池的成本结构。所以 402 的文案**整句替换**，不做过滤：
+
+| 位置 | 内容 |
+|---|---|
+| 请求日志 / `metrics` / 面板 | 原文（含 `M Plan weekly limit`、`account credits`） |
+| 返回给调用方的 `error.message` | `upstream quota exhausted for this account; please retry later`，`type` 为 `insufficient_quota` |
+
+`schema` 里的业务码（`code: 1008` 等）照常保留，调用方要判断仍可判断。
+兜底还有一条正则：即使某条路径没传状态码，`M Plan` 也会被抹成 `<plan>`，套餐名不会漏出去。
 
 想验证：
 

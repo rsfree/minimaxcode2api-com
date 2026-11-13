@@ -300,25 +300,29 @@ def error_response(status: int, message: str, code: str = "upstream_error") -> J
     # caller saw a bare 500 with no message at all. 502 is what it means.
     if status < 400 or status > 599:
         status = 502
+    # A 402's upstream text is written in terms of our own subscription plan; the
+    # caller cannot act on that, so the whole sentence is replaced. Everything
+    # else is filtered for addresses and credentials. The raw text is already in
+    # the request log (metrics.record).
+    if status == 402 and code == "upstream_error":
+        code = "insufficient_quota"
     return JSONResponse(
         status_code=status,
-        # Everything that reaches a caller goes through one filter. The raw text
-        # is already in the request log (metrics.record); this copy must not name
-        # an account or echo a credential.
-        content={"error": {"message": redact.scrub(message), "type": code, "code": code}},
+        content={"error": {"message": redact.for_caller(message, status), "type": code, "code": code}},
     )
 
 
 def media_error_response(exc: MediaError) -> JSONResponse:
-    """Surface a media tool failure with the upstream message intact.
+    """Surface a media tool failure without leaking how the pool is billed.
 
-    The 402 text from this channel is the only notice that the account balance is
-    gone, so it is passed through verbatim instead of being rewritten — minus
-    anything that identifies the account behind the gateway.
+    A 402 here explains which plan ran dry and suggests upgrading it — useful to
+    us, meaningless to a caller. The reason is therefore replaced with a retry
+    hint (see ``redact.for_caller``); the operator still gets the original text
+    in the request log.
     """
     body: dict[str, Any] = {
         "error": {
-            "message": redact.scrub(exc.message),
+            "message": redact.for_caller(exc.message, exc.status),
             "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
             "code": exc.code,
         }
@@ -654,8 +658,16 @@ async def chat_completions(request: Request):
             except Exception as exc:  # noqa: BLE001 - surface to the client
                 failed = str(exc)
                 log.warning("stream aborted: %s", exc)
-                # Same filter as error_response: an SSE frame is still caller-facing.
-                payload = {"error": {"message": redact.scrub(str(exc)), "type": "upstream_error"}}
+                # Same filter as error_response: an SSE frame is still
+                # caller-facing, and a 402 mid-stream says the same thing a 402
+                # on the first byte would.
+                status = getattr(exc, "status", 0) or 0
+                payload = {
+                    "error": {
+                        "message": redact.for_caller(str(exc), status),
+                        "type": "insufficient_quota" if status == 402 else "upstream_error",
+                    }
+                }
                 yield f"data: {json.dumps(payload)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
@@ -1131,8 +1143,8 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
     except MediaError as exc:
         body = {
             "error": {
-                "message": redact.scrub(exc.message),
-                "type": "upstream_error",
+                "message": redact.for_caller(exc.message, exc.status),
+                "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
                 "code": exc.code,
             },
             "id": task_id,

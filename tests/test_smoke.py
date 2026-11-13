@@ -1024,10 +1024,58 @@ def test_redaction_hides_accounts_and_tokens() -> None:
     assert "giie.eu.org" not in body["error"]["message"]
     assert "@" not in body["error"]["message"]
 
-    media = json.loads(media_error_response(MediaError(402, "credit gone for x@y.com, code 1008")).body)
+    media = json.loads(
+        media_error_response(MediaError(402, "credit gone for x@y.com, code 1008", code=1008)).body
+    )
     assert media["error"]["type"] == "insufficient_quota"
     assert "x@y.com" not in media["error"]["message"]
-    assert "1008" in media["error"]["message"]
+    # The business code still travels, but in its own field: the message itself
+    # is replaced wholesale for 402 (see the plan test below).
+    assert media["error"]["code"] == 1008
+
+
+def test_quota_errors_do_not_advertise_the_subscription_plan() -> None:
+    """A 402 explains our billing, not the caller's mistake.
+
+    Upstream answers a spent video balance with "the remaining M Plan weekly
+    limit and account credits cannot cover this ... upgrade your plan". That
+    names the plan we buy and how it is metered — procurement detail a caller
+    cannot act on. The status and a retry hint are all that ship.
+    """
+    from app.main import error_response, media_error_response
+    from app.media import MediaError
+    from app.redact import for_caller, leaks, scrub
+
+    upstream = (
+        "the remaining M Plan weekly limit and account credits cannot cover this "
+        "MiniMax-H3 video generation; MiniMax-H3 and MiniMax-H3-Max are paid from "
+        "the M Plan weekly limit on tiers that cover them; upgrade your plan"
+    )
+    for text in (for_caller(upstream, 402), json.loads(error_response(402, upstream).body)["error"]["message"]):
+        low = text.lower()
+        assert "plan" not in low, text
+        assert "weekly limit" not in low, text
+        assert "credits" not in low, text
+        assert "upgrade" not in low, text
+        assert "minimax-h3" not in low, text
+
+    # Status alone is enough to sanitise, and 402 gets a type callers can branch on.
+    body = json.loads(error_response(402, upstream).body)
+    assert body["error"]["type"] == "insufficient_quota"
+    assert "@" not in body["error"]["message"]
+
+    media = json.loads(media_error_response(MediaError(402, upstream, code=1008)).body)
+    assert media["error"]["type"] == "insufficient_quota"
+    assert "plan" not in media["error"]["message"].lower()
+
+    # The fallback regex is what saves a path that never passed a status code:
+    # the plan name still goes, even though the surrounding prose stays.
+    masked = scrub(upstream)
+    assert "M Plan" not in masked and "m plan" not in masked.lower()
+    assert "<plan>" in masked
+    assert leaks(upstream) and not leaks(masked)
+    # And a plain 500 keeps its own words.
+    assert "upstream HTTP 502" in for_caller("upstream HTTP 502 while reading the body", 502)
 
 
 def test_redaction_masks_bare_token_prefixes() -> None:
@@ -1640,6 +1688,7 @@ def main() -> None:
         test_store_degrades_to_memory,
         test_admin_logs_pagination,
         test_redaction_hides_accounts_and_tokens,
+        test_quota_errors_do_not_advertise_the_subscription_plan,
         test_redaction_masks_bare_token_prefixes,
         test_pool_exhaustion_never_names_the_mailbox_to_the_caller,
         test_transport_status_never_escapes_as_http,
