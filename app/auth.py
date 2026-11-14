@@ -43,6 +43,16 @@ COOLDOWN_UNAUTHORIZED = 600.0     # 401 — token or session is dead
 COOLDOWN_EXHAUSTED = 900.0        # 402 when the charge is one-off (media, long jobs)
 COOLDOWN_RATE_LIMITED = 60.0      # 429
 
+# A chat 402 means the account's daily allowance is spent, and that allowance
+# only returns with a check-in. Parking "until tomorrow's 00:10" sounds right but
+# has two failure modes: an account emptied at 00:06 used to be parked for 24 h
+# (the reset had already passed), and when the whole pool ran dry the gateway
+# stayed dark until the next 6-hourly check-in. Back off geometrically instead —
+# early retries are cheap and catch a check-in that just landed, while the cap
+# keeps a genuinely empty pool from hammering upstream.
+QUOTA_BACKOFF_BASE = 900.0        # 15 min after the first 402
+QUOTA_BACKOFF_MAX = 6 * 3600.0    # one check-in cycle
+
 # Reason tags live on the token so a successful sign-in can lift exactly the
 # quota parks (and never an auth one).
 REASON_AUTH = "auth"
@@ -66,13 +76,17 @@ CREDIT_HINT_TTL = 1800.0
 
 
 def seconds_until_next_day(tz_name: str, buffer_minutes: int = 10) -> float:
-    """Seconds until the next midnight in ``tz_name``, plus a settle buffer.
+    """Seconds until the *next* local midnight, plus a settle buffer.
 
-    A per-account daily allowance resets on the account's local midnight, not
-    fifteen minutes after the request that discovered it was empty. Parking a
-    spent account for 900 s therefore guaranteed another wasted round trip;
-    parking it until the reset costs one probe per day and lets the console say
-    "back at 00:10" instead of "cooling for 14m, again".
+    The word "next" is load-bearing. The previous version did
+    ``(now + 1 day).replace(hour=0)``, which is always tomorrow: an account that
+    ran dry at 00:06 was parked until 00:10 the *following* day, ~24 h instead of
+    the four minutes actually left. Observed in production on 2026-11-14 — the
+    last account emptied at 00:06 and the whole gateway answered
+    "every account is out of quota until the daily reset at 00:10" until the
+    01:46 check-in.
+
+    So: today's midnight + buffer if it is still ahead, otherwise tomorrow's.
     """
     try:
         from zoneinfo import ZoneInfo
@@ -82,22 +96,22 @@ def seconds_until_next_day(tz_name: str, buffer_minutes: int = 10) -> float:
         log.warning("timezone %s unavailable; assuming UTC+8 for the daily reset", tz_name)
         tz = dt_timezone(timedelta(hours=8))
     now = datetime.now(tz)
-    reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    reset += timedelta(minutes=buffer_minutes)
+    reset = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+        minutes=buffer_minutes
+    )
+    if reset <= now:
+        reset += timedelta(days=1)
     return max(60.0, (reset - now).total_seconds())
 
 
-def next_reset_label(tz_name: str, buffer_minutes: int = 10) -> str:
-    """``HH:MM`` of the next daily reset, for error messages an operator reads."""
-    seconds = seconds_until_next_day(tz_name, buffer_minutes)
-    try:
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo(tz_name)
-    except Exception:  # noqa: BLE001
-        tz = dt_timezone(timedelta(hours=8))
-    moment = datetime.fromtimestamp(time.time() + seconds, tz)
-    return moment.strftime("%H:%M")
+def short_delay(seconds: float) -> str:
+    """Human-sized duration for caller-facing messages: 45s / 14m / 3.2h."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
 
 
 class CredentialError(RuntimeError):
@@ -124,6 +138,10 @@ class Token:
     # written to both this and the media pair below.
     cooldown_until: float = 0.0
     cooldown_reason: str = ""       # auth / quota / rate — see REASON_*
+    # Consecutive chat 402s. Drives the geometric quota backoff: the first one
+    # parks 15 min, each repeat doubles it up to a check-in cycle. A successful
+    # check-in resets it, because a top-up makes the next 402 a fresh story.
+    quota_streak: int = 0
     # Media-channel park, kept separate because the two budgets are separate:
     # "cannot afford one image" is not "cannot answer a prompt".
     media_cooldown_until: float = 0.0
@@ -626,9 +644,13 @@ class TokenPool:
                 )
             cooling = [t for t in self._tokens if not t.disabled and t.is_cooling(capability)]
             if cooling and all(t.cooldown(capability)[1] == REASON_QUOTA for t in cooling):
+                # Report when the pool actually comes back, not a fixed "00:10":
+                # with the geometric backoff that is minutes, not a day, and the
+                # old wording sent everyone waiting for a reset that had passed.
+                soonest = min(t.cooldown(capability)[0] for t in cooling)
                 raise CredentialError(
-                    "every account is out of quota until the daily reset at "
-                    f"{next_reset_label(settings.signin_timezone)} "
+                    "every account is out of credits right now; earliest retry in "
+                    f"{short_delay(soonest - time.time())} "
                     f"({settings.signin_timezone})"
                 )
             raise CredentialError("every account in the pool is cooling down or unusable")
@@ -664,16 +686,21 @@ class TokenPool:
         token: Token,
         status: int | None = None,
         reason: str = "",
-        next_day: bool = False,
         capability: str = CAPABILITY_TEXT,
     ) -> None:
         """Temporarily remove an account from rotation.
 
-        ``next_day`` is for the chat path: an account answering 402 there has run
-        out of its *daily* allowance, which does not come back in 15 minutes.
+        A chat 402 means the allowance is spent, so the delay is a capped
+        geometric backoff (:data:`QUOTA_BACKOFF_BASE` doubling up to
+        :data:`QUOTA_BACKOFF_MAX`, never past the next reset): retrying early is
+        cheap and catches a check-in that just landed, while the cap keeps a
+        genuinely empty pool from hammering upstream. Parking "until the daily
+        reset" read well but put an account offline for 24 h when it emptied
+        minutes *after* midnight.
+
         One-off charges (media, where a single video costs 320 credits) keep the
-        short cooldown — being too poor for one expensive job says nothing about
-        the text quota.
+        flat short cooldown — being too poor for one expensive job says nothing
+        about the text quota.
 
         ``capability`` scopes a 402 to one budget. A media 402 only proves the
         account cannot pay for an image; it can still answer chat, so parking the
@@ -685,11 +712,15 @@ class TokenPool:
             delay, tag = COOLDOWN_UNAUTHORIZED, REASON_AUTH
         elif status == 402:
             tag = REASON_QUOTA
-            delay = (
-                seconds_until_next_day(settings.signin_timezone)
-                if next_day and capability == CAPABILITY_TEXT
-                else COOLDOWN_EXHAUSTED
-            )
+            if capability == CAPABILITY_TEXT:
+                token.quota_streak = min(token.quota_streak + 1, 10)
+                delay = min(
+                    QUOTA_BACKOFF_BASE * (2 ** (token.quota_streak - 1)),
+                    QUOTA_BACKOFF_MAX,
+                    seconds_until_next_day(settings.signin_timezone),
+                )
+            else:
+                delay = COOLDOWN_EXHAUSTED
         else:
             delay, tag = COOLDOWN_RATE_LIMITED, REASON_RATE
 
@@ -721,6 +752,9 @@ class TokenPool:
         token = self.find(key)
         if token is None:
             return False
+        # A claim is proof the allowance is back, so the next 402 (if any) starts
+        # a fresh backoff instead of continuing the previous day's streak.
+        token.quota_streak = 0
         cleared = False
         if token.cooldown_reason == REASON_QUOTA:
             token.cooldown_until = 0.0

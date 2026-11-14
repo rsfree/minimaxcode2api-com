@@ -26,6 +26,24 @@ from .config import API_KEY_PLACEHOLDER, settings
 
 log = logging.getLogger("minimax.upstream")
 
+# An empty pool is a state, not an event: while it lasts, every single request
+# logs the same line. On 2026-11-14 that produced 4116 identical warnings in 100
+# minutes, which buried everything else. Log it once a minute and carry the count.
+EMPTY_POOL_LOG_EVERY = 60.0
+_empty_pool_log = {"at": 0.0, "suppressed": 0}
+
+
+def _log_empty_pool(message: str) -> None:
+    now = time.time()
+    if now - _empty_pool_log["at"] < EMPTY_POOL_LOG_EVERY:
+        _empty_pool_log["suppressed"] += 1
+        return
+    suppressed = _empty_pool_log["suppressed"]
+    _empty_pool_log["at"] = now
+    _empty_pool_log["suppressed"] = 0
+    suffix = f" (+{suppressed} similar requests since the last line)" if suppressed else ""
+    log.warning("no usable account: %s%s", message, suffix)
+
 REDIRECT_HINT = (
     "upstream answered 307 to {location}. This network is geo-redirected to the "
     "legacy CN origin, which rejects a {region} token. Set UPSTREAM_PROXY to an "
@@ -342,7 +360,7 @@ class Upstream:
                 # what the token endpoint said) stays in this log line: the
                 # caller gets a reason, never an account identity.
                 else:
-                    log.warning("no usable account: %s", exc)
+                    _log_empty_pool(str(exc))
                     raise UpstreamError(503, f"no usable account: {exc}") from exc
             tried.add(token.access_token or token.label)
             last_token = token
@@ -383,13 +401,16 @@ class Upstream:
                 )
                 if retriable and attempt + 1 < tries:
                     if _quota_exhausted(err.message):
-                        # The daily allowance resets at local midnight, not in
-                        # fifteen minutes — park until then and let the sign-in
-                        # sweep lift the park once it has topped the account up.
-                        token_manager.park(token, 402, err.message, next_day=True)
+                        # The allowance is spent; park() applies the geometric
+                        # quota backoff (15 min doubling, never past the reset)
+                        # and the check-in sweep lifts it as soon as a claim
+                        # lands. Parking until "the daily reset" used to mean a
+                        # full day offline when the last account died just after
+                        # midnight.
+                        token_manager.park(token, 402, err.message)
                         token_manager.note_failure(token, err.message)
                         log.warning(
-                            "account %s is out of credits (%s); parked until the daily reset",
+                            "account %s is out of credits (%s); backing off",
                             token.label or token.short, err.message,
                         )
                     else:
@@ -443,10 +464,7 @@ class Upstream:
                     last = _error_from(retry.status_code, body)
                     last.account = current
 
-                token_manager.park(
-                    token, response.status_code, last.message,
-                    next_day=response.status_code == 402,
-                )
+                token_manager.park(token, response.status_code, last.message)
                 token_manager.note_failure(token, last.message)
                 log.warning(
                     "account %s failed (%s); trying next", token.label or token.short, response.status_code

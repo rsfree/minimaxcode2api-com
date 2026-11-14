@@ -579,9 +579,8 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | `429` / 限流 | 账号额度或并发限制 | 降并发、错峰，或换账号 |
 | `502 upstream error` + 具体 message | 上游返回的业务错误，原文透传 | 按 message 处理 |
 | 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（原文是 `plan balance has run out`，网关会换成中性文案） | 桌面端充值；该号只停图片通道 15 分钟，对话照常。全池都不够时才会把 402 返给你 |
-| 对话 `503 no usable account: every account is out of quota until the daily reset at 00:10` | 全池都撞了 1008，免费额度按天重置 | 等次日重置（网关会自动签到并解除冷却），或加号 / 充值 |
+| 对话 `503 no usable account: every account is out of credits right now` | 全池都撞了 1008：当天的免费额度用完了（额度只在签到时到账） | 看 message 里的 `earliest retry in …`；网关每 6 小时签到一轮、并会在 00:10 后立刻跨日签到，签到成功即解除全部额度冷却。要更早恢复就加号 / 充值 |
 | 号还有积分但生图一直 402 | 余额够聊天、不够一次生成：1 张 1K 图约 115 credits | 看面板积分列；低于 `MEDIA_MIN_CREDITS`（默认 115）的号会被自动跳过，调低门槛没用，得充值/签到 |
-| 对话 `503 no usable account: every account is out of quota until the daily reset at 00:10` | 全池都撞了 1008，免费额度按天重置 | 等次日重置（网关会自动签到并解除冷却），或加号 / 充值 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单（H3 4s = 320 credits） | 充值，或改用 `MiniMax-Hailuo-2.3` 6s |
 | 视频提交 `503 temporarily unavailable` | **该账号没有视频权限**（按账号给，不是按 key） | 池里只要有一个号能提交就没事，网关自动换号；日志会打印 `cannot use this tool (503)` |
 | 视频查询 `404 does not belong to the current caller` | 提交/查询不是同一个账号，或网关重启丢了 `task_id→账号` 映射 | 同一实例内轮询；重启后旧任务查不了 |

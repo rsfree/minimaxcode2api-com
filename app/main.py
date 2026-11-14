@@ -38,7 +38,7 @@ from fastapi.responses import (
 )
 
 from . import admin, logring, media, metrics as metrics_mod, probe, redact, security, store as store_mod
-from .auth import CredentialError, token_manager
+from .auth import CredentialError, seconds_until_next_day, token_manager
 from .security import UI_COOKIE, UI_COOKIE_MAX_AGE, authorized as _authorized, is_loopback as _is_loopback
 from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
 from .config import RUNTIME_NOTES, settings
@@ -146,6 +146,21 @@ async def _refresh_before_checkin() -> None:
     log.info("pre-check-in renewal: %s/%s account(s) refreshed", renewed, len(due))
 
 
+def _next_checkin_delay() -> float:
+    """Sleep for the configured interval — unless the daily reset is closer.
+
+    The allowance only lands *with a check-in*, so an account that empties at
+    00:06 stays empty until the loop comes round again. On a six-hour cycle that
+    is up to six hours of a dead pool for no reason (2026-11-14: the pool was
+    empty from 00:06, the check-in landed at 01:46, and 4116 requests were
+    answered with 503 in between). Crossing the reset window on purpose costs one
+    extra sweep a day and caps the damage at a couple of minutes.
+    """
+    interval = max(600.0, settings.signin_interval_hours * 3600)
+    to_reset = seconds_until_next_day(settings.signin_timezone) + 120.0
+    return min(interval, to_reset)
+
+
 async def _signin_loop() -> None:
     """Claim the daily reward for every pooled account, then idle.
 
@@ -196,7 +211,7 @@ async def _signin_loop() -> None:
                 await token_manager.reload()
             except Exception as exc:  # noqa: BLE001 - never take the gateway down
                 log.warning("pool resync after check-in failed: %s", exc)
-        await asyncio.sleep(max(600.0, settings.signin_interval_hours * 3600))
+        await asyncio.sleep(_next_checkin_delay())
 
 
 app = FastAPI(

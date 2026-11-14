@@ -841,6 +841,7 @@ def test_a_poor_account_still_answers_chat_but_not_images() -> None:
     reset" while that account sat there able to talk.
     """
     import time
+    from unittest.mock import patch
 
     from app.auth import (
         CAPABILITY_MEDIA,
@@ -869,15 +870,38 @@ def test_a_poor_account_still_answers_chat_but_not_images() -> None:
     }
     assert chosen == {"rich@x", "poor@x"}, "chat must still reach both accounts"
 
-    # A chat 402 does mean the balance is gone: both channels go down.
+    # A chat 402 does mean the balance is gone: both channels go down, and the
+    # delay is a backoff — 15 min first, doubling — not "until tomorrow's reset".
+    # A reset that has already passed must never produce a 24-hour park.
+    import app.auth as auth_mod
+
     fresh = Token(access_token="tok-f", label="f@x", pooled=True)
     solo = TokenPool()
     solo._tokens = [fresh]
     solo._loaded = True
-    solo.park(fresh, 402, "1008", next_day=True)
-    assert fresh.is_cooling(CAPABILITY_TEXT) is True
-    assert fresh.is_cooling(CAPABILITY_MEDIA) is True
-    assert fresh.cooldown_until - time.time() > 3600
+    with patch.object(auth_mod, "seconds_until_next_day", lambda *a, **kw: 86400.0):
+        solo.park(fresh, 402, "1008")
+        assert fresh.is_cooling(CAPABILITY_TEXT) is True
+        assert fresh.is_cooling(CAPABILITY_MEDIA) is True
+        first = fresh.cooldown_until - time.time()
+        assert 890 <= first <= 901, f"first 402 backs off 15 min, got {first:.0f}s"
+
+        # Repeats double it, capped at one check-in cycle.
+        solo.park(fresh, 402, "1008")
+        second = fresh.cooldown_until - time.time()
+        assert 1790 <= second <= 1801, f"second 402 doubles to 30 min, got {second:.0f}s"
+        for _ in range(8):
+            solo.park(fresh, 402, "1008")
+        assert fresh.cooldown_until - time.time() <= auth_mod.QUOTA_BACKOFF_MAX + 1
+
+    # A check-in is proof the allowance is back: it clears both channels and
+    # resets the streak, so the next 402 starts from 15 minutes again.
+    assert solo.clear_quota_cooldown("f@x") is True
+    assert fresh.quota_streak == 0
+    with patch.object(auth_mod, "seconds_until_next_day", lambda *a, **kw: 86400.0):
+        solo.park(fresh, 402, "1008")
+        again = fresh.cooldown_until - time.time()
+        assert 890 <= again <= 901, f"a fresh streak backs off 15 min, got {again:.0f}s"
 
     # Auth and rate limits are pool-wide: one dead credential is dead for both.
     dead = Token(access_token="tok-d", label="d@x", pooled=True)
@@ -1052,7 +1076,7 @@ def test_probe_publishes_a_balance_the_media_path_can_use() -> None:
         probe_mod.token_pool_ref = original
 
 
-def test_quota_park_lasts_until_reset() -> None:
+def test_quota_park_backs_off_instead_of_waiting_a_day() -> None:
     """1008 is a *daily* allowance: parking for 15 minutes just buys another fail.
 
     The park lasts until the next local midnight (plus a settle buffer) and a
@@ -1066,23 +1090,32 @@ def test_quota_park_lasts_until_reset() -> None:
         CredentialError,
         Token,
         TokenPool,
-        next_reset_label,
         seconds_until_next_day,
     )
     from app.config import settings
 
     seconds = seconds_until_next_day(settings.signin_timezone)
-    assert 60 <= seconds <= 24 * 3600 + 11 * 60, seconds
-    assert len(next_reset_label(settings.signin_timezone)) == 5
+    # "Next" means the next 00:10, not "tomorrow". Before 00:10 the wait is
+    # minutes; after it, the remaining day. The old `(now + 1 day).replace(hour=0)`
+    # returned ~24 h at 00:06, which kept an emptied pool dark for a full day.
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    local = datetime.now(ZoneInfo(settings.signin_timezone))
+    minutes = local.hour * 60 + local.minute
+    expected = (10 - minutes) * 60 if minutes < 10 else (1440 - minutes + 10) * 60
+    assert 60 <= seconds <= 24 * 3600, seconds
+    assert abs(seconds - expected) <= 120, (seconds, expected, minutes)
 
     pool = TokenPool()
     token = Token(access_token="tok-a", label="a@x", pooled=True)
     pool._tokens = [token]
     pool._loaded = True
 
-    pool.park(token, 402, "insufficient balance (1008)", next_day=True)
+    pool.park(token, 402, "insufficient balance (1008)")
     assert token.cooldown_reason == REASON_QUOTA
-    assert token.cooldown_until - time.time() > 3600, "a daily quota must not cool down for 15 minutes"
+    left = token.cooldown_until - time.time()
+    assert 60 <= left <= 901, f"a chat 402 backs off minutes, not a day: {left:.0f}s"
     assert token.is_cooling() is True
 
     # 签到 = 回血：解除额度冷却，但绝不顺手放过凭证类冷却。
@@ -1093,18 +1126,124 @@ def test_quota_park_lasts_until_reset() -> None:
     assert pool.clear_quota_cooldown("a@x") is False
     assert token.is_cooling() is True
 
-    # 全池都因额度停摆时，错误要告诉运维什么时候恢复，而不是「都不可用」。
+    # 全池都因额度停摆时，错误要给出真实的恢复时间，而不是「都不可用」。
     other = TokenPool()
     lone = Token(access_token="tok-b", label="b@x", pooled=True)
     other._tokens = [lone]
     other._loaded = True
-    other.park(lone, 402, "1008", next_day=True)
+    other.park(lone, 402, "1008")
     try:
         asyncio.run(other.acquire())
     except CredentialError as exc:
-        assert "daily reset" in str(exc), exc
+        assert "out of credits" in str(exc), exc
+        assert "earliest retry" in str(exc), exc
     else:
         raise AssertionError("expected CredentialError when every account is out of quota")
+
+
+def test_next_reset_after_midnight_is_minutes_not_a_day() -> None:
+    """00:06 must mean four minutes, not twenty-four hours.
+
+    Production, 2026-11-14: the last account emptied at 00:06, and
+    ``(now + 1 day).replace(hour=0)`` pointed at *tomorrow's* 00:10 — so the pool
+    stayed dark until the 01:46 check-in and 4116 requests were answered 503.
+    """
+    from datetime import datetime as real_datetime
+    from unittest.mock import patch
+    from zoneinfo import ZoneInfo
+
+    import app.auth as auth_mod
+
+    tz = ZoneInfo("Asia/Shanghai")
+
+    def frozen_at(hour: int, minute: int):
+        class Frozen(real_datetime):
+            @classmethod
+            def now(cls, tz=None):  # noqa: D401 - test double
+                return real_datetime(2026, 11, 14, hour, minute, tzinfo=tz)
+
+        return Frozen
+
+    with patch.object(auth_mod, "datetime", frozen_at(0, 6)):
+        assert 239 <= auth_mod.seconds_until_next_day("Asia/Shanghai") <= 241
+    with patch.object(auth_mod, "datetime", frozen_at(0, 11)):
+        wait = auth_mod.seconds_until_next_day("Asia/Shanghai")
+        assert 23.9 * 3600 <= wait <= 24 * 3600, f"past the reset it rolls a day: {wait:.0f}s"
+    with patch.object(auth_mod, "datetime", frozen_at(23, 55)):
+        assert 14.5 * 60 <= auth_mod.seconds_until_next_day("Asia/Shanghai") <= 15.5 * 60
+
+
+def test_empty_pool_warning_is_rate_limited() -> None:
+    """An empty pool logs once a minute, not once per request.
+
+    On 2026-11-14 the pool went dry at 00:06 and came back at 01:46; every
+    request in between wrote the same warning — 4116 identical lines that buried
+    the rest of the log. The line itself is still valuable, so it is throttled
+    with a count rather than dropped.
+    """
+    import logging
+
+    from app import upstream as up
+
+    messages: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):  # noqa: ANN001 - logging hook
+            messages.append(record.getMessage())
+
+    logger = logging.getLogger("minimax.upstream")
+    handler = Capture()
+    logger.addHandler(handler)
+    original = logger.level
+    logger.setLevel(logging.WARNING)
+    up._empty_pool_log.update({"at": 0.0, "suppressed": 0})
+    try:
+        for _ in range(5):
+            up._log_empty_pool("every account is out of credits")
+        assert len(messages) == 1, messages
+        assert "out of credits" in messages[0]
+
+        # Still inside the window: counted, not printed.
+        up._log_empty_pool("every account is out of credits")
+        assert len(messages) == 1
+
+        # A minute later the next line carries what it swallowed (5 total).
+        up._empty_pool_log["at"] -= up.EMPTY_POOL_LOG_EVERY + 1
+        up._log_empty_pool("every account is out of credits")
+        assert len(messages) == 2, messages
+        assert "+5" in messages[1], messages[1]
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(original)
+        up._empty_pool_log.update({"at": 0.0, "suppressed": 0})
+
+
+def test_checkin_loop_crosses_the_reset_window() -> None:
+    """The allowance arrives with a check-in, so the loop must not sleep past 00:10.
+
+    With a six-hour interval and a container started at 19:50, check-ins landed
+    at 01:46 — 100 minutes after the pool ran dry. Crossing the reset window
+    deliberately costs one extra sweep a day.
+    """
+    from unittest.mock import patch
+
+    from app import main as main_mod
+    from app.config import settings
+
+    original = settings.signin_interval_hours
+    settings.signin_interval_hours = 6.0
+    try:
+        # 00:06: the reset is four minutes away — wake up just after it.
+        with patch.object(main_mod, "seconds_until_next_day", lambda *a, **kw: 240.0):
+            assert main_mod._next_checkin_delay() == 360.0
+        # Mid-afternoon: the regular interval wins.
+        with patch.object(main_mod, "seconds_until_next_day", lambda *a, **kw: 5 * 3600.0):
+            assert main_mod._next_checkin_delay() == 5 * 3600.0 + 120.0
+        # Never below the ten-minute floor even right at the boundary.
+        with patch.object(main_mod, "seconds_until_next_day", lambda *a, **kw: 86400.0):
+            assert main_mod._next_checkin_delay() == 6 * 3600.0
+    finally:
+        settings.signin_interval_hours = original
 
 
 def test_request_history_survives_restart() -> None:
@@ -2349,7 +2488,10 @@ def main() -> None:
         test_account_import_flow,
         test_balance_surfacing,
         test_membership_payload_is_not_unwrapped,
-        test_quota_park_lasts_until_reset,
+        test_quota_park_backs_off_instead_of_waiting_a_day,
+        test_next_reset_after_midnight_is_minutes_not_a_day,
+        test_empty_pool_warning_is_rate_limited,
+        test_checkin_loop_crosses_the_reset_window,
         test_admin_requires_key,
         test_request_history_survives_restart,
         test_store_degrades_to_memory,
