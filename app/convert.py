@@ -7,13 +7,19 @@ clients speak OpenAI, so everything is translated here and nowhere else.
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import io
 import json
+import logging
 import time
 import uuid
 from typing import Any, AsyncIterator, Iterable
 
 from .catalog import DEFAULT_MODEL, get_model, resolve_model
 from .config import settings
+
+log = logging.getLogger("minimax.convert")
 
 FINISH_REASONS = {
     "end_turn": "stop",
@@ -29,6 +35,202 @@ class ConversionError(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# Inline media sizing
+# ---------------------------------------------------------------------------
+def _decode_inline(payload: str) -> bytes | None:
+    """Best-effort decode of a base64 body, tolerant of missing padding."""
+    text = payload.strip()
+    if not text:
+        return None
+    text += "=" * (-len(text) % 4)
+    try:
+        return base64.b64decode(text, validate=False)
+    except Exception:  # noqa: BLE001 - a broken image is the caller's problem
+        return None
+
+
+def _too_big(index: int, size: int) -> str:
+    limit = settings.media_max_bytes
+    return (
+        f"image #{index} is {size / 1048576:.1f} MiB ({size} bytes); this channel accepts "
+        f"at most {limit // 1048576} MiB ({limit} bytes) per image — send a smaller "
+        "image or turn on automatic resizing (MEDIA_COMPRESS=1)"
+    )
+
+
+def _inline_size(payload: str) -> int:
+    """Exact decoded size of a base64 body, computed without decoding it."""
+    text = payload.strip()
+    if not text:
+        return 0
+    return max(0, len(text) * 3 // 4 - text.count("="))
+
+
+def _shrink(image_bytes: bytes, limit: int) -> tuple[bytes, str] | None:
+    """Re-encode until the payload fits ``limit``; ``None`` means impossible.
+
+    The upstream ceiling is on transferred bytes, so an ordinary high-quality
+    photo trips it while the same picture at quality 80 sails through. Dropping
+    JPEG quality costs far less than the request failing outright, and a
+    downscale only happens when quality alone cannot close the gap.
+    """
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001 - Pillow is optional at runtime
+        return None
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+    except Exception:  # noqa: BLE001 - not an image, or a format we cannot reopen
+        return None
+    if image.mode not in {"RGB", "L"}:
+        # JPEG has no alpha channel; flatten onto white rather than dropping it.
+        if "A" in image.mode:
+            canvas = Image.new("RGB", image.size, (255, 255, 255))
+            canvas.paste(image, mask=image.split()[-1])
+            image = canvas
+        else:
+            image = image.convert("RGB")
+
+    for quality in (90, 84, 78, 72, 66, 58, 50, 42):
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, optimize=True, progressive=True)
+        if buffer.tell() <= limit:
+            return buffer.getvalue(), "image/jpeg"
+
+    scale = 0.85
+    while int(image.width * scale) >= 64 and int(image.height * scale) >= 64:
+        resized = image.resize(
+            (int(image.width * scale), int(image.height * scale)), Image.LANCZOS
+        )
+        buffer = io.BytesIO()
+        resized.save(buffer, format="JPEG", quality=74, optimize=True, progressive=True)
+        if buffer.tell() <= limit:
+            return buffer.getvalue(), "image/jpeg"
+        scale *= 0.85
+    return None
+
+
+async def shrink_inline_media(body: dict) -> None:
+    """Re-encode inline images that the upstream would reject as oversized.
+
+    Runs before translation so the body the caller sent is what gets adjusted —
+    the conversion then copies the new data URI across unchanged. Both wire
+    shapes are covered because both endpoints are public: OpenAI's
+    ``{"type": "image_url", "image_url": {"url": "data:..."}}`` and Anthropic's
+    ``{"type": "image", "source": {"type": "base64", ...}}``.
+
+    Remote URLs are left alone: their size is only knowable by downloading them,
+    and a failed download is worse than letting the upstream answer 2013.
+    """
+    if not settings.media_compress:
+        return
+    for blocks in _media_containers(body):
+        for part in blocks:
+            if isinstance(part, dict):
+                await _shrink_part(part)
+
+
+def _media_containers(body: dict) -> list[list]:
+    """Every block list that can hold an image, in both wire formats."""
+    found: list[list] = []
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and isinstance(message.get("content"), list):
+                found.append(message["content"])
+    system = body.get("system")
+    if isinstance(system, list):
+        found.append(system)
+    return found
+
+
+async def _shrink_part(part: dict) -> None:
+    kind = part.get("type")
+
+    # Anthropic block: the bytes live in source.data, not in a data: URI.
+    if kind == "image" and isinstance(part.get("source"), dict):
+        source = part["source"]
+        payload = source.get("data")
+        if source.get("type") != "base64" or not isinstance(payload, str):
+            return
+        raw = _decode_inline(payload)
+        if raw is None or len(raw) <= settings.media_max_bytes:
+            return
+        shrunk = await asyncio.to_thread(_shrink, raw, settings.media_max_bytes)
+        if shrunk is None:
+            return  # leave it; the size check reports it with a readable message
+        blob, mime = shrunk
+        source["data"] = base64.b64encode(blob).decode()
+        source["media_type"] = mime
+        _log_resize(len(raw), len(blob))
+        return
+
+    if kind not in {"image_url", "image", "input_image"}:
+        return
+    holder = part.get("image_url") or part.get("image")
+    url = holder.get("url") if isinstance(holder, dict) else holder
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return
+    _, _, payload = url.partition(",")
+    raw = _decode_inline(payload)
+    if raw is None or len(raw) <= settings.media_max_bytes:
+        return
+    shrunk = await asyncio.to_thread(_shrink, raw, settings.media_max_bytes)
+    if shrunk is None:
+        return
+    blob, mime = shrunk
+    replacement = f"data:{mime};base64," + base64.b64encode(blob).decode()
+    if isinstance(holder, dict):
+        holder["url"] = replacement
+    elif kind == "image_url":
+        part["image_url"] = replacement
+    else:
+        part["image"] = replacement
+    _log_resize(len(raw), len(blob))
+
+
+def _log_resize(before: int, after: int) -> None:
+    log.warning(
+        "resized inline image %.1f MiB -> %.1f MiB (jpeg): the channel rejects media above %d bytes",
+        before / 1048576, after / 1048576, settings.media_max_bytes,
+    )
+
+
+def _part_size(part: dict) -> int:
+    """Decoded byte size of an inline image block, or 0 when it is not inline."""
+    if part.get("type") == "image" and isinstance(part.get("source"), dict):
+        source = part["source"]
+        if source.get("type") == "base64" and isinstance(source.get("data"), str):
+            return _inline_size(source["data"])
+        return 0
+    holder = part.get("image_url") or part.get("image")
+    url = holder.get("url") if isinstance(holder, dict) else holder
+    if isinstance(url, str) and url.startswith("data:"):
+        _, _, payload = url.partition(",")
+        return _inline_size(payload)
+    return 0
+
+
+def validate_inline_media(body: dict) -> None:
+    """Refuse, with a readable reason, anything still above the ceiling.
+
+    Called after :func:`shrink_inline_media`, so a hit here means resizing was
+    turned off, Pillow could not reopen the image, or the picture could not be
+    squeezed under the limit even after downscaling.
+    """
+    index = 0
+    for blocks in _media_containers(body):
+        for part in blocks:
+            if not isinstance(part, dict):
+                continue
+            index += 1
+            size = _part_size(part)
+            if size > settings.media_max_bytes:
+                raise ConversionError(_too_big(index, size))
+
+
+# ---------------------------------------------------------------------------
 # OpenAI -> Anthropic
 # ---------------------------------------------------------------------------
 def _content_blocks(content: Any) -> list[dict]:
@@ -41,6 +243,7 @@ def _content_blocks(content: Any) -> list[dict]:
         return [{"type": "text", "text": str(content)}]
 
     blocks: list[dict] = []
+    images = 0
     for part in content:
         if isinstance(part, str):
             blocks.append({"type": "text", "text": part})
@@ -58,9 +261,13 @@ def _content_blocks(content: Any) -> list[dict]:
                 url = url.get("url")
             if not url:
                 continue
+            images += 1
             if url.startswith("data:"):
                 header, _, payload = url.partition(",")
                 media_type = header[5:].split(";")[0] or "image/png"
+                size = _inline_size(payload)
+                if size > settings.media_max_bytes:
+                    raise ConversionError(_too_big(images, size))
                 blocks.append(
                     {
                         "type": "image",

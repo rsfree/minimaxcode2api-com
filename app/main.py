@@ -47,7 +47,9 @@ from .convert import (
     build_anthropic_request,
     build_openai_response,
     iter_sse_events,
+    shrink_inline_media,
     stream_openai,
+    validate_inline_media,
 )
 from .media import MediaError
 from .upstream import UpstreamError, upstream
@@ -658,6 +660,10 @@ async def chat_completions(request: Request):
 
     try:
         body = await _read_json(request)
+        # Oversized inline images are re-encoded here rather than rejected: the
+        # upstream's 10 MiB ceiling is about bytes on the wire, so a normal
+        # high-quality photo trips it and the caller has no way to fix it.
+        await shrink_inline_media(body)
         anthropic_payload = build_anthropic_request(body)
     except ConversionError as exc:
         return error_response(400, str(exc), "invalid_request_error")
@@ -759,6 +765,10 @@ async def anthropic_messages(request: Request):
 
     try:
         body = await _read_json(request)
+        # Anthropic-shaped callers send the same 10 MiB ceiling a beating; the
+        # bytes live in source.data here instead of a data: URI.
+        await shrink_inline_media(body)
+        validate_inline_media(body)
     except ConversionError as exc:
         return error_response(400, str(exc), "invalid_request_error")
 

@@ -319,10 +319,10 @@ GATEWAY_PORT=8080
 
 ### 哪些配置能在线改、哪些必须重建
 
-面板「配置 → 运行配置」可以**不改 `.env`、不重建容器**直接改这 12 项：
-`RETRY_ATTEMPTS`、`MEDIA_MIN_CREDITS`、`UPSTREAM_TIMEOUT`、`DEFAULT_MAX_TOKENS`、`UPSTREAM_TRANSPORT`、
-`TOKEN_POOL_WATCH`、`PROBE_AUTO`/`PROBE_INTERVAL`、`SIGNIN_AUTO`/`SIGNIN_INTERVAL_HOURS`、
-`METRICS_RETENTION_DAYS`、`EXPOSE_RETIRED_MODELS`。
+面板「配置 → 运行配置」可以**不改 `.env`、不重建容器**直接改这 13 项：
+`RETRY_ATTEMPTS`、`MEDIA_MIN_CREDITS`、`MEDIA_COMPRESS`、`UPSTREAM_TIMEOUT`、`DEFAULT_MAX_TOKENS`、
+`UPSTREAM_TRANSPORT`、`TOKEN_POOL_WATCH`、`PROBE_AUTO`/`PROBE_INTERVAL`、
+`SIGNIN_AUTO`/`SIGNIN_INTERVAL_HOURS`、`METRICS_RETENTION_DAYS`、`EXPOSE_RETIRED_MODELS`。
 
 改动写在 `/data/runtime.json`（容器内的卷，备份与迁移记得带上它），优先级高于 `.env`；
 重建容器、换镜像都不丢。面板点「重置」= 删掉该条覆盖，回到 `.env` 的值。
@@ -579,6 +579,7 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | `429` / 限流 | 账号额度或并发限制 | 降并发、错峰，或换账号 |
 | `502 upstream error` + 具体 message | 上游返回的业务错误，原文透传 | 按 message 处理 |
 | 生图 / TTS / 音乐返回 `402` | 账号 credits 耗尽（原文是 `plan balance has run out`，网关会换成中性文案） | 桌面端充值；该号只停图片通道 15 分钟，对话照常。全池都不够时才会把 402 返给你 |
+| 对话报 `400 media exceeds size limit: max 10485760 bytes (2013)` | 单张图超过上游 **10 MiB**，按传输字节算、不按像素（实测 10485760 通过、10485761 拒绝；换成 URL 也一样） | 内联图网关会自动重编码（日志有 `resized inline image … (jpeg)`），仍报错说明 `MEDIA_COMPRESS=0` 或图压不下来；URL 图网关不下载，只能自己先降到 10 MiB 内 |
 | 对话 `503 no usable account: every account is out of credits right now` | 全池都撞了 1008：当天的免费额度用完了（额度只在签到时到账） | 看 message 里的 `earliest retry in …`；网关每 6 小时签到一轮、并会在 00:10 后立刻跨日签到，签到成功即解除全部额度冷却。要更早恢复就加号 / 充值 |
 | 号还有积分但生图一直 402 | 余额够聊天、不够一次生成：1 张 1K 图约 115 credits | 看面板积分列；低于 `MEDIA_MIN_CREDITS`（默认 115）的号会被自动跳过，调低门槛没用，得充值/签到 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单（H3 4s = 320 credits） | 充值，或改用 `MiniMax-Hailuo-2.3` 6s |

@@ -935,6 +935,51 @@ TTS 额外支持 `emotion`（`happy` / `sad` / `angry` / `fearful` / `disgusted`
 
 视频任务的 `status` 取值：`submitted` / `queued` / `running` / `succeeded` / `failed` / `cancelled`。
 
+### 3.8 对话里的图片：单张 ≤ 10 MiB
+
+上游对**单张媒体**有硬上限 **10485760 字节（10 MiB）**，超了回业务码 `2013`
+`media exceeds size limit: max 10485760 bytes`。这个上限**按传输字节算，不是按像素**——
+一张 4000×3000 的 JPEG 存到 6 MB 没问题，同样的图存成无损 PNG 到 12 MB 就会被拒。
+
+实测边界（2026-11-16，`POST /v1/chat/completions` 带一张图）：
+
+| 单张大小 | 结果 |
+|---|---|
+| `10485760` 字节 | ✅ 200，模型正常描述图片 |
+| `10485761` 字节 | ❌ 400 `media exceeds size limit: max 10485760 bytes (2013)` |
+| 11 MB 但通过 CDN URL 传 | ❌ 同样 400 —— **URL 也躲不过**，上游会先把文件下下来再量 |
+
+网关的处理分三种：
+
+| 传入 | 网关行为 |
+|---|---|
+| 内联 data URI / `source.data`，≤ 10 MiB | 原样透传，一个字节都不动 |
+| 内联，> 10 MiB | **自动重编码**：JPEG quality 从 90 逐级降到 42，仍不够就按 0.85 倍缩分辨率，直到塞进 10 MiB。日志记一条 `resized inline image 12.4 MiB -> 8.9 MiB (jpeg)`，请求不会失败 |
+| URL，> 10 MiB | 不动（不下载就不知道多大，下载失败比让上游报错更糟），上游的 2013 会被翻成可执行文案（见下） |
+
+两个入口都覆盖：`/v1/chat/completions` 的 `{"type":"image_url","image_url":{"url":"data:..."}}`
+和 `/v1/messages` 的 `{"type":"image","source":{"type":"base64",...}}`。
+
+关掉压缩（`MEDIA_COMPRESS=0`，运行配置里也能改）就变成明确拒绝，而不是把上游原文丢给调用方：
+
+```json
+{
+  "error": {
+    "message": "image #1 is 11.5 MiB (12018869 bytes); this channel accepts at most 10 MiB (10485760 bytes) per image — send a smaller image or turn on automatic resizing (MEDIA_COMPRESS=1)",
+    "type": "invalid_request_error"
+  }
+}
+```
+
+URL 超限时（网关量不了）文案换成：
+
+```json
+{"error": {"message": "a media item in this request is larger than the channel allows (10 MiB per image, counted in bytes); send a smaller image and retry", "type": "upstream_error"}}
+```
+
+**压缩是有损的**：一张 12 MiB 的 PNG 会被转成 9 MiB 的 JPEG，细密的文字或线稿会有可见损失。
+要求无损就自己先降到 10 MiB 以内再发，或者传一个 ≤ 10 MiB 的 CDN URL。
+
 ---
 
 ## 四、请求链路
@@ -977,12 +1022,13 @@ flowchart LR
 
 ### 运行配置在线改（不用重建容器）
 
-控制台「配置 → 运行配置」这 12 项可以直接改，保存后**下一条请求就生效**：
+控制台「配置 → 运行配置」这 13 项可以直接改，保存后**下一条请求就生效**：
 
 | 配置项 | 变量 | 说明 |
 |---|---|---|
 | 重试次数 | `RETRY_ATTEMPTS` | 0–50 |
 | 媒体积分门槛 | `MEDIA_MIN_CREDITS` | 派生成任务前要求的最低积分（一张图按此值 × 张数）；0 = 不预筛 |
+| 对话大图压缩 | `MEDIA_COMPRESS` | 内联图片超 10 MiB 时自动重编码，见 §3.8 |
 | 上游超时 | `UPSTREAM_TIMEOUT` | 秒；改完会重建 httpx 连接池 |
 | 默认 max_tokens | `DEFAULT_MAX_TOKENS` | 客户端没给时兜底 |
 | 出站传输 | `UPSTREAM_TRANSPORT` | `auto` / `httpx` / `curl` |
@@ -1043,6 +1089,8 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/js
 | `MINIMAX_MCP_BASE` | 由 `MINIMAX_BASE_URL` 推导 | 上游多模态 MCP 代理地址，默认把 `/llm/v1` 换成 `/mcp` |
 | `DEFAULT_MAX_TOKENS` | `8192` | 客户端没传 `max_tokens` 时用 |
 | `RETRY_ATTEMPTS` | `3` | 一次调用最多重试几次。`0` = 只试一次；单位是「尝试」不是「账号」，详见第八节 |
+| `MEDIA_COMPRESS` | `1` | 对话里的内联图片超过 10 MiB 时自动重编码为 JPEG（`0` = 直接拒绝并说明原因） |
+| `MEDIA_MAX_BYTES` | `10485760` | 单张图片的字节上限，改小等于收紧、改大没有意义（上游就是 10 MiB） |
 | `RUNTIME_CONFIG` | `/data/runtime.json` | 控制台改的运行配置存这里（容器内）；本地是 `data/runtime.json` |
 | `UPSTREAM_TIMEOUT` | `600` | 上游超时（秒） |
 | `REQUEST_BODY_LIMIT` | 64 MiB | 请求体上限 |

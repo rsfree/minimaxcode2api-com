@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.catalog import DEFAULT_MODEL, resolve_model, visible_models  # noqa: E402
 from app.convert import (  # noqa: E402
+    ConversionError,
     build_anthropic_request,
     build_openai_response,
     stream_openai,
@@ -1439,6 +1440,32 @@ def test_quota_errors_do_not_advertise_the_subscription_plan() -> None:
     assert "upstream HTTP 502" in for_caller("upstream HTTP 502 while reading the body", 502)
 
 
+def test_oversized_media_error_explains_the_limit() -> None:
+    """2013 carries a byte count but no fix; the caller needs the fix.
+
+    The channel answers ``media exceeds size limit: max 10485760 bytes (2013)``
+    for any single image over 10 MiB. That number is a limit, not an
+    instruction — a caller retrying the same bytes gets the same answer, so the
+    message names the ceiling and the one thing worth trying.
+    """
+    from app import redact
+    from app.main import error_response
+
+    upstream = "media exceeds size limit: max 10485760 bytes (2013)"
+    message = redact.for_caller(upstream, 400)
+    assert "10 MiB" in message, message
+    assert "10485760" not in message, message
+    assert "smaller image" in message, message
+    assert redact.leaks(message) is False
+
+    body = json.loads(error_response(400, upstream).body)
+    assert body["error"]["message"] == message
+    assert body["error"]["type"] != "insufficient_quota"
+
+    # An unrelated 400 keeps its own wording.
+    assert "unknown model" in redact.for_caller("unknown model 'x'", 400)
+
+
 def test_redaction_masks_bare_token_prefixes() -> None:
     """``Token.short`` is ``access_token[:12]`` — too short for a regex, too real
     to ship. The pool's live values are replaced by identity, not by pattern."""
@@ -1988,6 +2015,270 @@ def test_image_model_mapping() -> None:
             raise AssertionError(f"{bad} must not be accepted by the image channel")
 
 
+_OVERSIZED_PNG: bytes | None = None
+
+
+def _oversized_png() -> bytes:
+    """A noise PNG above the channel's 10 MiB ceiling, built once per run.
+
+    Random pixels cannot be compressed, so the file really is bigger than the
+    limit instead of merely claiming to be.
+    """
+    global _OVERSIZED_PNG
+    if _OVERSIZED_PNG is None:
+        import io
+        import os
+
+        from PIL import Image
+
+        side = 2000
+        image = Image.frombytes("RGB", (side, side), os.urandom(side * side * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        _OVERSIZED_PNG = buffer.getvalue()
+    return _OVERSIZED_PNG
+
+
+def test_oversized_inline_image_is_resized_before_it_ships() -> None:
+    """The channel answers 2013 above 10 MiB, counted in bytes, not pixels.
+
+    Verified on the live channel (2026-11-16): 10485760 bytes pass, 10485761
+    fail with ``media exceeds size limit``. A caller cannot preprocess its own
+    image, so an inline picture that overshoots is re-encoded here — otherwise
+    a perfectly ordinary high-quality photo is a hard failure.
+    """
+    import base64
+
+    from app.config import settings
+    from app.convert import shrink_inline_media
+
+    original = _oversized_png()
+    assert len(original) > settings.media_max_bytes, len(original)
+
+    body = {
+        "model": "MiniMax-M3.1-Flash",
+        "max_tokens": 32,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64," + base64.b64encode(original).decode()
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    asyncio.run(shrink_inline_media(body))
+    rewritten = body["messages"][0]["content"][1]["image_url"]["url"]
+    assert rewritten.startswith("data:image/jpeg;base64,"), rewritten[:32]
+    _, _, payload = rewritten.partition(",")
+    resized = base64.b64decode(payload)
+    assert len(resized) <= settings.media_max_bytes, len(resized)
+    assert len(resized) < len(original)
+
+    # The translated block carries the shrunken bytes and the new media type.
+    request = build_anthropic_request(body)
+    block = request["messages"][0]["content"][1]
+    assert block["source"]["type"] == "base64"
+    assert block["source"]["media_type"] == "image/jpeg"
+    assert block["source"]["data"] == payload
+
+
+def test_oversized_inline_image_is_refused_when_resizing_is_off() -> None:
+    """With MEDIA_COMPRESS=0 the caller gets a readable reason, not a 2013 echo."""
+    import base64
+
+    from app.config import settings
+    from app.convert import ConversionError, shrink_inline_media
+
+    original = _oversized_png()
+    body = {
+        "model": "MiniMax-M3.1-Flash",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64," + base64.b64encode(original).decode()
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    previous = settings.media_compress
+    settings.media_compress = False
+    try:
+        asyncio.run(shrink_inline_media(body))  # must be a no-op
+        assert body["messages"][0]["content"][0]["image_url"]["url"].startswith("data:image/png")
+        try:
+            build_anthropic_request(body)
+        except ConversionError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("an oversized inline image must be refused")
+    finally:
+        settings.media_compress = previous
+
+    assert "10 MiB" in message, message
+    assert str(settings.media_max_bytes) in message, message
+    assert "image #1" in message, message
+
+
+def test_anthropic_native_image_block_is_resized() -> None:
+    """``POST /v1/messages`` skips translation, so its extra shape needs its own pass.
+
+    There the image is ``{"type": "image", "source": {"type": "base64", ...}}``
+    rather than a data URI inside ``image_url``. Without handling it, Anthropic
+    clients would still collect a 2013 while OpenAI clients sailed through.
+    """
+    import base64
+
+    from app.config import settings
+    from app.convert import shrink_inline_media, validate_inline_media
+
+    original = _oversized_png()
+    body = {
+        "model": "MiniMax-M3.1-Flash",
+        "max_tokens": 32,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64.b64encode(original).decode(),
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    asyncio.run(shrink_inline_media(body))
+    source = body["messages"][0]["content"][1]["source"]
+    assert source["media_type"] == "image/jpeg", source["media_type"]
+    assert len(base64.b64decode(source["data"])) <= settings.media_max_bytes
+    validate_inline_media(body)  # must not raise
+
+    # With resizing off the validator is what turns 2013 into a readable 400.
+    previous = settings.media_compress
+    settings.media_compress = False
+    try:
+        raw_body = {
+            "model": "MiniMax-M3.1-Flash",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": base64.b64encode(original).decode(),
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        asyncio.run(shrink_inline_media(raw_body))
+        try:
+            validate_inline_media(raw_body)
+        except ConversionError as exc:
+            assert "10 MiB" in str(exc), str(exc)
+        else:
+            raise AssertionError("validate_inline_media must reject an oversized block")
+    finally:
+        settings.media_compress = previous
+
+
+def test_chat_endpoint_resizes_an_oversized_image_before_it_ships() -> None:
+    """End to end: a 12 MiB inline image goes in, a ≤10 MiB JPEG reaches upstream.
+
+    This is the path a real caller took when it collected
+    ``media exceeds size limit: max 10485760 bytes (2013)`` — the gateway used
+    to forward the bytes untouched and let the channel reject them.
+    """
+    import base64
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from app import upstream as upstream_mod
+    from app.config import settings
+    from app.main import app
+
+    captured: dict = {}
+
+    async def fake_messages_ex(payload):
+        captured.update(payload)
+        return (
+            {
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": payload.get("model"),
+                "content": [{"type": "text", "text": "a photo of something"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 3},
+            },
+            "unit-test-account",
+        )
+
+    original = _oversized_png()
+    body = {
+        "model": "MiniMax-M3.1-Flash",
+        "max_tokens": 32,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64," + base64.b64encode(original).decode()
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    keys = settings.api_keys
+    settings.api_keys = ["unit-test-key"]
+    try:
+        with patch.object(upstream_mod.upstream, "messages_ex", fake_messages_ex):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"x-api-key": "unit-test-key"},
+                    json=body,
+                )
+    finally:
+        settings.api_keys = keys
+
+    assert response.status_code == 200, response.text
+    image = next(b for b in captured["messages"][0]["content"] if b["type"] == "image")
+    assert image["source"]["media_type"] == "image/jpeg"
+    assert len(base64.b64decode(image["source"]["data"])) <= settings.media_max_bytes
+
+
 def test_ark_inline_image_is_uploaded() -> None:
     """Ark allows `image` as a data: URI; the tool only reads URLs."""
     from app import media
@@ -2461,6 +2752,10 @@ def main() -> None:
         test_ark_size_and_measured_image_info,
         test_image_geometry_comes_from_size_alone,
         test_image_model_mapping,
+        test_oversized_inline_image_is_resized_before_it_ships,
+        test_oversized_inline_image_is_refused_when_resizing_is_off,
+        test_anthropic_native_image_block_is_resized,
+        test_chat_endpoint_resizes_an_oversized_image_before_it_ships,
         test_ark_inline_image_is_uploaded,
         test_image_accepts_multiple_references,
         test_a_poor_account_still_answers_chat_but_not_images,
@@ -2498,6 +2793,7 @@ def main() -> None:
         test_admin_logs_pagination,
         test_redaction_hides_accounts_and_tokens,
         test_quota_errors_do_not_advertise_the_subscription_plan,
+        test_oversized_media_error_explains_the_limit,
         test_redaction_masks_bare_token_prefixes,
         test_pool_exhaustion_never_names_the_mailbox_to_the_caller,
         test_transport_status_never_escapes_as_http,

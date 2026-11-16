@@ -71,6 +71,10 @@ EDITABLE: dict[str, dict] = {
         "kind": "float", "min": 0, "max": 100000,
         "note": "派生成任务前要求的最低积分（一张 1K 图约 115，按张数乘）。0 = 不按余额预筛",
     },
+    "media_compress": {
+        "kind": "bool",
+        "note": "对话里的内联图片超过 10 MiB 时自动重编码（改画质，但请求不会失败）",
+    },
     "request_timeout": {
         "kind": "float", "min": 5, "max": 3600,
         "note": "上游超时（秒），改完立即重建连接池",
@@ -212,6 +216,17 @@ class Settings:
     # 300 s round trip to collect a 402. 0 turns the filter off.
     media_min_credits: float = field(
         default_factory=lambda: float(_env("MEDIA_MIN_CREDITS", "115") or 115)
+    )
+
+    # The upstream rejects any single media item above 10 MiB on the wire and
+    # answers 2013 "media exceeds size limit". That ceiling is about bytes, not
+    # pixels, so an ordinary 12 MP phone photo at quality 100 trips it. A
+    # gateway cannot ask the caller to preprocess, so it re-encodes inline
+    # images that overshoot. Turning this off restores plain rejection with a
+    # readable message instead of silent re-compression.
+    media_compress: bool = field(default_factory=lambda: _env_bool("MEDIA_COMPRESS", True))
+    media_max_bytes: int = field(
+        default_factory=lambda: _env_int("MEDIA_MAX_BYTES", 10 * 1024 * 1024)
     )
 
     def __post_init__(self) -> None:

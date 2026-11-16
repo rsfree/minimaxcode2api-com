@@ -61,6 +61,15 @@ PLAN = "<plan>"
 # free of numbers: the account, the balance and the model are all ours.
 QUOTA = "upstream quota exhausted for this account; please retry later"
 
+# 2013 answers an oversized inline image with "media exceeds size limit: max
+# 10485760 bytes", which names a number but not a fix. The caller cannot see
+# which of their images crossed it, so state the limit and what to do.
+MEDIA_TOO_BIG = (
+    "a media item in this request is larger than the channel allows "
+    "(10 MiB per image, counted in bytes); send a smaller image and retry"
+)
+_TOO_BIG = re.compile(r"(?i)media exceeds size limit")
+
 
 def for_caller(text: str, status: int = 0) -> str:
     """The only way an error message should leave the process.
@@ -71,6 +80,8 @@ def for_caller(text: str, status: int = 0) -> str:
     """
     if status == 402:
         return QUOTA
+    if _TOO_BIG.search(text or ""):
+        return MEDIA_TOO_BIG
     return scrub(text)
 
 
