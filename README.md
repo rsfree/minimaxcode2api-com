@@ -93,7 +93,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY
 
 ---
 
-## 二、30 秒跑起来（本机已登录桌面端）
+## 二、30 秒跑起来
 
 ```bash
 git clone https://github.com/rsfree/minimaxcode2api-com.git && cd minimaxcode2api-com
@@ -102,8 +102,43 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt   # Windows: .
 GATEWAY_API_KEY=sk-local .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
-macOS / Linux 会自动读取桌面端的 `~/.minimax/auth/prod/en/mcode-public/auth.json`，
-**不需要手动复制 token**。桌面端每次刷新 token，网关下一次请求就跟着用新的。
+**凭证要显式给，网关不会自己去拿。** 启动日志里如果看到这一行，说明本机有桌面端凭证但没被使用：
+
+```
+WARNING found the desktop client's credential at ~/.minimax/.../auth.json but not using it
+```
+
+这是刻意设计的。原因是一份 OAuth 会话只能有一个刷新者：refresh token 单次使用，上游收到重复值会
+**revoke 整个会话**。网关只要拿它续期一次，桌面端下次刷新就是 `invalid_grant`，用户被迫重新登录。
+所以「顺手帮你找到凭证」实际是一次接管，必须你点头。
+
+两种接法，按你的情况选一个：
+
+**只想让网关用这个号（桌面端可以不用）** —— 显式授权，接受桌面端被踢：
+
+```bash
+MINIMAX_AUTH_FILE=~/.minimax/auth/prod/en/mcode-public/auth.json \
+GATEWAY_API_KEY=sk-local .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+网关写回时会**按桌面端的 schema 改**（只动 `accessToken` / `refreshToken` / `expiresAtMs` /
+`generation`，`schemaVersion`、`clientId`、`scopes`、`audience`、`tokenType` 原样保留），
+所以桌面端下次启动不会因为格式问题报 `CREDENTIAL_RECORD_CORRUPT`。但会话归属仍是同一个，
+两边同时刷新时后到的一方会失败。
+
+**桌面端和网关都要用** —— 别共用同一个号。给网关单独登一个账号进池子，桌面端用另一个：
+
+```bash
+.venv/bin/python -m app.login --out data/tokens/second-account.json
+```
+
+```bash
+TOKEN_POOL=data/tokens GATEWAY_API_KEY=sk-local \
+  .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+> 反过来说：**不要把桌面端的 `auth.json` 拷进 `TOKEN_POOL` 当第二个来源。** 拷过去之后两边仍然是
+> 同一个 refresh token，谁先刷新谁就把对方踢掉。
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -1174,7 +1209,7 @@ flowchart LR
     G -.->|可选出口| P[UPSTREAM_PROXY]
 ```
 
-网关本身无状态：凭证只从环境变量 / `token.json` / 桌面端 `auth.json` 读，不落日志、不下发。
+网关本身无状态：凭证只从环境变量 / `token.json` / 显式指定的 `MINIMAX_AUTH_FILE` 读，不落日志、不下发。
 
 ---
 
@@ -1262,7 +1297,7 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/js
 | `MINIMAX_ACCESS_TOKEN` | 空 | 直接给一个 access token（约 12h 失效） |
 | `MINIMAX_REFRESH_TOKEN` | 空 | 只给 refresh token，网关自己续期 |
 | `TOKEN_STORE` | `/data/token.json` | 网关自己管理的 token 文件，会就地刷新 |
-| `MINIMAX_AUTH_FILE` | 自动探测 | 桌面端 `auth.json` 路径 |
+| `MINIMAX_AUTH_FILE` | **空** | 桌面端 `auth.json` 路径。**默认不填 = 不接管**：填了才会加载它，代价是这个号的桌面端会被踢下线（refresh token 单次使用）。写回按桌面端 schema 合并，不会破坏它的格式 |
 | `MINIMAX_BASE_URL` | 按区域 | 上游 LLM 地址 |
 | `MINIMAX_MCP_BASE` | 由 `MINIMAX_BASE_URL` 推导 | 上游多模态 MCP 代理地址，默认把 `/llm/v1` 换成 `/mcp` |
 | `DEFAULT_MAX_TOKENS` | `8192` | 客户端没传 `max_tokens` 时用 |

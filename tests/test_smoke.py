@@ -472,6 +472,145 @@ def test_token_refresh_keeps_fields_it_does_not_own() -> None:
         assert saved["note"] == "手写的备注"
 
 
+def test_desktop_credential_is_rewritten_under_its_own_schema() -> None:
+    """桌面端的 auth.json 只能按它自己的 schema 改。
+
+    2026-11-16 的事故：网关刷新后按自家的 6 个字段整份重写，抹掉了
+    schemaVersion / tokenType / clientId / scopes / audience / generation。
+    客户端启动时逐字段校验，缺一个就抛 CREDENTIAL_RECORD_CORRUPT，
+    用户被迫重新登录。
+    """
+    import tempfile
+
+    from app.auth import _desktop_record_valid, _write_record, Token
+
+    desktop = {
+        "schemaVersion": 1,
+        "accessToken": "a" * 20,
+        "refreshToken": "r" * 20,
+        "tokenType": "Bearer",
+        "clientId": "mcode-public",
+        "scopes": ["agent.default"],
+        "audience": "agent-backend",
+        "expiresAtMs": 1795032556939,
+        "generation": 6,
+    }
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "auth.json"
+        path.write_text(json.dumps(desktop, indent=2) + "\n", "utf-8")
+        _write_record(
+            path,
+            Token(access_token="new-access", refresh_token="new-refresh", expires_at_ms=1795100000000),
+            "en",
+        )
+        saved = json.loads(path.read_text("utf-8"))
+        assert saved["accessToken"] == "new-access"
+        assert saved["refreshToken"] == "new-refresh"
+        assert saved["expiresAtMs"] == 1795100000000
+        # 客户端拥有的字段必须原样留着，否则下次启动读不进来。
+        assert saved["schemaVersion"] == 1
+        assert saved["tokenType"] == "Bearer"
+        assert saved["clientId"] == "mcode-public"
+        assert saved["scopes"] == ["agent.default"]
+        assert saved["audience"] == "agent-backend"
+        assert saved["generation"] == 7
+        assert _desktop_record_valid(saved)
+        # 我们的字段不该混进客户端文件。
+        assert "obtainedAtMs" not in saved and "region" not in saved
+
+        # 已经坏掉的文件：不写。写下去只会让客户端更难恢复。
+        broken = {k: v for k, v in desktop.items() if k != "tokenType"}
+        bad = Path(tmp) / "broken.json"
+        bad.write_text(json.dumps(broken), "utf-8")
+        before = bad.read_bytes()
+        _write_record(bad, Token(access_token="x", refresh_token="y"), "en")
+        assert bad.read_bytes() == before
+
+
+def test_auth_file_reads_both_layouts() -> None:
+    """老导出格式是 records 包一层，桌面端 3.1.x 是平铺，两种都要能读。"""
+    import tempfile
+
+    from app.auth import _parse_auth_file
+
+    flat = {
+        "schemaVersion": 1,
+        "accessToken": "tok-flat",
+        "refreshToken": "ref-flat",
+        "tokenType": "Bearer",
+        "clientId": "mcode-public",
+        "scopes": ["agent.default"],
+        "audience": "agent-backend",
+        "expiresAtMs": 1795032556939,
+        "generation": 1,
+    }
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        one = Path(tmp) / "flat.json"
+        one.write_text(json.dumps(flat), "utf-8")
+        assert (_parse_auth_file(one) or {}).get("accessToken") == "tok-flat"
+
+        two = Path(tmp) / "records.json"
+        two.write_text(json.dumps({"records": {"uuid-1": flat}}), "utf-8")
+        assert (_parse_auth_file(two) or {}).get("accessToken") == "tok-flat"
+
+        # 无关文件仍然返回 None，不能凭空造出一个空 token。
+        three = Path(tmp) / "noise.json"
+        three.write_text(json.dumps({"hello": "world"}), "utf-8")
+        assert _parse_auth_file(three) is None
+
+
+def test_desktop_credentials_are_not_adopted_by_default() -> None:
+    """没显式配置就不碰桌面端凭证。
+
+    用它的 access token 12 小时后必然要 refresh，而 refresh token 单次使用：
+    spend 一次，桌面端就被踢下线。所以「顺手帮用户找到凭证」实际是一次接管，
+    必须在 MINIMAX_AUTH_FILE 里明确同意才算数。
+    """
+    import tempfile
+
+    from app.auth import TokenPool
+    from app.config import settings
+
+    desktop = {
+        "schemaVersion": 1,
+        "accessToken": "tok-desktop",
+        "refreshToken": "ref-desktop",
+        "tokenType": "Bearer",
+        "clientId": "mcode-public",
+        "scopes": ["agent.default"],
+        "audience": "agent-backend",
+        "expiresAtMs": 1795032556939,
+        "generation": 3,
+    }
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "auth.json"
+        path.write_text(json.dumps(desktop), "utf-8")
+
+        saved = (settings.auth_file, settings.token_pool, settings.access_token,
+                 settings.token_store, settings.refresh_token)
+        settings.token_pool = ""
+        settings.access_token = ""
+        settings.token_store = ""
+        settings.refresh_token = ""
+        try:
+            # 默认：只提示，不加载。
+            settings.auth_file = ""
+            pool = TokenPool()
+            pool._load()
+            assert [t.access_token for t in pool._tokens] == []
+
+            # 显式配置：加载，并把文件当作写回目标。
+            settings.auth_file = str(path)
+            pool = TokenPool()
+            pool._load()
+            assert [t.access_token for t in pool._tokens] == ["tok-desktop"]
+            assert pool._tokens[0].origin == path
+            assert pool._tokens[0].refresh_token == "ref-desktop"
+        finally:
+            (settings.auth_file, settings.token_pool, settings.access_token,
+             settings.token_store, settings.refresh_token) = saved
+
+
 def test_console_asset() -> None:
     """The console is a static file copied into the image — Go-style embed-less.
 
@@ -3051,6 +3190,9 @@ def main() -> None:
         test_console_signin_unparks_only_the_accounts_it_claimed,
         test_checkin_handles_a_file_holding_several_accounts,
         test_token_refresh_keeps_fields_it_does_not_own,
+        test_desktop_credential_is_rewritten_under_its_own_schema,
+        test_auth_file_reads_both_layouts,
+        test_desktop_credentials_are_not_adopted_by_default,
         test_console_asset,
         test_pool_hot_reload,
         test_pool_reload_survives_write_race,
