@@ -200,6 +200,29 @@ python -m app.provision --refresh
 > `signin` 是签到日志（网关自动写，用来保证一天只领一次）；删掉它只会让网关再问一次上游，
 > 上游会说「今天已领」，不会重复发积分。
 
+### 本地验证别和线上抢同一个号
+
+`refreshToken` 每次刷新都会轮换，**一个号同时只能有一个刷新者**：本地跑一次刷新，线上那份就
+`invalid_grant`。所以本地要做验证，是从线上池里**借一个出来**，不是复制一份：
+
+```bash
+# 1) 线上：把这个号移出池子（移进归档目录，不删，随时能放回去）
+ssh root@<服务器> 'cd /opt/minimax-code2api/data && mkdir -p token-archive \
+  && mv tokens/<名字>.json token-archive/'
+
+# 2) 本地：取线上那份「最新的」凭证（本地旧副本的 refreshToken 早已被线上用掉，救不回来）
+mkdir -p data/tokens
+ssh root@<服务器> 'cat /opt/minimax-code2api/data/token-archive/<名字>.json' > data/tokens/<名字>.json
+
+# 3) 启动。中国大陆出口会被 307 到 agent.minimaxi.com（旧 CN 源），必须给一条海外出口
+#    ssh -N -D 1080 root@<服务器>  先在另一个窗口开着
+TOKEN_POOL=data/tokens GATEWAY_API_KEY=sk-local UPSTREAM_PROXY=socks5://127.0.0.1:1080 \
+  .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8099
+```
+
+> 本地实例停掉之后再把它放回线上：`mv token-archive/<名字>.json tokens/`。
+> 两边同时持有同一个号，只会互相把对方踢下线。账号文件里的 `signin` 日志不参与这件事。
+
 ### 网页加号：在控制台里贴账号
 
 `/ui → 账号池 → ＋ 添加账号`，把 `邮箱 密码` 一行一个贴进去就行（空格 / Tab / 逗号都认），
