@@ -617,6 +617,8 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.versi
 | 控制台「积分余额」一直是 `—` / 探针数据不动 | `PROBE_AUTO=0`、`PROBE_INTERVAL=0`，或首轮还没跑完（启动后 8 秒开始，30 个号约 8 秒） | 点「刷新探针」，或 `curl -X POST -H "X-API-Key: $KEY" .../admin/probes/refresh`；**探针不花积分**，可以随便刷 |
 | 某个号探针报 `401` 但业务请求正常 | 探针不主动续期 token；业务请求触发续期后即恢复 | 不用处理，下一轮自动好；持续 401 说明 refresh token 也失效了 |
 | 日志 `ConnectError [WinError 10054]` / `SSL: UNEXPECTED_EOF` | 出口代理只放行 Windows schannel 指纹，拒 Python/OpenSSL 握手 | 留着 `UPSTREAM_TRANSPORT=auto` 让它自动退回 curl（镜像已装 curl）；退回只维持 5 分钟，之后自动再试 httpx |
+| `docker pull` 报 `lookup ghcr.io on 127.0.0.53:53: i/o timeout` | systemd-resolved 偶发超时，不是网络被封 | 先 `getent hosts ghcr.io` 复判：能解析、`curl -o /dev/null -s -w "%{http_code}" https://ghcr.io/v2/` 回 `401`（未带 token，属正常）就是可达，**直接重试 pull**，不要改 DNS 配置 |
+| 在服务器上 `curl -H "X-API-Key: $KEY" 127.0.0.1:39600/healthz` 回 `Invalid HTTP request received.` | 两件事都会触发：① 服务器 shell 有 `http_proxy`，curl 对 127.0.0.1 也走代理，请求行变成绝对 URL；② `.env` 是 CRLF，`$KEY` 尾部带 `\r`，注进请求头就是畸形请求 | `curl --noproxy "*" …`，且取值时 `\| tr -d "\r\n "`：`KEY=$(grep -E "^GATEWAY_API_KEY=" .env \| cut -d= -f2- \| tr -d "\r\n ")` |
 | 只有**长对话**报 500，错误是 `OSError: [Errno 7] Argument list too long: 'curl'` | 旧版本把请求体当命令行参数交给 curl，Linux 单个参数上限 128 KiB（`MAX_ARG_STRLEN`），超了就 exec 失败 | 升级到 2026-11-13 之后的镜像（请求体改走 stdin，无上限）；临时可 `UPSTREAM_TRANSPORT=httpx` 绕过 |
 
 看实时日志定位：
