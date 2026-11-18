@@ -12,6 +12,9 @@ Usage::
     # a file of "email<tab>password" or "email password" lines
     python -m app.provision --file accounts.txt
 
+    # the same, but from browser session cookies (no password needed)
+    python -m app.provision --cookies cookies.txt
+
     # refresh every stored token now
     python -m app.provision --refresh
 
@@ -32,7 +35,7 @@ import time
 from pathlib import Path
 from secrets import token_hex
 
-from .account_api import AccountError, provision, refresh
+from .account_api import AccountError, provision, provision_with_cookies, refresh
 from .config import settings
 
 
@@ -82,12 +85,67 @@ def _read_accounts(path: Path) -> list[tuple[str, str]]:
     return rows
 
 
+def _read_cookies(path: Path) -> list[tuple[str, str]]:
+    """``label<tab>cookie`` lines. The cookie half is kept verbatim.
+
+    Only the first run of whitespace is a separator: a Cookie header contains
+    plenty of spaces and semicolons of its own, and splitting on those would cut
+    the session in half and produce a confusing "not logged in" error.
+    """
+    rows: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2 or "=" not in parts[1]:
+            continue
+        rows.append((parts[0], parts[1].strip()))
+    return rows
+
+
+def _refresh_all(directory: Path, proxy: str | None, delay: float) -> int:
+    """Re-new every stored record: refresh token first, cookie as the fallback."""
+    files = sorted(p for p in directory.glob("*.json") if p.name != "index.json")
+    if not files:
+        print(f"no token files in {directory}", file=sys.stderr)
+        return 0
+    ok = 0
+    for path in files:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        label = record.get("email") or path.stem
+        session = record.get("session") if isinstance(record.get("session"), dict) else {}
+        try:
+            if record.get("refreshToken"):
+                updated = refresh(record, proxy=proxy)
+            elif session.get("cookie"):
+                updated = provision_with_cookies(
+                    session["cookie"], label, record.get("region") or "en", proxy
+                )
+                updated.setdefault("session", session)
+            else:
+                print(f"  SKIP {label}: no refresh token and no session cookie")
+                continue
+        except AccountError as exc:
+            print(f"  FAIL {label}: {exc}")
+            continue
+        path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+        ok += 1
+        print(f"  refreshed {label}")
+        time.sleep(delay)
+    print(f"\n{ok}/{len(files)} refreshed")
+    return ok
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Provision MiniMax Code accounts into the gateway pool")
     parser.add_argument("--email")
     parser.add_argument("--password")
     parser.add_argument("--file", help="list of email/password lines")
+    parser.add_argument("--cookie", help="one browser session cookie, with --email as its label")
+    parser.add_argument("--cookies", help="file of 'label<TAB>cookie' lines")
     parser.add_argument("--refresh", action="store_true", help="refresh every stored token")
+    parser.add_argument("--region", default=None, help="en (default) or cn, for cookie imports")
     parser.add_argument("--out", help="pool directory (default TOKEN_POOL or ./data/tokens)")
     parser.add_argument("--proxy", default=settings.upstream_proxy or None)
     args = parser.parse_args(argv)
@@ -96,24 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     delay = float(os.environ.get("PROVISION_DELAY", "1.5"))
 
     if args.refresh:
-        files = sorted(p for p in directory.glob("*.json") if p.name != "index.json")
-        if not files:
-            print(f"no token files in {directory}", file=sys.stderr)
-            return 2
-        ok = 0
-        for path in files:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            label = record.get("email") or path.stem
-            try:
-                updated = refresh(record, proxy=args.proxy)
-            except AccountError as exc:
-                print(f"  FAIL {label}: {exc}")
-                continue
-            path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
-            ok += 1
-            print(f"  refreshed {label}")
-            time.sleep(delay)
-        print(f"\n{ok}/{len(files)} refreshed")
+        ok = _refresh_all(directory, args.proxy, delay)
         return 0 if ok else 1
 
     accounts: list[tuple[str, str]] = []
@@ -121,14 +162,24 @@ def main(argv: list[str] | None = None) -> int:
         accounts += _read_accounts(Path(args.file))
     if args.email and args.password:
         accounts.append((args.email, args.password))
-    if not accounts:
-        parser.error("give --email/--password, --file, or --refresh")
+
+    cookies: list[tuple[str, str]] = []
+    if args.cookies:
+        cookies += _read_cookies(Path(args.cookies))
+    if args.cookie:
+        if not args.email:
+            parser.error("--cookie needs --email as the account label")
+        cookies.append((args.email, args.cookie))
+
+    if not accounts and not cookies:
+        parser.error("give --email/--password, --file, --cookies/--cookie, or --refresh")
 
     ok = 0
+    total = len(accounts) + len(cookies)
     for index, (email, password) in enumerate(accounts, 1):
-        print(f"[{index}/{len(accounts)}] {email}", end="", flush=True)
+        print(f"[{index}/{total}] {email} (password)", end="", flush=True)
         try:
-            record = provision(email, password, proxy=args.proxy)
+            record = provision(email, password, proxy=args.proxy, region=args.region or "en")
         except AccountError as exc:
             print(f"  FAIL {exc}")
             continue
@@ -137,7 +188,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  OK  {path.name}  access={record['accessToken'][:14]}…")
         time.sleep(delay)
 
-    print(f"\n{ok}/{len(accounts)} provisioned into {directory}")
+    region = args.region or settings.region
+    for index, (label, cookie) in enumerate(cookies, len(accounts) + 1):
+        print(f"[{index}/{total}] {label} (cookie)", end="", flush=True)
+        try:
+            record = provision_with_cookies(cookie, label, region, args.proxy)
+        except (AccountError, ValueError) as exc:
+            print(f"  FAIL {exc}")
+            continue
+        path = _write(directory, record)
+        ok += 1
+        print(f"  OK  {path.name}  access={record['accessToken'][:14]}…")
+        time.sleep(delay)
+
+    print(f"\n{ok}/{total} provisioned into {directory}")
     print(f"Run the gateway with TOKEN_POOL={directory}")
     return 0 if ok else 1
 

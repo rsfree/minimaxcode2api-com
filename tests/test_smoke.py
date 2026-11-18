@@ -12,6 +12,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# The cookie/session import tests live in their own module; the list in main() is
+# what CI runs, so they are merged there instead of adding a second CI command.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.catalog import DEFAULT_MODEL, resolve_model, visible_models  # noqa: E402
 from app.convert import (  # noqa: E402
@@ -20,6 +23,7 @@ from app.convert import (  # noqa: E402
     build_openai_response,
     stream_openai,
 )
+from test_session_import import TESTS as SESSION_TESTS  # noqa: E402
 
 
 def test_model_aliases() -> None:
@@ -853,13 +857,13 @@ def test_account_import_flow() -> None:
     gate.set()
     calls: list[str] = []
 
-    def fake_provision(email: str, password: str, proxy=None) -> dict:
+    def fake_provision(email: str, password: str, proxy=None, region: str = "en") -> dict:
         gate.wait(5)
         calls.append(email)
         if email.startswith("bad"):
             raise AccountError("wrong password", code=1001)
         return {
-            "region": "en",
+            "region": region,
             "email": email,
             "accessToken": f"tok-{email}",
             "refreshToken": "refresh",
@@ -3085,6 +3089,8 @@ def main() -> None:
         test_capacity_math,
         test_retry_budget_comes_from_config,
         test_runtime_config_is_writable_and_survives_a_restart,
+        # Cookie / session import (parsing, minting pipeline, pool re-mint).
+        *SESSION_TESTS,
     ]
     for test in tests:
         test()

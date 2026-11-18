@@ -218,6 +218,11 @@ TOKEN_POOL=/data/tokens
 `邮箱 密码`（一行一个，空格 / Tab / 逗号都行）→ 开始导入。逐行回显「已加入 / 已更新 / 失败原因」，
 写完当场进池。密码只在网关内存里过一遍换 token，不落盘。
 
+同一处切到「邮箱 Cookie」就可以**不用密码加号**：每行 `邮箱<空格>Cookie`，Cookie 取自已登录
+`agent.minimax.io` 的浏览器（F12 → Network → 任意请求 → Request Headers → `Cookie`）。
+cookie 会写进该账号的 json（`0600`），用处只有一个：refresh token 被上游拒时网关自己重换一对新凭证，
+否则那个号只能人工重加。**能读 `/data/tokens` 就能接管账号，按密码级别保护这个卷。**
+
 命令行等价写法（没有浏览器时）：
 
 ```bash
@@ -225,9 +230,19 @@ TOKEN_POOL=/data/tokens
 docker compose run --rm --entrypoint python minimax-code2api \
   -m app.provision --email new@mail.example.com --password 'Pa55word1' --out /data/tokens
 
+# cookie 方式（cookies.txt 每行 "邮箱<tab>cookie"，只读挂进临时容器）
+docker compose run --rm -v "$PWD/cookies.txt:/tmp/cookies.txt:ro" \
+  --entrypoint python minimax-code2api \
+  -m app.provision --cookies /tmp/cookies.txt --out /data/tokens
+
 # 或者走和网页同一个接口（后台任务，可轮询进度）
 curl -s -H "X-API-Key: $KEY" -H 'content-type: application/json' \
   -d '{"text":"a@mail.example.com pw1\nb@mail.example.com pw2"}' \
+  http://127.0.0.1:39600/admin/accounts/import
+
+# cookie 方式：多一个 mode 字段
+curl -s -H "X-API-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"mode":"cookie","text":"a@mail.example.com _token=...; sessionid=..."}' \
   http://127.0.0.1:39600/admin/accounts/import
 
 # 等 10 秒，看池子变大（不要 restart）

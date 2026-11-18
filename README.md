@@ -188,6 +188,93 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/admin/accounts/import   # 轮
 - 同一邮箱再提交一次等于重新授权并覆盖旧 token 文件（回显「已更新」），不会出现两个同号；
 - 失败原因会区分「登录被拒 / 没有可授权分组 / 超时」，一个号失败不影响整批。
 
+### 扩容第二种：贴 cookie（不需要密码）
+
+先给结论：**一段已登录浏览器的 cookie，和「邮箱 + 密码」等价，而且覆盖面更大。**
+
+原因是换成 token 的四个步骤里，只有中间两步要身份，而它们是 cookie 鉴权的：
+
+```
+POST /oauth2/device/code        不要身份
+GET  /oauth2/device/authorize   cookie ← 只有这步认人
+POST /oauth2/device/authorize   cookie + 请求体签名
+POST /oauth2/token              device_code + PKCE
+```
+
+密码登录（`/oauth2/login`）唯一的作用就是把这口 cookie jar 填满。所以拿 cookie 直接进，
+就跳过了密码：Google / Apple / 邮箱验证码注册的号，**不知道密码也能进池**。
+
+**取 cookie**
+
+1. 浏览器打开 `https://agent.minimax.io` 并登录（cn 区域是 `https://agent.minimaxi.com`）；
+2. F12 → Network → 随便点一个请求 → Request Headers → 复制 `Cookie` 整行的值
+   （带不带 `Cookie:` 前缀都行，解析器认）；
+3. 也可以贴 Cookie-Editor 导出的 JSON，或 `cookies.txt`（Netscape 格式）——三种形态都认。
+
+**贴进去**
+
+```bash
+# 单条
+python -m app.provision --email someone@mail.example \
+  --cookie '_token=...; sessionid=...'
+
+# 批量：cookies.txt 每行 "邮箱<tab>cookie"
+python -m app.provision --cookies cookies.txt
+```
+
+控制台：`/ui → 账号池 → ＋ 添加账号 → 切到「邮箱 Cookie」`，每行 `邮箱 Cookie`，一次最多 200 个。
+接口同一个，只是多一个 `mode`：
+
+```bash
+curl -s -H "X-API-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"mode":"cookie","text":"a@mail.example _token=...; sessionid=..."}' \
+  http://127.0.0.1:8080/admin/accounts/import
+```
+
+写出来的文件比密码模式多三块：
+
+```json
+{
+  "accessToken": "mmoat_...",
+  "refreshToken": "mmort_...",
+  "source": "cookie",
+  "session": {"cookie": "_token=…; sessionid=…", "obtainedAtMs": 1763…, "region": "en"},
+  "signin_check": {"claimable": true, "today_points": 400, "today_day": 3}
+}
+```
+
+**两种方式的实际差别**
+
+| | 邮箱 密码 | 邮箱 Cookie |
+|---|---|---|
+| 需要密码 | 要 | 不要 |
+| 密码登录注册（Google / Apple / 验证码）的号 | 进不来 | 能进 |
+| refresh token 被上游拒了 | **只能人重新加号** | **网关用 cookie 自己重换** |
+| 失败主要来自 | 密码错、验证码、风控 | cookie 过期、域或区域不对 |
+
+**自愈机制**（这是 cookie 模式真正的价值）
+
+`refreshToken` 一次性轮换，被拒（改密码、上游吊销、长期不用）以前就是死号。现在
+`_refresh_once` 的顺序是：先读磁盘 → 再试 refresh → **只有 refresh 被拒之后**才用保存的 cookie 重铸一对新凭证，
+写回同一个文件，账号不用人管。
+
+**绝不提前重铸**是刻意的：refresh token 复用会被上游当成凭证泄露，连带吊销刚发出来的 access token。
+所以源码里没有任何"提前续一次试试"的路径。
+
+**必须知道的边界**
+
+- **域**：cookie 必须属于账号站（`account.minimax.io`，cn 是 `account.minimax.cn`）。解析器把 cookie 写成
+  `.minimax.io` 域，所以 `agent.*` 和 `account.*` 都会带上；但如果浏览器里那条 cookie 是 host-only
+  （DevTools 的 Domain 列没有开头的点），导出后仍可能拿不到 —— 报错会是
+  「session 没被识别成已登录用户（HTTP 200 但 groups 为空）」。
+- **区域**：哪个区的号就用哪个区导，`--region cn` 或环境变量 `MINIMAX_REGION`。跨区导入会在验证步骤直接失败。
+- **设备**：每导入一次，账号里就多一条设备授权（和网页端扫码登录一样），可在上游设备列表里撤销。
+- **导入即验证**：换到 token 后会拿签到面板试一次，被业务码拒绝就直接标失败、**不写文件**，
+  避免往池里塞一个每次请求都 401 的死号。网络错误只记录不判死。
+- **安全**：cookie 等价于账号登录态，写进 `/data/tokens/*.json`（`0600`）。控制台、`/healthz`、
+  请求日志都不返回它（日志里只打 cookie 的**名字**不打值），但**能读这个文件的人就能接管该账号**——
+  按密码的级别保护 `/data` 卷。
+
 ### 启动
 
 ```bash
@@ -238,7 +325,9 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/healthz |
    而 reused token 会连带吊销整个会话。
 
 **唯一不会自动恢复的情况**：`refreshToken` 本身被拒（密码改过、上游吊销）。
-密码不落盘（`write_record` 会剔除 `password`），所以这时只能重新加号。
+密码不落盘（`write_record` 会剔除 `password`），所以**密码模式**的号这时只能重新加号。
+**用 cookie 导进来的号是例外**：它把 session 存进了文件，refresh 被拒时网关会用 cookie
+自动重铸一对新凭证，不需要人介入（见下面「扩容第二种：贴 cookie」）。
 
 ### 看池状态
 
@@ -737,7 +826,7 @@ export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3.1-Flash
 | `GET /admin/probes?refresh=0` / `POST /admin/probes/refresh` | 签到面板 + 积分批次缓存 / 立刻重采 |
 | `POST /admin/signin` | `{"label": "..."}` 签一个号，`{}` 签全部 |
 | `POST /admin/accounts/disable` | `{"label": "...", "disabled": true}` 单号停/启用（不删文件） |
-| `POST /admin/accounts/import` | `{"text": "邮箱 密码\n..."}` 批量开通并进池（后台任务，一次一个）；密码不落盘 |
+| `POST /admin/accounts/import` | `{"text": "邮箱 密码\n...", "mode": "password"}` 批量开通并进池（后台任务，一次一个）；密码不落盘。`mode: "cookie"` 时第二列改为浏览器 cookie，见二点五 |
 | `GET /admin/accounts/import` | 当前 / 上次导入任务的分账号进度（控制台轮询这个） |
 
 ### 3.4 文生图（Ark / Seedream 协议）

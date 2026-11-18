@@ -804,10 +804,14 @@ table.tbl tr.failrow .mark i { background: var(--bad); }
   <div class="modal wide">
     <header>
       <h3>添加账号 <span class="hint" id="addHint">POST /admin/accounts/import</span></h3>
-      <div class="hint">每行一个 <code>邮箱 密码</code>，空格 / Tab / 逗号分隔都可以，一次粘一整段。
+      <div class="hint" id="addDoc">每行一个 <code>邮箱 密码</code>，空格 / Tab / 逗号分隔都可以，一次粘一整段。
         凭据只用来向上游换 token，密码不落盘；同邮箱重复提交等于重新授权并覆盖旧 token。</div>
     </header>
     <div class="body">
+      <div class="chips" id="addModes" style="margin-bottom:9px">
+        <span class="chip on" data-addmode="password" role="button" tabindex="0">邮箱 密码</span>
+        <span class="chip" data-addmode="cookie" role="button" tabindex="0">邮箱 Cookie</span>
+      </div>
       <textarea id="addText" rows="8" spellcheck="false" autocomplete="off"
         placeholder="someone@mail.example  password123"></textarea>
       <div class="inline" style="justify-content:space-between;margin-top:9px">
@@ -1251,7 +1255,8 @@ function renderAccounts() {
 
   if (!rows.length) {
     $("accBody").innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">没有账号</div>' +
-      '点右上角「＋ 添加账号」，粘贴 <code>邮箱 密码</code> 列表即可自动开通并进池</div></td></tr>';
+      '点右上角「＋ 添加账号」，粘贴 <code>邮箱 密码</code> 列表即可自动开通并进池；' +
+      '没有密码的号用「邮箱 Cookie」模式贴浏览器 session 也能进池</div></td></tr>';
     return;
   }
   $("accBody").innerHTML = slice.map((a) => {
@@ -1295,9 +1300,14 @@ function renderAccounts() {
           : '<span class="tag mute">已领 · 第 ' + (a.signin.today_day || "?") + " 天</span>")
       : '<span class="dim">未采样</span>';
     const err = a.last_error ? ' title="' + esc(a.last_error) + '"' : "";
+    // 有 session cookie 的账号能在 refresh token 失效后自己重换一次，不等人来补密码。
+    const sessionTag = a.has_session
+      ? ' <span class="tag mute" style="font-size:10px" title="导入时保存了浏览器 session：refresh token 被拒时可自动重换 token">cookie</span>'
+      : "";
     return '<tr class="' + cls + '"><td class="mark"><i></i></td>' +
       '<td class="who"><div class="nm"' + err + ">" + esc(a.label || "—") + "</div>" +
-      '<div class="id">' + (a.last_error ? esc(String(a.last_error).slice(0, 42)) : "expires " + (a.expires_at_ms ? new Date(a.expires_at_ms).toLocaleDateString("zh-CN") : "—")) + "</div></td>" +
+      '<div class="id">' + (a.last_error ? esc(String(a.last_error).slice(0, 42)) : "expires " + (a.expires_at_ms ? new Date(a.expires_at_ms).toLocaleDateString("zh-CN") : "—")) +
+        sessionTag + "</div></td>" +
       "<td>" + tag + mediaTag + "</td>" +
       '<td class="num">' + cr + "</td>" +
       '<td class="num">' + (a.ok || 0) + " / " + (a.fail ? '<span style="color:var(--bad)">' + a.fail + "</span>" : "0") +
@@ -1423,6 +1433,22 @@ $("btnProbe").addEventListener("click", async () => {
 // 后端按「一个任务一次」跑：登录上游是有速率限制的，并发多了看起来就像撞库。
 let addPoll = 0;
 let addBusy = false;
+// password = 邮箱 密码；cookie = 标签 + 浏览器里复制的 Cookie 请求头。
+// 两条路在服务端汇合到同一个 device-authorize 步骤，进池后没有区别——
+// 唯一差别是 cookie 账号在 refresh token 失效后能自己重换一次。
+let addMode = "password";
+
+const ADD_DOC = {
+  password: "每行一个 <code>邮箱 密码</code>，空格 / Tab / 逗号分隔都可以，一次粘一整段。" +
+    "凭据只用来向上游换 token，密码不落盘；同邮箱重复提交等于重新授权并覆盖旧 token。",
+  cookie: "每行一个 <code>标签 Cookie</code>：标签写这一行对应的账号（一般就是邮箱），后面整段粘贴" +
+    "浏览器 DevTools → Network → 任意请求的 <code>Cookie</code> 请求头的值。" +
+    "Cookie 会存进该账号的 json，用于 refresh token 失效时自动重换（不用再找密码）。",
+};
+const ADD_PLACEHOLDER = {
+  password: "someone@mail.example  password123",
+  cookie: "someone@mail.example  _token=...; sessionid=...",
+};
 
 function parseLines(text) {
   const rows = [];
@@ -1431,6 +1457,18 @@ function parseLines(text) {
   (text || "").split("\n").forEach((raw) => {
     const line = raw.trim();
     if (!line || line.startsWith("#")) return;
+    if (addMode === "cookie") {
+      // 只在第一段空白处切：Cookie 头自己带一堆空格和分号，切多了就把会话拆坏。
+      const at = line.search(/\s/);
+      if (at < 1) { bad.push(line); return; }
+      const label = line.slice(0, at).trim();
+      const cookie = line.slice(at).trim();
+      if (/^cookie:?$/i.test(label) || cookie.indexOf("=") < 0) { bad.push(line); return; }
+      if (seen.has(label)) return;
+      seen.add(label);
+      rows.push({ label, cookie });
+      return;
+    }
     const m = line.match(/^([^\s,;:]+@[^\s,;:]+)[\s,;:]+\s*(\S.*)$/);
     if (!m) { bad.push(line); return; }
     const email = m[1].toLowerCase();
@@ -1445,14 +1483,26 @@ function parseLines(text) {
 function updateAddCount() {
   const parsed = parseLines($("addText").value);
   const n = parsed.rows.length;
+  const why = addMode === "cookie" ? "行（缺少标签或 Cookie）" : "行（没有邮箱或密码）";
   $("addCount").textContent = "识别 " + n + " 个账号" +
-    (parsed.bad.length ? " · 跳过 " + parsed.bad.length + " 行（没有邮箱或密码）" : "") +
+    (parsed.bad.length ? " · 跳过 " + parsed.bad.length + " " + why : "") +
     (n > 200 ? "（上限 200，请分批）" : "");
   $("addGo").disabled = addBusy || !n || n > 200;
 }
 
+function setAddMode(mode) {
+  addMode = mode === "cookie" ? "cookie" : "password";
+  document.querySelectorAll("#addModes .chip").forEach((chip) => {
+    chip.classList.toggle("on", chip.dataset.addmode === addMode);
+  });
+  $("addDoc").innerHTML = ADD_DOC[addMode];
+  $("addText").placeholder = ADD_PLACEHOLDER[addMode];
+  updateAddCount();
+}
+
 function openAdd() {
   $("addVeil").classList.add("on");
+  setAddMode(addMode);
   $("addText").focus();
   updateAddCount();
   // 打开时拉一次状态：可能是上次没看完的任务，也可能正在跑
@@ -1476,7 +1526,8 @@ function renderImport(job) {
     ? "进行中 " + job.done + " / " + job.total + " · 成功 " + job.ok + (job.failed ? " · 失败 " + job.failed : "")
     : "完成：" + job.ok + " 成功" + (job.failed ? "，" + job.failed + " 失败" : "") +
       " · 耗时 " + dur((job.finished_at || job.started_at) - job.started_at)) + skipped;
-  $("addHint").textContent = "任务 " + job.id + " · " + job.concurrency + " 并发 → " + job.pool_dir;
+  $("addHint").textContent = "任务 " + job.id + " · " + (job.mode === "cookie" ? "Cookie " : "") +
+    job.concurrency + " 并发 → " + job.pool_dir;
   $("addList").innerHTML = (job.rows || []).map((r) => {
     const cls = r.state === "fail" ? "fail" : r.state === "running" ? "run"
       : r.state === "updated" ? "upd" : r.state === "ok" ? "ok" : "";
@@ -1485,7 +1536,7 @@ function renderImport(job) {
       : r.state === "updated" ? '<span class="tag accent">已更新</span>'
       : r.state === "ok" ? '<span class="tag ok">已加入</span>'
       : '<span class="tag mute">排队</span>';
-    return '<div class="r ' + cls + '"><span class="em">' + esc(r.email) + "</span>" + tag +
+    return '<div class="r ' + cls + '"><span class="em">' + esc(r.label || r.email) + "</span>" + tag +
       (r.error ? '<span class="msg" title="' + esc(r.error) + '">' + esc(r.error) + "</span>" : "") + "</div>";
   }).join("");
   $("addGo").textContent = running ? "导入中…" : "开始导入";
@@ -1525,11 +1576,14 @@ async function startAdd() {
   const rows = parseLines($("addText").value).rows;
   if (!rows.length) return;
   if (rows.length > 200) { toast("一次最多 200 个账号，请分批粘贴", "bad"); return; }
+  // 用解析结果重建文本再提交：垃圾行在前端就丢掉，服务端只认规范的一行一账号。
+  const text = rows.map((r) => addMode === "cookie" ? r.label + " " + r.cookie : r.email + " " + r.password)
+    .join("\n");
   addBusy = true;
   $("addGo").disabled = true;
   $("addGo").textContent = "提交中…";
   try {
-    const d = await postJSON("/admin/accounts/import", { text: $("addText").value });
+    const d = await postJSON("/admin/accounts/import", { text: text, mode: addMode });
     renderImport(d.job);
     schedulePoll();
   } catch (e) {
@@ -1539,6 +1593,10 @@ async function startAdd() {
     toast(e.message || String(e), "bad");
   }
 }
+
+document.querySelectorAll("#addModes .chip").forEach((chip) => {
+  chip.addEventListener("click", () => setAddMode(chip.dataset.addmode));
+});
 
 $("btnAdd").addEventListener("click", openAdd);
 $("addClose").addEventListener("click", closeAdd);

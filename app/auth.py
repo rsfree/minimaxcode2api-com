@@ -144,6 +144,13 @@ class Token:
     position: int = 0               # index inside that file (one file may hold an array)
     index: int = 0
     pooled: bool = False            # True only for records read from TOKEN_POOL
+    region: str = ""                # account region this record belongs to
+    # Browser session cookie the account was imported with, if any. Not a
+    # credential for the model host — it is the *factory* that mints credentials,
+    # kept for one reason: when upstream finally rejects the refresh token the
+    # pool can re-mint a pair by itself instead of waiting for a human to paste a
+    # password again (see ``_remint_from_session``).
+    session_cookie: str | None = None
     # Text-channel park. Auth and rate-limit failures are pool-wide and are
     # written to both this and the media pair below.
     cooldown_until: float = 0.0
@@ -228,6 +235,12 @@ def _record_to_token(record: dict, index: int, origin: Path | None = None, posit
     if not access:
         return None
     expires = record.get("expiresAtMs")
+    # A cookie-imported record carries its session under "session"; records that
+    # were provisioned with a password simply have no such key.
+    session = record.get("session")
+    session_cookie = ""
+    if isinstance(session, dict):
+        session_cookie = (session.get("cookie") or "").strip()
     return Token(
         access_token=access,
         refresh_token=(record.get("refreshToken") or record.get("refresh_token") or "").strip() or None,
@@ -236,6 +249,8 @@ def _record_to_token(record: dict, index: int, origin: Path | None = None, posit
         origin=origin,
         position=position,
         index=index,
+        region=(record.get("region") or "").strip(),
+        session_cookie=session_cookie or None,
     )
 
 
@@ -534,13 +549,19 @@ class TokenPool:
             return token
         try:
             return await self._refresh(token)
-        except CredentialError:
+        except CredentialError as exc:
             # Nothing newer on disk and the exchange was rejected: the refresh
             # token itself is dead, so parking is correct. Re-check anyway —
             # a writer may have landed a pair during the round trip.
             if self._resync(token) and token.access_token:
                 return token
-            raise
+            # Last resort before parking: if the account was imported with a
+            # browser session, that cookie can mint a brand-new pair. This is the
+            # one case the README used to describe as unrecoverable.
+            try:
+                return await self._remint_from_session(token)
+            except CredentialError:
+                raise exc
 
     async def _refresh(self, token: Token) -> Token:
         if not token.refresh_token:
@@ -571,6 +592,56 @@ class TokenPool:
         if token.origin:
             _write_record(token.origin, token, settings.region)
         log.info("refreshed account %s, expires_at_ms=%s", token.label or token.short, token.expires_at_ms)
+        return token
+
+    async def _remint_from_session(self, token: Token) -> Token:
+        """Mint a fresh access/refresh pair from the stored browser session.
+
+        Only reached after a refresh was *rejected* — never preemptively. A
+        refresh token is single-use and upstream revokes the session when one is
+        reused, so guessing here would destroy a session that still worked.
+        The paste is a plain cookie replay, which is exactly what a browser tab
+        does on reload: no password, no mailbox, no captcha.
+
+        Runs the blocking curl flow in a worker thread; the pool lock is already
+        held by the caller, so no second request can race the same account.
+        """
+        if not token.session_cookie:
+            raise CredentialError(
+                f"account {token.label or token.short} has no refresh token and no session cookie"
+            )
+        from .account_api import provision_with_cookies
+
+        region = token.region or settings.region
+        try:
+            record = await asyncio.to_thread(
+                provision_with_cookies,
+                token.session_cookie,
+                token.label,
+                region,
+                settings.upstream_proxy or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Every failure of this path has the same meaning — the account
+            # cannot be re-minted — and the caller only handles CredentialError.
+            # A subprocess timeout or a JSON decode error escaping as-is would
+            # turn "park the account" into a 500 for whichever request happened
+            # to trigger the refresh.
+            raise CredentialError(
+                f"cookie re-mint failed for {token.label or token.short}: {exc}"
+            ) from exc
+
+        token.access_token = record["accessToken"]
+        if record.get("refreshToken"):
+            token.refresh_token = record["refreshToken"]
+        token.expires_at_ms = record.get("expiresAtMs")
+        token.cooldown_until = 0.0
+        token.cooldown_reason = ""
+        token.last_error = ""
+        if token.origin:
+            _write_record(token.origin, token, region)
+        log.info("re-minted account %s from its session cookie, expires_at_ms=%s",
+                 token.label or token.short, token.expires_at_ms)
         return token
 
     async def _post_token(self, form: dict[str, str]) -> tuple[int, bytes]:
@@ -607,7 +678,7 @@ class TokenPool:
             return None
         if capability == CAPABILITY_MEDIA and not token.can_afford(need):
             return None
-        if token.is_expired() and token.refresh_token:
+        if token.is_expired() and (token.refresh_token or token.session_cookie):
             try:
                 return await self._refresh_once(token)
             except CredentialError as exc:
@@ -933,6 +1004,9 @@ class TokenPool:
                     and t.can_afford(settings.media_min_credits),
                     "disabled": t.disabled,
                     "expires_at_ms": t.expires_at_ms,
+                    # Whether the account can be re-minted without a human. Shown
+                    # as a badge so an operator knows which rows are self-healing.
+                    "has_session": bool(t.session_cookie),
                     "cooling_for": round(max(0.0, t.cooldown_until - now)),
                     "cooldown_until": t.cooldown_until or None,
                     "cooldown_reason": t.cooldown_reason or None,

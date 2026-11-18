@@ -371,10 +371,17 @@ async def disable_account(request: Request) -> dict:
 
 @router.post("/accounts/import")
 async def import_accounts(request: Request) -> dict:
-    """Mint tokens for pasted email/password pairs and drop them into the pool.
+    """Mint tokens for pasted credentials and drop them into the pool.
+
+    Two modes, one pipeline: ``password`` takes ``邮箱 密码`` lines, ``cookie``
+    takes ``邮箱 Cookie`` lines where the second field is a browser session. Both
+    end at the same device-authorisation step (see ``account_api``), so the pool
+    cannot tell the two apart afterwards — except that a cookie account can
+    re-mint itself when its refresh token dies.
 
     Runs in the background (one job at a time); poll ``GET /admin/accounts/import``
-    for per-account progress. Passwords are used once and never stored.
+    for per-account progress. Passwords are used once and never stored; the
+    session cookie is stored on purpose, because re-minting needs it.
     """
     body: dict = {}
     try:
@@ -382,14 +389,19 @@ async def import_accounts(request: Request) -> dict:
     except Exception:  # noqa: BLE001 - body is required in practice
         body = {}
     text = (body or {}).get("text") or ""
+    mode = (body or {}).get("mode") or ""
+    if not mode and isinstance((body or {}).get("accounts"), list):
+        first = next((a for a in body["accounts"] if isinstance(a, dict)), {})
+        mode = "cookie" if "cookie" in first else "password"
     accounts = (body or {}).get("accounts")
     if not text and isinstance(accounts, list):
         text = "\n".join(
-            f"{a.get('email', '')} {a.get('password', '')}" for a in accounts if isinstance(a, dict)
+            f"{a.get('email', '')} {a.get('cookie') or a.get('password', '')}"
+            for a in accounts if isinstance(a, dict)
         )
     concurrency = (body or {}).get("concurrency")
     try:
-        job = await importer.start(text, concurrency)
+        job = await importer.start(text, concurrency, mode or "password")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

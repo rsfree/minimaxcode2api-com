@@ -100,8 +100,12 @@ def _known_values() -> list[str]:
     values: set[str] = set()
     for token in list(getattr(token_manager, "_tokens", None) or []):
         access = getattr(token, "access_token", "") or ""
+        # The session cookie is a long-lived credential in its own right: an
+        # imported account keeps one so the pool can re-mint. It never belongs in
+        # a caller-facing message, so it is scrubbed like the tokens.
         for value in (getattr(token, "label", "") or "", access,
-                      getattr(token, "refresh_token", "") or ""):
+                      getattr(token, "refresh_token", "") or "",
+                      getattr(token, "session_cookie", "") or ""):
             if len(value) >= 6:
                 values.add(value)
         if len(access) >= 12:
