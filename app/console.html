@@ -1262,9 +1262,9 @@ function renderAccounts() {
     const coolText = coolLong
       ? "至 " + new Date(a.cooldown_until * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
       : dur(a.cooling_for);
-    const coolWhy = a.cooldown_reason === "quota" ? "额度用尽，等次日重置（签到后会解除）"
+    const coolWhy = a.cooldown_reason === "quota" ? "积分耗尽，停用到次日重置。签到成功或探针读到余额为正会提前解除；第一次仅停 2 小时后复核"
       : a.cooldown_reason === "auth" ? "凭证失效，等网关自动续期"
-      : a.cooldown_reason === "rate" ? "被上游限流" : "";
+      : a.cooldown_reason === "rate" ? "被上游限流。连续命中按 1→2→4→8 分钟翻倍，成功一次即清零" : "";
     const tag = a.disabled ? '<span class="tag mute">已禁用</span>'
       : a.usable ? '<span class="tag ok">可用</span>'
       : cooling ? '<span class="tag warn"' + (coolWhy ? ' title="' + esc(coolWhy) + '"' : "") + ">冷却 " + coolText + "</span>"
@@ -1387,7 +1387,11 @@ $("btnSigninAll").addEventListener("click", async () => {
   btn.textContent = "签到中…";
   try {
     const d = await postJSON("/admin/signin", {});
-    toast("签到完成：" + d.claimed + " 个号 +" + d.points + " 积分" + (d.errors ? "，" + d.errors + " 个失败" : ""),
+    // 「0 个号 +0 积分」不等于失败：签到是按本地自然日幂等的，今天已经领过的号会被
+    // 直接跳过（连上游都不问），把它们单独数出来，免得操作员以为签到没生效。
+    const cached = (d.results || []).filter((r) => r.cached).length;
+    toast("签到完成：" + d.claimed + " 个号 +" + d.points + " 积分" +
+      (cached ? "，" + cached + " 个号今天已领" : "") + (d.errors ? "，" + d.errors + " 个失败" : ""),
       d.errors ? "bad" : "ok");
     loadOverview();
     refreshNav();

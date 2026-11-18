@@ -15,6 +15,12 @@ the same OAuth access token the gateway already holds:
 rejected with ``1406010011 invalid timezone_id``. Per-day status codes are
 1 = upcoming, 2 = claimable, 3 = claimed, 4 = disabled; the claim response
 carries ``claim_result`` 1 = just claimed, 2 = already claimed today.
+
+Claiming is a once-per-local-day resource and three callers can reach the same
+account — the check-in loop (straight from the token files), the console button
+(through the in-memory pool) and the CLI. So a successful claim is journalled
+into the token file itself (key ``signin``) and re-checked under a per-account
+lock before any request goes out; see :func:`claim_token`.
 """
 
 from __future__ import annotations
@@ -24,7 +30,9 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from secrets import token_hex
 from typing import Any
@@ -49,6 +57,12 @@ JUST_CLAIMED, ALREADY_CLAIMED = 1, 2
 
 IS_WINDOWS = sys.platform.startswith("win")
 
+# Where the "already claimed today" journal lives inside a token record. It has
+# to sit in the token file because that is the only store all three callers
+# share: the check-in loop reads the files, the console reads the pool the files
+# produced, and the CLI reads the files again.
+CLAIM_STATE = "signin"
+
 
 class SigninError(RuntimeError):
     def __init__(self, message: str, code: int | None = None) -> None:
@@ -58,6 +72,117 @@ class SigninError(RuntimeError):
 
 def _host(region: str) -> str:
     return HOSTS.get(region, HOSTS["en"])
+
+
+# ---------------------------------------------------------------------------
+# local day / claim journal
+# ---------------------------------------------------------------------------
+def _tz(tz_name: str):
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001 - a missing tz database must not block a claim
+        log.warning("timezone %s unavailable; assuming UTC+8 for the daily reset", tz_name)
+        return dt_timezone(timedelta(hours=8))
+
+
+def local_day(tz_name: str = DEFAULT_TIMEZONE, at: float | None = None) -> str:
+    """Local calendar day (``YYYY-MM-DD``) of the check-in timezone.
+
+    The allowance resets at local midnight, so "did we already claim" is a
+    calendar-day question. A rolling 24-hour window would both re-claim an
+    account that claimed at 23:50 and skip one that claimed at 00:05.
+    """
+    moment = datetime.fromtimestamp(time.time() if at is None else at, _tz(tz_name))
+    return moment.strftime("%Y-%m-%d")
+
+
+def claim_state(result: dict, timezone: str = DEFAULT_TIMEZONE) -> dict:
+    """The journal entry written after a claim that actually landed."""
+    return {
+        "day": local_day(timezone),
+        "claim_id": result.get("claim_id"),
+        "points": int(result.get("points") or 0),
+        "day_no": result.get("day_no"),
+        "claimed_at_ms": int(time.time() * 1000),
+    }
+
+
+def _entry(record: dict) -> dict:
+    state = record.get(CLAIM_STATE)
+    return state if isinstance(state, dict) else {}
+
+
+def _claimed_on(record: dict, timezone: str) -> dict | None:
+    """Today's journal entry for one token record, or None."""
+    state = _entry(record)
+    if not state or state.get("day") != local_day(timezone):
+        return None
+    return state
+
+
+# A credential that came from the environment has no file to journal into, so
+# the process keeps that single entry itself.
+_MEMORY_CLAIMS: dict[str, dict] = {}
+
+
+def claim_today(
+    path: Path | None, position: int, label: str, timezone: str = DEFAULT_TIMEZONE
+) -> dict | None:
+    """Today's journalled claim for one account (file first, memory otherwise)."""
+    if path is not None:
+        try:
+            records, _ = _read(path)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if 0 <= position < len(records) and isinstance(records[position], dict):
+            return _claimed_on(records[position], timezone)
+        return None
+    state = _MEMORY_CLAIMS.get(label)
+    if state and state.get("day") == local_day(timezone):
+        return state
+    return None
+
+
+def remember_claim(path: Path | None, position: int, label: str, state: dict) -> None:
+    """Journal one claim without touching anything else in the file.
+
+    The file is re-read here instead of reusing the copy loaded at the top of
+    the claim: a refresh may have rotated the credentials during the two round
+    trips, and writing the older pair back would cost a password login.
+    """
+    if path is not None:
+        try:
+            records, as_array = _read(path)
+        except (OSError, json.JSONDecodeError):
+            records, as_array = [], False
+        if 0 <= position < len(records) and isinstance(records[position], dict):
+            records[position][CLAIM_STATE] = state
+            _write(path, records, as_array)
+            return
+    _MEMORY_CLAIMS[label] = state
+
+
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(key: Path | str) -> threading.Lock:
+    """One lock per account.
+
+    Upstream's "already claimed" answer only arrives *after* the reward is
+    booked, so two callers that both saw ``claimable`` would race: one wins the
+    credits, the other is told they were already taken, and the two disagree
+    about whether the account was topped up. Serialising per account makes the
+    second caller read the journal the first one just wrote.
+    """
+    name = os.path.normcase(os.path.abspath(str(key)))
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(name)
+        if lock is None:
+            lock = _LOCKS[name] = threading.Lock()
+        return lock
 
 
 def _request(
@@ -142,15 +267,26 @@ def summarize(panel: dict) -> dict:
 # ---------------------------------------------------------------------------
 # token files
 # ---------------------------------------------------------------------------
-def _load(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _read(path: Path) -> tuple[list, bool]:
+    """Return ``(records, was_array)``: one file may hold an array of accounts.
+
+    Elements are returned as they are, including anything that is not an object,
+    so a position computed here means the same thing as in ``auth.TokenPool``.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return data, True
+    if isinstance(data, dict):
+        return [data], False
+    return [], False
 
 
-def _save(path: Path, record: dict) -> None:
+def _write(path: Path, records: list, as_array: bool) -> None:
     # Unique temp name: the gateway writes rotated tokens into the same
     # directory, and two writers must not share one rename target.
+    payload = records if as_array else (records[0] if len(records) == 1 else records)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{token_hex(4)}.tmp")
-    tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
     try:
         path.chmod(0o600)
@@ -171,6 +307,81 @@ def _fresh_token(record: dict, proxy: str | None) -> tuple[str, bool]:
     return token, False
 
 
+def _cached_row(label: str, state: dict) -> dict:
+    """The row a repeat call gets for a claim that is already on record."""
+    return {
+        "label": label,
+        "claimed": False,
+        "already": True,
+        "signed_in": True,
+        "cached": True,
+        "points": int(state.get("points") or 0),
+        "day": state.get("day"),
+        "day_no": state.get("day_no"),
+        "claim_id": state.get("claim_id"),
+    }
+
+
+def claim_token(
+    access_token: str,
+    label: str | None = None,
+    path: Path | None = None,
+    position: int = 0,
+    region: str = "en",
+    timezone: str = DEFAULT_TIMEZONE,
+    proxy: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Read one account's panel and claim today's reward, journalling a success.
+
+    Idempotent by construction: a journal entry for today short-circuits the
+    whole sequence, and both the check and the claim happen under the account's
+    lock, so a second caller (the loop, the console button, a CLI run) cannot
+    slip in between "the panel says claimable" and "book it".
+
+    ``path``/``position`` identify the token record to journal into; a token
+    that came from the environment passes ``path=None`` and is remembered in
+    the process instead.
+    """
+    label = label or (path.stem if path is not None else "account")
+    with _lock_for(path if path is not None else f"label:{label}"):
+        done = claim_today(path, position, label, timezone)
+        if done is not None and not dry_run:
+            log.info("skip %s: already signed in today (+%s, %s)",
+                     label, done.get("points"), done.get("claim_id"))
+            return _cached_row(label, done)
+
+        panel = status(access_token, region, timezone, proxy)
+        info = summarize(panel)
+        if dry_run or not info["claimable"]:
+            return {"label": label, "claimed": False, **info}
+
+        result = claim(access_token, region, timezone, proxy)
+        outcome = result.get("claim_result")
+        if outcome == JUST_CLAIMED:
+            state = claim_state(result, timezone)
+            remember_claim(path, position, label, state)
+            log.info("signed in %s: +%s credits (day %s, expires %s)",
+                     label, result.get("points"), result.get("day_no"),
+                     result.get("expire_at_ms"))
+            return {"label": label, "claimed": True, "signed_in": True, **state}
+        if outcome == ALREADY_CLAIMED:
+            # Somebody else took today's reward — the browser, another process,
+            # a run whose journal entry was lost. Worth journalling so the next
+            # sweep stops asking, but it proves nothing about the balance *now*
+            # (the account may have spent the credits minutes after claiming),
+            # so no park is lifted on the strength of it.
+            remember_claim(path, position, label, {
+                "day": local_day(timezone),
+                "claim_id": None,
+                "points": 0,
+                "day_no": result.get("day_no"),
+                "claimed_at_ms": int(time.time() * 1000),
+                "external": True,
+            })
+        return {"label": label, "claimed": False, "already": outcome == ALREADY_CLAIMED, **info}
+
+
 def claim_file(
     path: Path,
     region: str = "en",
@@ -178,6 +389,7 @@ def claim_file(
     proxy: str | None = None,
     dry_run: bool = False,
     allow_refresh: bool = True,
+    position: int = 0,
 ) -> dict:
     """Check one stored account and claim today's reward when it is available.
 
@@ -186,35 +398,31 @@ def claim_file(
     would race it into ``invalid_grant`` (upstream revokes the session when a
     refresh token is reused).
     """
-    record = _load(path)
-    label = record.get("email") or path.stem
+    path = Path(path).expanduser()
+    records, as_array = _read(path)
+    if not (0 <= position < len(records)) or not isinstance(records[position], dict):
+        raise SigninError(f"no token record at {path}#{position}")
+    record = records[position]
+    label = record.get("email") or (path.stem if position == 0 else f"{path.stem}#{position}")
+
+    # Check the journal before anything else: a claimed account must not cost a
+    # token refresh either, and the loop would otherwise re-rotate credentials
+    # for nothing on every restart.
+    done = claim_today(path, position, label, timezone)
+    if done is not None and not dry_run:
+        log.info("skip %s: already signed in today (+%s)", label, done.get("points"))
+        return _cached_row(label, done)
+
     if allow_refresh:
         token, rotated = _fresh_token(record, proxy)
         # The refresh token rotates on every use, so a refresh has to reach the
         # file even when the reward turns out to be already claimed.
         if rotated:
-            _save(path, record)
+            _write(path, records, as_array)
     else:
         token = (record.get("accessToken") or "").strip()
 
-    panel = status(token, region, timezone, proxy)
-    info = summarize(panel)
-    if dry_run or not info["claimable"]:
-        return {"label": label, "claimed": False, **info}
-
-    result = claim(token, region, timezone, proxy)
-    outcome = result.get("claim_result")
-    if outcome == JUST_CLAIMED:
-        log.info("signed in %s: +%s credits (day %s, expires %s)",
-                 label, result.get("points"), result.get("day_no"), result.get("expire_at_ms"))
-        return {
-            "label": label, "claimed": True,
-            "points": int(result.get("points") or 0),
-            "day_no": result.get("day_no"),
-            "expire_at_ms": result.get("expire_at_ms"),
-            "claim_id": result.get("claim_id"),
-        }
-    return {"label": label, "claimed": False, "already": outcome == ALREADY_CLAIMED, **info}
+    return claim_token(token, label, path, position, region, timezone, proxy, dry_run)
 
 
 def claim_pool(root: str | Path, region: str = "en", timezone: str = DEFAULT_TIMEZONE,
@@ -229,10 +437,22 @@ def claim_pool(root: str | Path, region: str = "en", timezone: str = DEFAULT_TIM
         if path.name == "index.json":
             continue
         try:
-            results.append(claim_file(path, region, timezone, proxy, dry_run, allow_refresh))
-        except (SigninError, AccountError, OSError, json.JSONDecodeError) as exc:
-            log.warning("check-in failed for %s: %s", path.stem, exc)
+            records, _ = _read(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("check-in failed for %s: %s", path.name, exc)
             results.append({"label": path.stem, "claimed": False, "error": str(exc)[:200]})
+            continue
+        # One file may hold an array of accounts; each element has its own
+        # journal entry, so they are claimed (and reported) one by one.
+        for position in range(len(records)):
+            label = path.stem if position == 0 else f"{path.stem}#{position}"
+            try:
+                results.append(
+                    claim_file(path, region, timezone, proxy, dry_run, allow_refresh, position)
+                )
+            except (SigninError, AccountError, OSError, json.JSONDecodeError) as exc:
+                log.warning("check-in failed for %s: %s", label, exc)
+                results.append({"label": label, "claimed": False, "error": str(exc)[:200]})
     return results
 
 
@@ -282,6 +502,9 @@ def main(argv: list[str] | None = None) -> int:
             claimed += 1
             gained += int(row.get("points") or 0)
             print(f"{label:34}  +{row['points']:<5} day {row.get('day_no')}  claim_id={row.get('claim_id')}")
+        elif row.get("cached"):
+            # 幂等：今天的领取已经记在号文件里，这次连上游都没问。
+            print(f"{label:34}  already signed in today (+{row.get('points', 0)})")
         elif args.status:
             state = {UPCOMING: "upcoming", CLAIMABLE: "claimable", CLAIMED: "claimed",
                      DISABLED: "disabled"}.get(row.get("today_status"), "?")

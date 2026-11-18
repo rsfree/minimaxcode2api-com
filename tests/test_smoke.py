@@ -240,6 +240,234 @@ def test_signin_panel() -> None:
     assert summarize(live)["claimable"] is True
 
 
+def test_signin_is_idempotent_per_local_day() -> None:
+    """签到是「每天一次」的资源，重复调用必须不花钱。
+
+    三个调用方会碰到同一个号——签到循环（直接读文件）、控制台的签到按钮（走内存池）、
+    以及命令行——所以「今天已经领过」记在号文件里（``signin`` 键），并且在取任何上游
+    数据之前先查它。以前每次启动 / 每 6 小时都会重新问一遍上游，靠 claim_result=2
+    兜底；更糟的是它同时把「没报错」当成「回血了」。
+    """
+    import tempfile
+    import time
+    from unittest.mock import patch
+
+    from app import signin as signin_mod
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "a@x.json"
+        path.write_text(json.dumps({
+            "email": "a@x",
+            "accessToken": "tok-a",
+            "refreshToken": "ref-a",
+            "expiresAtMs": int(time.time() * 1000) + 3_600_000,
+        }), "utf-8")
+
+        panel = {"days": [
+            {"day_no": 1, "points": 400, "status": signin_mod.CLAIMABLE, "is_today": True},
+        ]}
+        calls: list[str] = []
+
+        def fake_status(*a, **k):
+            calls.append("status")
+            return panel
+
+        def fake_claim(*a, **k):
+            calls.append("claim")
+            return {"claim_result": signin_mod.JUST_CLAIMED, "points": 400,
+                    "day_no": 1, "claim_id": "claim-1", "expire_at_ms": 0}
+
+        with patch.object(signin_mod, "status", fake_status), \
+                patch.object(signin_mod, "claim", fake_claim):
+            first = signin_mod.claim_file(path)
+            assert first["claimed"] is True and first["points"] == 400
+            assert calls == ["status", "claim"]
+
+            # 记录写进了号文件，而且没把凭证字段弄丢（凭证才是这个文件的本职）。
+            saved = json.loads(path.read_text("utf-8"))
+            assert saved["accessToken"] == "tok-a" and saved["refreshToken"] == "ref-a"
+            assert saved["signin"]["day"] == signin_mod.local_day()
+            assert saved["signin"]["claim_id"] == "claim-1"
+            assert saved["signin"]["points"] == 400
+
+            # 第二次：幂等 —— 一个上游请求都不发，答案和第一次一致。
+            calls.clear()
+            again = signin_mod.claim_file(path)
+            assert again["claimed"] is False
+            assert again["already"] is True and again["cached"] is True
+            assert again["points"] == 400, "重复调用要给回同一笔到账，而不是 0"
+            assert calls == [], f"already-claimed account must cost zero calls, made {calls}"
+
+        # 上游说“今天已经领过”（别处领的）：记一笔，但这不是“这个号现在有积分”，
+        # 所以 claimed 必须是 False —— 调用方据此决定要不要解冷却。
+        saved.pop("signin")
+        path.write_text(json.dumps(saved), "utf-8")
+        with patch.object(signin_mod, "status", fake_status), \
+                patch.object(signin_mod, "claim", lambda *a, **k: {"claim_result": signin_mod.ALREADY_CLAIMED}):
+            third = signin_mod.claim_file(path)
+        assert third["claimed"] is False and third["already"] is True
+        journal = json.loads(path.read_text("utf-8"))["signin"]
+        assert journal["external"] is True and journal["points"] == 0
+        # 外部领取也进日志，下一轮扫描就不再问了。
+        calls.clear()
+        with patch.object(signin_mod, "status", fake_status), \
+                patch.object(signin_mod, "claim", fake_claim):
+            fourth = signin_mod.claim_file(path)
+        assert fourth["cached"] is True and calls == []
+
+
+def test_checkin_lifts_a_park_only_when_the_claim_landed() -> None:
+    """签到的意义是回血，但「今天签过」不等于「现在有积分」。
+
+    旧逻辑是「这一行没报错 → 解冷却」，于是每 6 小时一轮扫描都会把一个 0 积分的号
+    放回轮换，调用方马上去撞 402 —— 冷却形同虚设，最坏情况整池都是这种号。现在只有
+    ``claim_result == 1``（真的到账）才动冷却，并且顺手把到账积分写进余额提示，
+    免得媒体预筛还在按旧余额把它筛掉。
+    """
+    from app import main as main_mod
+    from app.auth import CAPABILITY_MEDIA, CAPABILITY_TEXT, Token, TokenPool
+
+    pool = TokenPool()
+    signed = Token(access_token="tok-s", label="s@x", pooled=True)
+    idle = Token(access_token="tok-i", label="i@x", pooled=True)
+    pool._tokens = [signed, idle]
+    pool._loaded = True
+    pool.park(signed, 402, "insufficient balance (1008)")
+    pool.park(idle, 402, "insufficient balance (1008)")
+
+    rows = [
+        {"label": "s@x", "claimed": True, "points": 400},
+        {"label": "i@x", "claimed": False, "already": True, "cached": True, "points": 0},
+        {"label": "e@x", "claimed": False, "error": "HTTP 500"},
+    ]
+    claimed, gained, lifted = main_mod._apply_checkin(rows, pool)
+    assert (claimed, gained, lifted) == (1, 400, 1)
+
+    assert signed.is_cooling(CAPABILITY_TEXT) is False
+    assert signed.is_cooling(CAPABILITY_MEDIA) is False
+    assert signed.credit_hint() == 400, "到账积分要立刻能被媒体预筛看到"
+    assert signed.quota_streak == 0
+
+    # 「今天已经领过」的那个号：冷却必须留着，两条通道都留。
+    assert idle.is_cooling(CAPABILITY_TEXT) is True
+    assert idle.is_cooling(CAPABILITY_MEDIA) is True
+    assert idle.credit_hint() is None
+
+
+def test_console_signin_unparks_only_the_accounts_it_claimed() -> None:
+    """控制台「全部签到」也要守同一条线：只有真的到账才让号回到轮换。"""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from app import signin as signin_mod
+    from app.auth import CAPABILITY_MEDIA, Token, token_manager
+    from app.config import settings
+    from app.main import app
+
+    signed = Token(access_token="tok-s", label="s@x", pooled=True)
+    idle = Token(access_token="tok-i", label="i@x", pooled=True)
+    token_manager.park(signed, 402, "insufficient balance (1008)")
+    token_manager.park(idle, 402, "insufficient balance (1008)")
+
+    panel = {"days": [
+        {"day_no": 3, "points": 400, "status": signin_mod.CLAIMABLE, "is_today": True},
+    ]}
+
+    def fake_claim(token, *a, **k):
+        if token == "tok-s":
+            return {"claim_result": signin_mod.JUST_CLAIMED, "points": 400,
+                    "day_no": 3, "claim_id": "c3"}
+        return {"claim_result": signin_mod.ALREADY_CLAIMED}
+
+    saved = (token_manager._tokens, token_manager._loaded, settings.api_keys,
+             dict(signin_mod._MEMORY_CLAIMS))
+    token_manager._tokens = [signed, idle]
+    token_manager._loaded = True
+    settings.api_keys = ["unit-test-key"]
+    # These two tokens have no file to journal into, so the process keeps their
+    # claim entries itself; start from a clean slate and put it back afterwards.
+    signin_mod._MEMORY_CLAIMS.clear()
+    try:
+        with patch.object(signin_mod, "status", lambda *a, **k: panel), patch.object(
+            signin_mod, "claim", fake_claim
+        ):
+            body = TestClient(app).post(
+                "/admin/signin", json={}, headers={"x-api-key": "unit-test-key"}
+            ).json()
+    finally:
+        token_manager._tokens, token_manager._loaded, settings.api_keys = saved[:3]
+        signin_mod._MEMORY_CLAIMS.clear()
+        signin_mod._MEMORY_CLAIMS.update(saved[3])
+
+    assert body["claimed"] == 1 and body["points"] == 400, body
+    rows = {row["label"]: row for row in body["results"]}
+    assert rows["s@x"]["claimed"] is True
+    assert rows["i@x"]["claimed"] is False and rows["i@x"]["already"] is True
+
+    assert signed.is_cooling() is False
+    assert idle.is_cooling() is True, "「今天已经领过」不是「现在有积分」"
+    assert idle.is_cooling(CAPABILITY_MEDIA) is True
+
+
+def test_checkin_handles_a_file_holding_several_accounts() -> None:
+    """一个文件放多个号时，签到日志要写到对应那一条，不能把文件写成单条对象。"""
+    import tempfile
+    import time
+    from unittest.mock import patch
+
+    from app import signin as signin_mod
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "batch.json"
+        soon = int(time.time() * 1000) + 3_600_000
+        path.write_text(json.dumps([
+            {"email": "a@x", "accessToken": "tok-a", "expiresAtMs": soon},
+            {"email": "b@x", "accessToken": "tok-b", "expiresAtMs": soon},
+        ]), "utf-8")
+
+        panel = {"days": [
+            {"day_no": 2, "points": 400, "status": signin_mod.CLAIMABLE, "is_today": True},
+        ]}
+        with patch.object(signin_mod, "status", lambda *a, **k: panel), patch.object(
+            signin_mod, "claim",
+            lambda *a, **k: {"claim_result": signin_mod.JUST_CLAIMED, "points": 400,
+                             "day_no": 2, "claim_id": "c2"},
+        ):
+            rows = signin_mod.claim_pool(Path(tmp))
+
+        assert [r["label"] for r in rows] == ["a@x", "b@x"]
+        assert all(r["claimed"] for r in rows), rows
+
+        saved = json.loads(path.read_text("utf-8"))
+        assert isinstance(saved, list) and len(saved) == 2, "数组文件必须还是数组"
+        assert [r["accessToken"] for r in saved] == ["tok-a", "tok-b"]
+        assert [r["email"] for r in saved] == ["a@x", "b@x"]
+        assert all(r["signin"]["claim_id"] == "c2" for r in saved)
+        assert all(r["signin"]["day"] == signin_mod.local_day() for r in saved)
+
+
+def test_token_refresh_keeps_fields_it_does_not_own() -> None:
+    """令牌文件里不止凭证：签到日志住在那儿，刷新不能把它擦掉。"""
+    import tempfile
+
+    from app.auth import Token, _write_record
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "a@x.json"
+        path.write_text(json.dumps({
+            "email": "a@x",
+            "accessToken": "old",
+            "signin": {"day": "2026-11-18", "claim_id": "c1", "points": 400},
+            "note": "手写的备注",
+        }), "utf-8")
+        _write_record(path, Token(access_token="new", refresh_token="ref", label="a@x"), "en")
+        saved = json.loads(path.read_text("utf-8"))
+        assert saved["accessToken"] == "new" and saved["refreshToken"] == "ref"
+        assert saved["signin"]["claim_id"] == "c1"
+        assert saved["note"] == "手写的备注"
+
+
 def test_console_asset() -> None:
     """The console is a static file copied into the image — Go-style embed-less.
 
@@ -565,14 +793,19 @@ def test_quota_errors_rotate() -> None:
 
     Upstream answers 400 with "not enough credits" for a spent account while its
     siblings still work, so the message — not the status code — decides whether
-    the pool rotates.
+    the pool rotates. Throttling messages rotate too; they just park for a minute
+    instead of for the rest of the day.
     """
-    from app.upstream import _quota_exhausted
+    from app.upstream import _quota_exhausted, _rate_limited
 
-    for text in ("not enough credits", "Insufficient balance (1008)", "quota exceeded"):
+    for text in ("not enough credits", "Insufficient balance (1008)", "1008"):
         assert _quota_exhausted(text), text
+    for text in ("quota exceeded", "Rate limit reached", "too many requests"):
+        assert _rate_limited(text), text
+        assert not _quota_exhausted(text), f"{text} 说的是限流，别当成没钱"
     for text in ("unknown model: MiniMax-M9", "invalid request body", ""):
         assert not _quota_exhausted(text), text
+        assert not _rate_limited(text), text
 
 
 def test_metrics_rollup() -> None:
@@ -848,6 +1081,7 @@ def test_a_poor_account_still_answers_chat_but_not_images() -> None:
         CAPABILITY_MEDIA,
         CAPABILITY_TEXT,
         REASON_QUOTA,
+        REASON_RATE,
         CredentialError,
         Token,
         TokenPool,
@@ -871,9 +1105,8 @@ def test_a_poor_account_still_answers_chat_but_not_images() -> None:
     }
     assert chosen == {"rich@x", "poor@x"}, "chat must still reach both accounts"
 
-    # A chat 402 does mean the balance is gone: both channels go down, and the
-    # delay is a backoff — 15 min first, doubling — not "until tomorrow's reset".
-    # A reset that has already passed must never produce a 24-hour park.
+    # A chat 402 does mean the balance is gone, so both channels go down. The
+    # first one only earns a two-hour re-check; the second parks until the reset.
     import app.auth as auth_mod
 
     fresh = Token(access_token="tok-f", label="f@x", pooled=True)
@@ -885,24 +1118,38 @@ def test_a_poor_account_still_answers_chat_but_not_images() -> None:
         assert fresh.is_cooling(CAPABILITY_TEXT) is True
         assert fresh.is_cooling(CAPABILITY_MEDIA) is True
         first = fresh.cooldown_until - time.time()
-        assert 890 <= first <= 901, f"first 402 backs off 15 min, got {first:.0f}s"
+        assert 7190 <= first <= 7201, f"first 402 re-checks in 2 h, got {first:.0f}s"
 
-        # Repeats double it, capped at one check-in cycle.
+        # Still 402 two hours later: today's allowance really is gone.
         solo.park(fresh, 402, "1008")
         second = fresh.cooldown_until - time.time()
-        assert 1790 <= second <= 1801, f"second 402 doubles to 30 min, got {second:.0f}s"
-        for _ in range(8):
-            solo.park(fresh, 402, "1008")
-        assert fresh.cooldown_until - time.time() <= auth_mod.QUOTA_BACKOFF_MAX + 1
+        assert 86390 <= second <= 86401, f"second 402 waits for the reset, got {second:.0f}s"
 
     # A check-in is proof the allowance is back: it clears both channels and
-    # resets the streak, so the next 402 starts from 15 minutes again.
+    # resets the streak, so the next 402 gets the cheap re-check again.
     assert solo.clear_quota_cooldown("f@x") is True
     assert fresh.quota_streak == 0
     with patch.object(auth_mod, "seconds_until_next_day", lambda *a, **kw: 86400.0):
         solo.park(fresh, 402, "1008")
         again = fresh.cooldown_until - time.time()
-        assert 890 <= again <= 901, f"a fresh streak backs off 15 min, got {again:.0f}s"
+        assert 7190 <= again <= 7201, f"a fresh streak re-checks in 2 h, got {again:.0f}s"
+
+    # 429 is throttling, not poverty: the balance is untouched, so the wait
+    # doubles per consecutive hit and any success clears the streak.
+    burst = Token(access_token="tok-r", label="r@x", pooled=True)
+    solo._tokens = [burst]
+    solo.park(burst, 429, "rate limit")
+    assert 59 <= burst.cooldown_until - time.time() <= 61, "first 429 waits a minute"
+    assert burst.cooldown_reason == REASON_RATE
+    solo.park(burst, 429, "rate limit")
+    assert 119 <= burst.cooldown_until - time.time() <= 121, "second 429 doubles to 2 min"
+    for _ in range(8):
+        solo.park(burst, 429, "rate limit")
+    assert burst.cooldown_until - time.time() <= auth_mod.RATE_BACKOFF_MAX + 1
+    solo.note_success(burst)
+    assert burst.rate_streak == 0, "a successful request ends the throttle streak"
+    solo.park(burst, 429, "rate limit")
+    assert 59 <= burst.cooldown_until - time.time() <= 61, "back to a minute after success"
 
     # Auth and rate limits are pool-wide: one dead credential is dead for both.
     dead = Token(access_token="tok-d", label="d@x", pooled=True)
@@ -1077,11 +1324,13 @@ def test_probe_publishes_a_balance_the_media_path_can_use() -> None:
         probe_mod.token_pool_ref = original
 
 
-def test_quota_park_backs_off_instead_of_waiting_a_day() -> None:
-    """1008 is a *daily* allowance: parking for 15 minutes just buys another fail.
+def test_quota_park_runs_to_the_next_reset_after_one_recheck() -> None:
+    """1008 is a *daily* allowance: retrying again today only buys another 402.
 
-    The park lasts until the next local midnight (plus a settle buffer) and a
-    successful sign-in is what lifts it — that is the whole "签到再恢复" loop.
+    So the park runs to the next reset — but the first 402 only gets a two-hour
+    re-check. Upstream also answers 402 for a single oversized request, and
+    trusting it outright would bench an account that still holds credits for the
+    rest of the day. A successful sign-in lifts the park at once.
     """
     import time
 
@@ -1116,8 +1365,12 @@ def test_quota_park_backs_off_instead_of_waiting_a_day() -> None:
     pool.park(token, 402, "insufficient balance (1008)")
     assert token.cooldown_reason == REASON_QUOTA
     left = token.cooldown_until - time.time()
-    assert 60 <= left <= 901, f"a chat 402 backs off minutes, not a day: {left:.0f}s"
+    assert abs(left - min(7200.0, seconds)) <= 2, f"first 402 re-checks in 2 h: {left:.0f}s"
     assert token.is_cooling() is True
+
+    # Two hours later it is still 402 — now the balance itself is the story.
+    pool.park(token, 402, "insufficient balance (1008)")
+    assert abs((token.cooldown_until - time.time()) - seconds) <= 2, "second 402 waits for the reset"
 
     # 签到 = 回血：解除额度冷却，但绝不顺手放过凭证类冷却。
     assert pool.clear_quota_cooldown("a@x") is True
@@ -1140,6 +1393,24 @@ def test_quota_park_backs_off_instead_of_waiting_a_day() -> None:
         assert "earliest retry" in str(exc), exc
     else:
         raise AssertionError("expected CredentialError when every account is out of quota")
+
+
+def test_quota_exceeded_is_throttling_not_an_empty_balance() -> None:
+    """One word now decides between a one-minute park and a whole day offline.
+
+    Upstream says "quota exceeded" both when the rate budget is blown and when
+    the balance is gone. Since the two cannot be told apart from the string, take
+    the cheaper guess: throttle for a minute, and if it really was poverty the
+    next 402 corrects it at the cost of a minute instead of a day.
+    """
+    from app.upstream import _quota_exhausted, _rate_limited
+
+    assert _rate_limited("quota exceeded") is True
+    assert _quota_exhausted("quota exceeded") is False, "限流的话不能当成没钱"
+    assert _quota_exhausted("insufficient balance (1008)") is True
+    assert _quota_exhausted("not enough credit") is True
+    assert _rate_limited("rate limit reached") is True
+    assert _rate_limited("insufficient balance") is False, "没钱不是限流"
 
 
 def test_next_reset_after_midnight_is_minutes_not_a_day() -> None:
@@ -2771,6 +3042,11 @@ def main() -> None:
         test_response_translation,
         test_stream_translation,
         test_signin_panel,
+        test_signin_is_idempotent_per_local_day,
+        test_checkin_lifts_a_park_only_when_the_claim_landed,
+        test_console_signin_unparks_only_the_accounts_it_claimed,
+        test_checkin_handles_a_file_holding_several_accounts,
+        test_token_refresh_keeps_fields_it_does_not_own,
         test_console_asset,
         test_pool_hot_reload,
         test_pool_reload_survives_write_race,
@@ -2783,7 +3059,8 @@ def main() -> None:
         test_account_import_flow,
         test_balance_surfacing,
         test_membership_payload_is_not_unwrapped,
-        test_quota_park_backs_off_instead_of_waiting_a_day,
+        test_quota_park_runs_to_the_next_reset_after_one_recheck,
+        test_quota_exceeded_is_throttling_not_an_empty_balance,
         test_next_reset_after_midnight_is_minutes_not_a_day,
         test_empty_pool_warning_is_rate_limited,
         test_checkin_loop_crosses_the_reset_window,

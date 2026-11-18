@@ -323,35 +323,30 @@ async def claim_signin(request: Request) -> dict:
         try:
             if token.is_expired() and token.refresh_token:
                 await token_manager.renew(token)
-            panel = await asyncio.to_thread(
-                signin.status, token.access_token, settings.region,
-                settings.signin_timezone, settings.upstream_proxy or None,
+            # Same entry point as the check-in loop: it owns the per-account
+            # journal and lock, so a click that races the loop cannot spend the
+            # day's claim twice and cannot disagree about who got the points.
+            return await asyncio.to_thread(
+                signin.claim_token,
+                token.access_token,
+                name,
+                token.origin,
+                token.position,
+                settings.region,
+                settings.signin_timezone,
+                settings.upstream_proxy or None,
             )
-            info = signin.summarize(panel)
-            if not info["claimable"]:
-                return {"label": name, "claimed": False, **info}
-            result = await asyncio.to_thread(
-                signin.claim, token.access_token, settings.region,
-                settings.signin_timezone, settings.upstream_proxy or None,
-            )
-            if result.get("claim_result") == signin.JUST_CLAIMED:
-                return {
-                    "label": name,
-                    "claimed": True,
-                    "points": int(result.get("points") or 0),
-                    "day_no": result.get("day_no"),
-                    "expire_at_ms": result.get("expire_at_ms"),
-                }
-            return {"label": name, "claimed": False, "already": True, **info}
         except Exception as exc:  # noqa: BLE001 - one account must not sink the batch
             return {"label": name, "claimed": False, "error": str(exc)[:200]}
 
     results = await asyncio.gather(*(one(t) for t in tokens))
-    # 签到的意义就是回血：签完把这些号从「额度冷却」里放出来（对话和图片两条通道都解，
-    # 它们花的是同一份积分）。
+    # 签到的意义就是回血，但只有**真的领到**（claim_result=1）才算回血：这时候把这个号
+    # 从「额度冷却」里放出来（对话和图片两条通道都解，它们花的是同一份积分）。
+    # 「今天已经领过」不是「现在有积分」——领完几分钟就花光的还是同一个号，放出来只会
+    # 让它立刻再用一个 402 证明一次自己没钱。
     for row in results:
-        if not row.get("error"):
-            token_manager.clear_quota_cooldown(row.get("label"))
+        if row.get("claimed"):
+            token_manager.note_claim(row.get("label"), row.get("points") or 0)
     gained = sum(r.get("points") or 0 for r in results if r.get("claimed"))
     return {
         "results": results,

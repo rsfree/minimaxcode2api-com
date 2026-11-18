@@ -41,17 +41,27 @@ AUDIENCE = "agent-backend"
 # How long an account is parked after a hard failure.
 COOLDOWN_UNAUTHORIZED = 600.0     # 401 — token or session is dead
 COOLDOWN_EXHAUSTED = 900.0        # 402 when the charge is one-off (media, long jobs)
-COOLDOWN_RATE_LIMITED = 60.0      # 429
+COOLDOWN_RATE_LIMITED = 60.0      # 403 — a policy rejection, not throttling
 
-# A chat 402 means the account's daily allowance is spent, and that allowance
-# only returns with a check-in. Parking "until tomorrow's 00:10" sounds right but
-# has two failure modes: an account emptied at 00:06 used to be parked for 24 h
-# (the reset had already passed), and when the whole pool ran dry the gateway
-# stayed dark until the next 6-hourly check-in. Back off geometrically instead —
-# early retries are cheap and catch a check-in that just landed, while the cap
-# keeps a genuinely empty pool from hammering upstream.
-QUOTA_BACKOFF_BASE = 900.0        # 15 min after the first 402
-QUOTA_BACKOFF_MAX = 6 * 3600.0    # one check-in cycle
+# A chat 402 says the daily allowance is spent. That allowance only comes back
+# with a check-in, and a check-in lands at most once a day (the sweep is
+# idempotent per local day), so retrying later on the same day cannot succeed —
+# every retry just buys another 402. Park until the next reset instead.
+#
+# The *first* 402 is deliberately not trusted. Upstream occasionally answers 402
+# for one oversized request, or while a balance refresh is in flight, and
+# believing it outright would bench an account that still holds credits for the
+# rest of the day. One cheap re-check two hours later tells "this account is
+# really empty" apart from "that request was too expensive".
+QUOTA_PARK_FIRST = 2 * 3600.0     # first 402 — re-check after two hours
+
+# A 429 is throttling, not poverty: the balance is untouched and the account is
+# usable again as soon as the burst passes. A flat one minute turned into a
+# metronome — every minute it hammered the same saturated edge and got another
+# 429. Double the wait per consecutive throttle instead, and let one success
+# reset the streak.
+RATE_BACKOFF_BASE = 60.0          # first 429
+RATE_BACKOFF_MAX = 10 * 60.0      # cap
 
 # Reason tags live on the token so a successful sign-in can lift exactly the
 # quota parks (and never an auth one).
@@ -138,10 +148,15 @@ class Token:
     # written to both this and the media pair below.
     cooldown_until: float = 0.0
     cooldown_reason: str = ""       # auth / quota / rate — see REASON_*
-    # Consecutive chat 402s. Drives the geometric quota backoff: the first one
-    # parks 15 min, each repeat doubles it up to a check-in cycle. A successful
-    # check-in resets it, because a top-up makes the next 402 a fresh story.
+    # Consecutive chat 402s. The first one only parks for a short re-check; from
+    # the second on the account is taken to be empty for the rest of the day. A
+    # successful check-in resets it, because a top-up makes the next 402 a fresh
+    # story.
     quota_streak: int = 0
+    # Consecutive 429s. Doubles the throttle wait (60 s → 120 s → … capped at
+    # RATE_BACKOFF_MAX); cleared by any successful request, since that is the
+    # proof the burst is over.
+    rate_streak: int = 0
     # Media-channel park, kept separate because the two budgets are separate:
     # "cannot afford one image" is not "cannot answer a prompt".
     media_cooldown_until: float = 0.0
@@ -245,6 +260,16 @@ def _write_record(path: Path, token: Token, region: str) -> None:
         "expiresAtMs": token.expires_at_ms,
         "obtainedAtMs": int(time.time() * 1000),
     }
+    # The token file carries more than credentials: the check-in journal lives
+    # there too (``signin``), and so may anything an operator put in by hand.
+    # Rewriting the file from a fixed schema used to erase that on every refresh.
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            existing.update(payload)
+            payload = existing
+    except (OSError, json.JSONDecodeError):
+        pass
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Unique temp name per write: the check-in thread and the console
@@ -645,8 +670,9 @@ class TokenPool:
             cooling = [t for t in self._tokens if not t.disabled and t.is_cooling(capability)]
             if cooling and all(t.cooldown(capability)[1] == REASON_QUOTA for t in cooling):
                 # Report when the pool actually comes back, not a fixed "00:10":
-                # with the geometric backoff that is minutes, not a day, and the
-                # old wording sent everyone waiting for a reset that had passed.
+                # the soonest park may be the two-hour re-check rather than the
+                # reset, and the old wording sent everyone waiting for a moment
+                # that had already passed.
                 soonest = min(t.cooldown(capability)[0] for t in cooling)
                 raise CredentialError(
                     "every account is out of credits right now; earliest retry in "
@@ -690,13 +716,18 @@ class TokenPool:
     ) -> None:
         """Temporarily remove an account from rotation.
 
-        A chat 402 means the allowance is spent, so the delay is a capped
-        geometric backoff (:data:`QUOTA_BACKOFF_BASE` doubling up to
-        :data:`QUOTA_BACKOFF_MAX`, never past the next reset): retrying early is
-        cheap and catches a check-in that just landed, while the cap keeps a
-        genuinely empty pool from hammering upstream. Parking "until the daily
-        reset" read well but put an account offline for 24 h when it emptied
-        minutes *after* midnight.
+        Three failure shapes, three clocks:
+
+        * **402** — the allowance is gone. It only returns with a check-in, and
+          a check-in lands at most once a day, so a retry later today can only
+          fail again. From the *second* consecutive 402 the account is parked
+          until the next reset. The first one parks :data:`QUOTA_PARK_FIRST`
+          first, because upstream also answers 402 for a single oversized
+          request, and a false positive here would cost a whole day.
+        * **429** — throttling, balance untouched. Doubling wait per consecutive
+          hit (:data:`RATE_BACKOFF_BASE` → :data:`RATE_BACKOFF_MAX`), reset by
+          any success.
+        * **401 / 403** — dead credential or policy rejection, flat cooldown.
 
         One-off charges (media, where a single video costs 320 credits) keep the
         flat short cooldown — being too poor for one expensive job says nothing
@@ -714,13 +745,21 @@ class TokenPool:
             tag = REASON_QUOTA
             if capability == CAPABILITY_TEXT:
                 token.quota_streak = min(token.quota_streak + 1, 10)
-                delay = min(
-                    QUOTA_BACKOFF_BASE * (2 ** (token.quota_streak - 1)),
-                    QUOTA_BACKOFF_MAX,
-                    seconds_until_next_day(settings.signin_timezone),
+                to_reset = seconds_until_next_day(settings.signin_timezone)
+                delay = (
+                    to_reset
+                    if token.quota_streak > 1
+                    else min(QUOTA_PARK_FIRST, to_reset)
                 )
             else:
                 delay = COOLDOWN_EXHAUSTED
+        elif status == 429:
+            tag = REASON_RATE
+            token.rate_streak = min(token.rate_streak + 1, 10)
+            delay = min(
+                RATE_BACKOFF_BASE * (2 ** (token.rate_streak - 1)),
+                RATE_BACKOFF_MAX,
+            )
         else:
             delay, tag = COOLDOWN_RATE_LIMITED, REASON_RATE
 
@@ -752,8 +791,9 @@ class TokenPool:
         token = self.find(key)
         if token is None:
             return False
-        # A claim is proof the allowance is back, so the next 402 (if any) starts
-        # a fresh backoff instead of continuing the previous day's streak.
+        # A claim is proof the allowance is back, so the next 402 (if any) is a
+        # fresh story and gets the cheap two-hour re-check instead of being
+        # taken as "empty for the rest of the day".
         token.quota_streak = 0
         cleared = False
         if token.cooldown_reason == REASON_QUOTA:
@@ -768,6 +808,27 @@ class TokenPool:
             token.last_error = ""
             log.info("unparked %s after top-up", token.label or token.short)
         return cleared
+
+    def note_claim(self, key: str | None, points: float = 0.0) -> bool:
+        """Apply the effect of a check-in that actually landed.
+
+        Call this **only** for ``claim_result == 1``. Every other outcome — "已
+        经领过"、今天没得领、调用失败 — must leave the park alone: an account that
+        has not received credits this second is exactly the account the park was
+        describing. Lifting on "the request did not raise" is what put a
+        0-credit account back into rotation after every sweep, so the caller paid
+        for the discovery with a 402 minutes later.
+
+        The claimed amount is also published as the balance hint, so the media
+        pre-filter stops skipping an account that has just been paid instead of
+        waiting for the next probe sweep.
+        """
+        token = self.find(key)
+        if token is None:
+            return False
+        if points > 0:
+            self.set_credit_hint(key, max(token.credit_hint() or 0.0, float(points)))
+        return self.clear_quota_cooldown(key)
 
     def set_credit_hint(self, key: str | None, credit: float | None) -> None:
         """Record the probed balance so the media path can pre-filter on it."""
@@ -788,6 +849,11 @@ class TokenPool:
         token.tokens_in += max(0, int(prompt_tokens or 0))
         token.tokens_out += max(0, int(completion_tokens or 0))
         token.last_error = ""
+        # The burst is over; the next throttle starts from one minute again.
+        # quota_streak is *not* reset here: one accepted request does not prove
+        # the daily allowance came back, and the account that just spent its last
+        # credits answered successfully too.
+        token.rate_streak = 0
 
     def note_failure(self, token: Token, reason: str = "") -> None:
         token.fail_count += 1

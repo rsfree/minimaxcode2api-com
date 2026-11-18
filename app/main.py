@@ -163,6 +163,28 @@ def _next_checkin_delay() -> float:
     return min(interval, to_reset)
 
 
+def _apply_checkin(rows: list[dict], pool: Any = None) -> tuple[int, int, int]:
+    """Turn a sweep's rows into pool state: ``(claimed, gained, lifted)``.
+
+    A park is lifted **only** for a row that actually claimed. Every other
+    outcome — "今天已经领过"、今天没得领、调用失败 — used to clear it too, because
+    the old test was merely "the call did not raise". That handed a 0-credit
+    account back to rotation after every sweep, and the caller paid for the
+    discovery with a 402 the pool had already been told about hours earlier.
+    """
+    pool = pool if pool is not None else token_manager
+    claimed = gained = lifted = 0
+    for row in rows:
+        if not row.get("claimed"):
+            continue
+        claimed += 1
+        points = int(row.get("points") or 0)
+        gained += points
+        if pool.note_claim(row.get("label"), points):
+            lifted += 1
+    return claimed, gained, lifted
+
+
 async def _signin_loop() -> None:
     """Claim the daily reward for every pooled account, then idle.
 
@@ -190,19 +212,23 @@ async def _signin_loop() -> None:
         except Exception as exc:  # noqa: BLE001 - never take the gateway down
             log.warning("daily check-in skipped: %s", exc)
         else:
-            gained = sum(int(row.get("points") or 0) for row in rows if row.get("claimed"))
-            claimed = sum(1 for row in rows if row.get("claimed"))
-            # A quota park lasts until the daily reset; a claim is the proof that
-            # the new day's allowance (and the sign-in points) are in, so lift it
-            # here rather than letting the account sit out another cycle.
-            lifted = sum(
-                1 for row in rows
-                if not row.get("error") and token_manager.clear_quota_cooldown(row.get("label"))
-            )
+            # A quota park lasts until the daily reset, and only a claim is proof
+            # that the new day's allowance (and the sign-in points) actually
+            # arrived — so the park is lifted here, and nowhere near "the call
+            # came back without an exception".
+            claimed, gained, lifted = _apply_checkin(rows)
+            # "Nothing to claim" has two very different meanings, and the log is
+            # the only place an operator can tell them apart: every account may
+            # already have claimed today (the idempotent path, zero requests), or
+            # the sweep may have failed for all of them.
+            cached = sum(1 for row in rows if row.get("cached"))
             if claimed:
-                log.info("daily check-in: %s/%s accounts, +%s credits", claimed, len(rows), gained)
+                log.info("daily check-in: %s/%s accounts, +%s credits%s",
+                         claimed, len(rows), gained,
+                         f" ({cached} already signed in today)" if cached else "")
             else:
-                log.info("daily check-in: nothing to claim across %s accounts", len(rows))
+                log.info("daily check-in: nothing to claim across %s accounts%s",
+                         len(rows), f" ({cached} already signed in today)" if cached else "")
             if lifted:
                 log.info("released %s account(s) parked on quota", lifted)
             # The check-in thread refreshes straight from files and writes the

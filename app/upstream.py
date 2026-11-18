@@ -84,15 +84,30 @@ class UpstreamError(RuntimeError):
 # is empty. Retrying on the next account is the difference between "that one
 #号 is spent" and "the whole gateway is down" — observed as a ~1-in-8 failure
 # before this branch existed.
+#
+# Keep this list narrow. A hit now parks the account until the next daily reset,
+# so a word that can also mean "you are going too fast" would bench an account
+# that still holds credits for the rest of the day. "quota exceeded" is exactly
+# that word: upstream uses it for plain throttling as often as for an empty
+# balance, so it lives in RATE_HINTS.
 QUOTA_HINTS = (
     "not enough credit", "insufficient balance", "insufficient credit",
-    "credit not enough", "quota exceeded", "1008",
+    "credit not enough", "1008",
 )
+
+# Throttling wording. These mean "slow down", not "you are poor": the balance is
+# untouched and the account is fine again once the burst passes.
+RATE_HINTS = ("quota exceeded", "rate limit", "too many requests", "try again later")
 
 
 def _quota_exhausted(message: str) -> bool:
     text = (message or "").lower()
     return any(hint in text for hint in QUOTA_HINTS)
+
+
+def _rate_limited(message: str) -> bool:
+    text = (message or "").lower()
+    return any(hint in text for hint in RATE_HINTS)
 
 
 # Worth another attempt on the *same* account: the request never reached a
@@ -397,20 +412,30 @@ class Upstream:
                 # an operator actually needs to read.
                 err.account = current
                 retriable = (
-                    "unknown model" in err.message.lower() or _quota_exhausted(err.message)
+                    "unknown model" in err.message.lower()
+                    or _quota_exhausted(err.message)
+                    or _rate_limited(err.message)
                 )
                 if retriable and attempt + 1 < tries:
                     if _quota_exhausted(err.message):
-                        # The allowance is spent; park() applies the geometric
-                        # quota backoff (15 min doubling, never past the reset)
-                        # and the check-in sweep lifts it as soon as a claim
-                        # lands. Parking until "the daily reset" used to mean a
-                        # full day offline when the last account died just after
-                        # midnight.
+                        # The allowance is spent. park() benches the account
+                        # until the next daily reset (after one cheap two-hour
+                        # re-check), and the check-in sweep lifts it the moment a
+                        # claim lands.
                         token_manager.park(token, 402, err.message)
                         token_manager.note_failure(token, err.message)
                         log.warning(
-                            "account %s is out of credits (%s); backing off",
+                            "account %s is out of credits (%s); parking",
+                            token.label or token.short, err.message,
+                        )
+                    elif _rate_limited(err.message):
+                        # "quota exceeded" inside a 400 means "slow down", not
+                        # "no money". Parking it as a 402 would take an account
+                        # that still holds credits offline for a whole day.
+                        token_manager.park(token, 429, err.message)
+                        token_manager.note_failure(token, err.message)
+                        log.warning(
+                            "account %s is throttled (%s); backing off",
                             token.label or token.short, err.message,
                         )
                     else:
