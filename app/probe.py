@@ -14,11 +14,13 @@ the console show a dash:
   ``total_count: 0`` with no ``details`` key. Empty is not an error; it is the
   normal state of a free account.
 * ``/matrix/api/v1/commerce/get_membership_info`` — the **balance**: plan name,
-  ``total_remains_credit``, the free/paid split and the check-in gift. Free-plan
-  accounts sit at ``0`` and some go *negative* (spend beyond a granted pack);
-  neither stops them from serving, because requests are metered against a daily
-  free allowance that upstream does not expose. A 402 ``insufficient balance
-  (1008)`` is that allowance running out, not this number.
+  ``total_remains_credit``, the free/paid split and the check-in gift. Only
+  ``op_credit_summary.total_remaining_amount`` is authoritative. A free account
+  sits at ``0`` until it checks in, and **0 means unusable**: a 402
+  ``insufficient balance (1008)`` is that same number failing to cover the
+  request, not a separate daily allowance. ``total_remains_credit`` is always 0
+  and must not be displayed; ``daily_login_gift_credit_remaining`` says whether
+  today's check-in is still claimable, not how much is spendable.
 """
 
 from __future__ import annotations

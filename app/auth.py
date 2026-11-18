@@ -43,10 +43,11 @@ COOLDOWN_UNAUTHORIZED = 600.0     # 401 — token or session is dead
 COOLDOWN_EXHAUSTED = 900.0        # 402 when the charge is one-off (media, long jobs)
 COOLDOWN_RATE_LIMITED = 60.0      # 403 — a policy rejection, not throttling
 
-# A chat 402 says the daily allowance is spent. That allowance only comes back
-# with a check-in, and a check-in lands at most once a day (the sweep is
-# idempotent per local day), so retrying later on the same day cannot succeed —
-# every retry just buys another 402. Park until the next reset instead.
+# A chat 402 means this account's credit balance cannot cover the request. For a
+# free account the only top-up is a check-in, and a check-in lands at most once a
+# day (the sweep is idempotent per local day), so retrying later on the same day
+# cannot succeed — every retry just buys another 402. Park until the next reset
+# instead.
 #
 # The *first* 402 is deliberately not trusted. Upstream occasionally answers 402
 # for one oversized request, or while a balance refresh is in flight, and
@@ -255,15 +256,97 @@ def _record_to_token(record: dict, index: int, origin: Path | None = None, posit
 
 
 def _parse_auth_file(path: Path) -> dict | None:
+    """Read one credential out of a foreign auth file.
+
+    Two layouts exist. Older exports wrap each account in ``records``; the
+    desktop client 3.1.x writes a single flat record and validates it field by
+    field on startup. Only the first was handled, which is why a credential file
+    already damaged by a bad rewrite stopped being readable here too — the
+    gateway went from "wrong credentials" to "no credentials" and logged nothing.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("cannot read auth file %s: %s", path, exc)
         return None
-    records = data.get("records") or {}
-    if not isinstance(records, dict) or not records:
+    if not isinstance(data, dict):
         return None
-    return next(iter(records.values()))
+    records = data.get("records")
+    if isinstance(records, dict) and records:
+        first = next(iter(records.values()))
+        return first if isinstance(first, dict) else None
+    if data.get("accessToken") or data.get("access_token"):
+        return data
+    return None
+
+
+# The desktop client's credential schema (``parseStoredCredential`` in its
+# app.asar). It refuses to start — CREDENTIAL_RECORD_CORRUPT, "sign in again" —
+# when any required field is missing, so a file under this schema is rewritten
+# by *its* rules and never by ours.
+DESKTOP_SCHEMA_VERSION = 1
+DESKTOP_MARKERS = ("schemaVersion", "clientId", "tokenType", "scopes", "audience")
+
+
+def _is_desktop_record(data: dict) -> bool:
+    """Is this file the desktop client's, rather than one of our pool files?
+
+    Our own records are flat as well, but they never carry these keys — the
+    marker set exists only in the client's schema.
+    """
+    return any(marker in data for marker in DESKTOP_MARKERS)
+
+
+def _desktop_record_valid(record: dict) -> bool:
+    """Mirror of the client's startup precondition, checked before we write.
+
+    Failing it means the next launch cannot sign in at all. Checking first is
+    the difference between "one field stale" and "operator must log in again".
+    """
+    scopes = record.get("scopes")
+    expires = record.get("expiresAtMs")
+    generation = record.get("generation")
+    return (
+        isinstance(record.get("schemaVersion"), int)
+        and 1 <= record["schemaVersion"] <= DESKTOP_SCHEMA_VERSION
+        and isinstance(record.get("accessToken"), str)
+        and bool(record["accessToken"])
+        and isinstance(record.get("refreshToken"), str)
+        and bool(record["refreshToken"])
+        and record.get("tokenType") == "Bearer"
+        and record.get("clientId") == CLIENT_ID
+        and isinstance(scopes, list)
+        and all(isinstance(scope, str) for scope in scopes)
+        and record.get("audience") == AUDIENCE
+        and isinstance(expires, (int, float))
+        and expires == expires  # reject NaN
+        and isinstance(generation, int)
+        and generation >= 0
+        and all(
+            record.get(key) is None or isinstance(record.get(key), str)
+            for key in ("subject", "accountId", "loginEpoch")
+        )
+    )
+
+
+def _merge_desktop_record(existing: dict, token: Token) -> dict | None:
+    """Update a desktop credential under the client's schema, or refuse.
+
+    Only the four fields that actually change are touched: ``schemaVersion``,
+    ``clientId`` and ``scopes`` belong to the client and stay as written. Returns
+    None when the merged result would no longer validate — a half-record there
+    costs a re-login, so the file is left untouched and the new credential stays
+    in memory plus our own store.
+    """
+    merged = dict(existing)
+    merged["accessToken"] = token.access_token
+    if token.refresh_token:
+        merged["refreshToken"] = token.refresh_token
+    if token.expires_at_ms:
+        merged["expiresAtMs"] = int(token.expires_at_ms)
+    generation = merged.get("generation")
+    merged["generation"] = generation + 1 if isinstance(generation, int) and generation >= 0 else 1
+    return merged if _desktop_record_valid(merged) else None
 
 
 def _write_record(path: Path, token: Token, region: str) -> None:
@@ -278,13 +361,29 @@ def _write_record(path: Path, token: Token, region: str) -> None:
     # The token file carries more than credentials: the check-in journal lives
     # there too (``signin``), and so may anything an operator put in by hand.
     # Rewriting the file from a fixed schema used to erase that on every refresh.
+    existing = None
     try:
         existing = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(existing, dict):
-            existing.update(payload)
-            payload = existing
     except (OSError, json.JSONDecodeError):
         pass
+    if isinstance(existing, dict) and _is_desktop_record(existing):
+        # Writing our six keys into this file is what broke the desktop client:
+        # it drops schemaVersion/clientId/scopes/audience/tokenType/generation,
+        # and the client answers every later launch with
+        # CREDENTIAL_RECORD_CORRUPT. Update it in its own dialect instead.
+        merged = _merge_desktop_record(existing, token)
+        if merged is None:
+            log.warning(
+                "left %s untouched: it belongs to the desktop client and the merged "
+                "record would fail its own validation, which forces a re-login. "
+                "The new credential is kept in memory and in our own store only.",
+                path,
+            )
+            return
+        payload = merged
+    elif isinstance(existing, dict):
+        existing.update(payload)
+        payload = existing
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Unique temp name per write: the check-in thread and the console
@@ -361,11 +460,33 @@ class TokenPool:
         if not self._tokens:
             auth_file = settings.default_auth_file()
             if auth_file:
-                record = _parse_auth_file(auth_file)
-                if record:
-                    token = _record_to_token(record, index, auth_file)
-                    if token:
-                        self._tokens.append(token)
+                if settings.auth_file:
+                    # Explicitly configured, so the operator accepted the trade:
+                    # the first refresh here spends the client's single-use
+                    # refresh token and the client itself has to sign in again.
+                    record = _parse_auth_file(auth_file)
+                    if record:
+                        token = _record_to_token(record, index, auth_file)
+                        if token:
+                            self._tokens.append(token)
+                    else:
+                        log.warning(
+                            "MINIMAX_AUTH_FILE=%s holds no readable credential "
+                            "(neither an accessToken nor a records map)", auth_file,
+                        )
+                else:
+                    # Silent auto-adoption is gone. It read as a convenience and
+                    # behaved as a takeover: refreshing here spends the client's
+                    # single-use refresh token, so the desktop app gets signed
+                    # out, and the write-back used to flatten its schema on top of
+                    # that. Say so once and let the operator decide.
+                    log.warning(
+                        "found the desktop client's credential at %s but not using it — "
+                        "refreshing with it would spend its single-use refresh token and "
+                        "sign the client out. Set MINIMAX_AUTH_FILE to accept that, or copy "
+                        "the account into your own pool (TOKEN_POOL).",
+                        auth_file,
+                    )
 
         if not self._tokens and settings.refresh_token:
             self._tokens.append(
@@ -490,7 +611,7 @@ class TokenPool:
         the disabled flag stay on the live object; only the credential moves.
         An auth park is lifted here because the rejection applied to the old
         token, not the new one — a quota park is not, since a fresh access token
-        says nothing about the daily allowance.
+        says nothing about the credit balance.
 
         ``force`` is for the resync after a failed exchange: at that point the
         file is known to be the newer of the two, whatever its expiry says.
@@ -922,7 +1043,7 @@ class TokenPool:
         token.last_error = ""
         # The burst is over; the next throttle starts from one minute again.
         # quota_streak is *not* reset here: one accepted request does not prove
-        # the daily allowance came back, and the account that just spent its last
+        # the balance was topped up, and the account that just spent its last
         # credits answered successfully too.
         token.rate_streak = 0
 

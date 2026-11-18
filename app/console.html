@@ -502,7 +502,7 @@ table.tbl tr.failrow .mark i { background: var(--bad); }
         <div class="stat"><div class="v" id="sInflight">-</div><div class="k">在途</div></div>
         <div class="stat warn"><div class="v" id="sClaimable">-</div><div class="k">今日可签积分</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k"
-          title="上游会员接口的可用积分（免费 + 付费）汇总，每 PROBE_INTERVAL 秒采一次。400 = 今天签到到账还没花；0 = 花完了或者还没签到。它不等于「能不能用」：免费额度按天另算，真跑空时上游回 402，网关会冷却到次日重置。">积分余额 <span class="dim" id="sCreditsNote"></span></div></div>
+          title="上游会员接口的可用积分（免费 + 付费）汇总，每 PROBE_INTERVAL 秒采一次。400 = 今天签到到账还没花；0 = 花完了或者还没签到。0 就是付不起任何一单（上游回 402 / 1008），只有签到真的到账后网关才解除冷却——没有与积分分开计算的日额度。">积分余额 <span class="dim" id="sCreditsNote"></span></div></div>
       </div>
 
       <div class="alertbar" id="alertBar" hidden></div>
