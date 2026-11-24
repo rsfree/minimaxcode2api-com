@@ -78,6 +78,16 @@ REASON_RATE = "rate"
 # chat (balance genuinely gone) does say something about media.
 CAPABILITY_TEXT = "text"
 CAPABILITY_MEDIA = "media"
+# Video is a third budget, not a subset of media. Measured 2026-11-25: the same
+# account that draws images happily answers
+#   402 the remaining M Plan weekly limit and account credits cannot cover this
+#       MiniMax-H3 video generation ... this task costs 320 credits
+# so "cannot run this video job" says nothing about "cannot draw a picture", and
+# parking media on it took image capacity away from the whole pool for 15
+# minutes at a time. Upstream also reports video entitlement per account
+# (``503 video generation is temporarily unavailable`` on accounts without video
+# access), which is exactly the shape a per-capability park exists for.
+CAPABILITY_VIDEO = "video"
 
 # How stale a probed balance may be before the pool stops trusting it. The probe
 # sweep is minutes apart; anything older than this is treated as unknown, which
@@ -169,6 +179,13 @@ class Token:
     # "cannot afford one image" is not "cannot answer a prompt".
     media_cooldown_until: float = 0.0
     media_cooldown_reason: str = ""
+    # Video-channel park. Separate from media because the *entitlement* is
+    # separate: the pool's accounts run Hailuo on the legacy Token Plan while
+    # H3/H3-Max need an M Plan weekly limit none of them have, and an account
+    # with no video access at all answers 503 for video while still drawing
+    # images perfectly well.
+    video_cooldown_until: float = 0.0
+    video_cooldown_reason: str = ""
     # Balance as last read by the probe sweep, plus when it was read. Used to
     # skip accounts that provably cannot pay for the job instead of spending a
     # 300 s round trip to be told so.
@@ -192,13 +209,14 @@ class Token:
         return time.time() * 1000 + skew_ms >= self.expires_at_ms
 
     def is_cooling(self, capability: str = CAPABILITY_TEXT) -> bool:
-        until = self.media_cooldown_until if capability == CAPABILITY_MEDIA else self.cooldown_until
-        return until > time.time()
+        return self.cooldown(capability)[0] > time.time()
 
     def cooldown(self, capability: str = CAPABILITY_TEXT) -> tuple[float, str]:
         """``(until, reason)`` for one capability."""
         if capability == CAPABILITY_MEDIA:
             return self.media_cooldown_until, self.media_cooldown_reason
+        if capability == CAPABILITY_VIDEO:
+            return self.video_cooldown_until, self.video_cooldown_reason
         return self.cooldown_until, self.cooldown_reason
 
     def credit_hint(self) -> float | None:
@@ -797,7 +815,7 @@ class TokenPool:
             return None
         if token.is_cooling(capability):
             return None
-        if capability == CAPABILITY_MEDIA and not token.can_afford(need):
+        if capability in (CAPABILITY_MEDIA, CAPABILITY_VIDEO) and not token.can_afford(need):
             return None
         if token.is_expired() and (token.refresh_token or token.session_cookie):
             try:
@@ -849,14 +867,14 @@ class TokenPool:
                 t for t in self._tokens
                 if not t.disabled and not t.is_cooling(capability) and t.access_token
             ]
-            if capability == CAPABILITY_MEDIA and warm:
+            if capability in (CAPABILITY_MEDIA, CAPABILITY_VIDEO) and warm:
                 # Every warm account was skipped by the balance filter. Say so
                 # precisely: "all cooling" would send an operator looking for a
                 # quota reset when what is needed is a top-up.
                 best = max((t.credit_hint() or 0.0) for t in warm)
                 raise CredentialError(
-                    f"no account can afford this media job (need {need:.0f} credits, "
-                    f"best probed balance {best:.0f})",
+                    f"no account can afford this {'video' if capability == CAPABILITY_VIDEO else 'media'} "
+                    f"job (need {need:.0f} credits, best probed balance {best:.0f})",
                     status=402,
                 )
             cooling = [t for t in self._tokens if not t.disabled and t.is_cooling(capability)]
@@ -866,6 +884,16 @@ class TokenPool:
                 # reset, and the old wording sent everyone waiting for a moment
                 # that had already passed.
                 soonest = min(t.cooldown(capability)[0] for t in cooling)
+                if capability == CAPABILITY_VIDEO:
+                    # Not a credit story: the pool's accounts run video on the
+                    # legacy Token Plan, and H3/H3-Max are billed against a
+                    # weekly limit they do not have. Saying "out of credits"
+                    # sends everyone to top up the wrong bucket.
+                    raise CredentialError(
+                        "no account can run this video job right now (plan limit or "
+                        f"credits); earliest retry in {short_delay(soonest - time.time())} "
+                        f"({settings.signin_timezone})"
+                    )
                 raise CredentialError(
                     "every account is out of credits right now; earliest retry in "
                     f"{short_delay(soonest - time.time())} "
@@ -928,8 +956,12 @@ class TokenPool:
         ``capability`` scopes a 402 to one budget. A media 402 only proves the
         account cannot pay for an image; it can still answer chat, so parking the
         text channel for 15 minutes because of it was silently costing the pool
-        usable capacity. 401 and 429 are different: a dead or throttled
-        credential is dead for both, so those two write to both channels.
+        usable capacity. Video is scoped the same way and for a stronger reason:
+        the pool's accounts run video off a legacy plan that only covers
+        Hailuo-2.3, so an H3 attempt returns 402 on accounts that draw images
+        perfectly well — parking media there benched the whole image path for 15
+        minutes per attempt. 401 and 429 are different: a dead or throttled
+        credential is dead for all three, so those write to every channel.
         """
         if status == 401:
             delay, tag = COOLDOWN_UNAUTHORIZED, REASON_AUTH
@@ -957,15 +989,22 @@ class TokenPool:
 
         until = time.time() + delay
         message = reason[:200] or f"HTTP {status}"
-        scopes = [CAPABILITY_TEXT, CAPABILITY_MEDIA] if status in {401, 429} else [capability]
-        # Chat's 402 says the balance itself is gone, so images cannot be paid for
-        # either; parking media too saves discovering that 300 s later.
+        scopes = (
+            [CAPABILITY_TEXT, CAPABILITY_MEDIA, CAPABILITY_VIDEO]
+            if status in {401, 429}
+            else [capability]
+        )
+        # Chat's 402 says the balance itself is gone, so neither images nor video
+        # can be paid for either; parking them too saves discovering that later.
         if status == 402 and capability == CAPABILITY_TEXT:
-            scopes.append(CAPABILITY_MEDIA)
+            scopes.extend([CAPABILITY_MEDIA, CAPABILITY_VIDEO])
         for scope in scopes:
             if scope == CAPABILITY_MEDIA:
                 token.media_cooldown_until = until
                 token.media_cooldown_reason = tag
+            elif scope == CAPABILITY_VIDEO:
+                token.video_cooldown_until = until
+                token.video_cooldown_reason = tag
             else:
                 token.cooldown_until = until
                 token.cooldown_reason = tag
@@ -995,6 +1034,10 @@ class TokenPool:
         if token.media_cooldown_reason == REASON_QUOTA:
             token.media_cooldown_until = 0.0
             token.media_cooldown_reason = ""
+            cleared = True
+        if token.video_cooldown_reason == REASON_QUOTA:
+            token.video_cooldown_until = 0.0
+            token.video_cooldown_reason = ""
             cleared = True
         if cleared:
             token.last_error = ""
@@ -1114,6 +1157,15 @@ class TokenPool:
             "cooling_media": sum(
                 1 for t in self._tokens if (not t.disabled) and t.is_cooling(CAPABILITY_MEDIA)
             ),
+            # Video is its own count because it is its own entitlement: all 72
+            # pooled accounts can draw while none of them can run H3.
+            "usable_video": sum(
+                1 for t in self._tokens
+                if t.access_token and not t.disabled and not t.is_cooling(CAPABILITY_VIDEO)
+            ),
+            "cooling_video": sum(
+                1 for t in self._tokens if (not t.disabled) and t.is_cooling(CAPABILITY_VIDEO)
+            ),
             "in_flight": sum(t.in_flight for t in self._tokens),
             "pool_watch_seconds": settings.pool_watch if settings.token_pool else 0,
             "accounts": [
@@ -1134,6 +1186,11 @@ class TokenPool:
                     "media_cooling_for": round(max(0.0, t.media_cooldown_until - now)),
                     "media_cooldown_until": t.media_cooldown_until or None,
                     "media_cooldown_reason": t.media_cooldown_reason or None,
+                    "usable_video": bool(t.access_token) and not t.disabled
+                    and not t.is_cooling(CAPABILITY_VIDEO),
+                    "video_cooling_for": round(max(0.0, t.video_cooldown_until - now)),
+                    "video_cooldown_until": t.video_cooldown_until or None,
+                    "video_cooldown_reason": t.video_cooldown_reason or None,
                     "credit": t.credit,
                     "uses": t.uses,
                     "ok": t.ok_count,

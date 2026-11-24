@@ -114,6 +114,31 @@ def image_credit_need(count: int) -> float:
     return _min_credits() * max(1, int(count))
 
 
+# What one video job quotes, read off the upstream 402 body rather than guessed:
+# "this task costs 320 credits" for H3 4 s, "250 credits" for H3-Max 5 s 480P.
+# Hailuo-2.3 is billed against the legacy Token Plan, not credits, so its credit
+# floor is genuinely zero.
+VIDEO_CREDIT_PRICES = {
+    "MiniMax-H3": 320.0,
+    "MiniMax-H3-Max": 250.0,
+    "MiniMax-Hailuo-2.3": 0.0,
+}
+
+
+def video_credit_need(model: str | None) -> float:
+    """Credit floor for one video job on ``model``.
+
+    A floor, not a price: the charge scales with duration and the quote for the
+    longest render is not measured. Under-estimating is the safe direction — a
+    borderline account is let through and the upstream 402 settles it, which now
+    costs only the video channel.
+    """
+    try:
+        return VIDEO_CREDIT_PRICES.get(normalize_video_model(model), 0.0)
+    except MediaError:
+        return 0.0
+
+
 async def call(
     tool: str, payload: dict, timeout: float, account: str | None = None,
     need_credits: float = 0.0,
@@ -648,7 +673,8 @@ def normalize_video_model(model: str | None) -> str:
 async def video_submit(payload: dict, account: str | None = None) -> tuple[dict, str]:
     """Submit a video task; returns ``(response, account that owns the task)``."""
     return await call_ex(
-        "submit_video_generation", payload, VIDEO_SUBMIT_TIMEOUT, account, _min_credits()
+        "submit_video_generation", payload, VIDEO_SUBMIT_TIMEOUT, account,
+        video_credit_need(payload.get("model")),
     )
 
 

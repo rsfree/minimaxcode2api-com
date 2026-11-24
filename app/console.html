@@ -1227,7 +1227,7 @@ function renderAccounts() {
   let list = rows.filter((a) => {
     if (q && !(a.label || "").toLowerCase().includes(q)) return false;
     if (accState.filter === "usable" && !a.usable) return false;
-    if (accState.filter === "cooling" && !(a.cooling_for > 0) && !(a.media_cooling_for > 0)) return false;
+    if (accState.filter === "cooling" && !(a.cooling_for > 0) && !(a.media_cooling_for > 0) && !(a.video_cooling_for > 0)) return false;
     if (accState.filter === "disabled" && !a.disabled) return false;
     return true;
   });
@@ -1285,6 +1285,16 @@ function renderAccounts() {
       ? '<div style="margin-top:4px"><span class="tag mute" style="font-size:11px" title="' +
         esc(mediaWhy) + '">图 ' + dur(a.media_cooling_for) + "</span></div>"
       : "";
+    // 视频是第三本账：这个池子靠 legacy Token Plan 只能跑 Hailuo，H3/H3-Max 要 M Plan
+    // 周额度，全池都没有。视频被停不影响生图，所以单独标一格。
+    const videoCool = (a.video_cooling_for || 0) > 0;
+    const videoWhy = a.video_cooldown_reason === "quota" ? "这个号跑不了当前视频任务（M Plan 周额度或积分不足），生图不受影响"
+      : a.video_cooldown_reason === "rate" ? "视频权限不可用（上游 503），生图不受影响"
+      : a.video_cooldown_reason === "auth" ? "凭证失效，等网关自动续期" : "";
+    const videoTag = videoCool
+      ? '<div style="margin-top:4px"><span class="tag mute" style="font-size:11px" title="' +
+        esc(videoWhy) + '">视 ' + dur(a.video_cooling_for) + "</span></div>"
+      : "";
     // 余额来自会员接口，0 与负数都是真实值；只有「没采到」才是破折号。
     const bal = a.balance || null;
     const credit = bal && bal.credit != null ? bal.credit : null;
@@ -1308,7 +1318,7 @@ function renderAccounts() {
       '<td class="who"><div class="nm"' + err + ">" + esc(a.label || "—") + "</div>" +
       '<div class="id">' + (a.last_error ? esc(String(a.last_error).slice(0, 42)) : "expires " + (a.expires_at_ms ? new Date(a.expires_at_ms).toLocaleDateString("zh-CN") : "—")) +
         sessionTag + "</div></td>" +
-      "<td>" + tag + mediaTag + "</td>" +
+      "<td>" + tag + mediaTag + videoTag + "</td>" +
       '<td class="num">' + cr + "</td>" +
       '<td class="num">' + (a.ok || 0) + " / " + (a.fail ? '<span style="color:var(--bad)">' + a.fail + "</span>" : "0") +
         (a.attempts_total != null && a.attempts_total > (a.ok || 0) + (a.fail || 0)

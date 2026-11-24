@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 
 from . import curl_transport
-from .auth import CAPABILITY_MEDIA, CredentialError, token_manager
+from .auth import CAPABILITY_MEDIA, CAPABILITY_VIDEO, CredentialError, token_manager
 from .config import API_KEY_PLACEHOLDER, settings
 
 log = logging.getLogger("minimax.upstream")
@@ -67,6 +67,15 @@ ROTATABLE_TOOLS = {
     "synthesize_speech",
     "batch_text_to_music",
 }
+
+# Which park a failure writes to. Video has its own entitlement — the pool runs
+# Hailuo on a legacy plan while H3/H3-Max need an M Plan weekly limit none of
+# them have — so a video 402/503 must not bench the image channel.
+VIDEO_TOOLS = frozenset({"submit_video_generation", "query_video_generation"})
+
+
+def _capability_for(tool: str) -> str:
+    return CAPABILITY_VIDEO if tool in VIDEO_TOOLS else CAPABILITY_MEDIA
 
 
 class UpstreamError(RuntimeError):
@@ -571,6 +580,7 @@ class Upstream:
         last_account = ""
         tries = 1 + max(0, int(settings.retry_attempts))
         pinned = token_manager.find(account) if account else None
+        capability = _capability_for(tool)
 
         for attempt in range(tries):
             token = None
@@ -581,7 +591,7 @@ class Upstream:
             if token is None:
                 try:
                     token = await token_manager.acquire(
-                        exclude=tried, capability=CAPABILITY_MEDIA, need=need_credits
+                        exclude=tried, capability=capability, need=need_credits
                     )
                 except CredentialError as exc:
                     # The pool is not broken, it is too poor for this job. A 502
@@ -597,7 +607,13 @@ class Upstream:
                                     tool, wait, attempt + 1, tries)
                         await asyncio.sleep(wait)
                         continue
-                    raise UpstreamError(502, f"credential refresh failed: {exc}") from exc
+                    # Nothing is wrong with upstream: the pool has nothing to
+                    # spend on this job. 503 with the reason (which already
+                    # carries the earliest retry) tells the caller the truth;
+                    # a 502 here reads like a gateway fault and sent callers
+                    # hunting for a broken upstream that was working fine.
+                    _log_empty_pool(str(exc))
+                    raise UpstreamError(503, f"no usable account: {exc}") from exc
             tried.add(token.access_token or token.label)
             last_account = token.label or token.short
 
@@ -627,7 +643,7 @@ class Upstream:
                     last.account = last_account
                     token_manager.park(
                         token, status, last.message if last else f"HTTP {status}",
-                        capability=CAPABILITY_MEDIA,
+                        capability=capability,
                     )
                     log.warning("mcp %s: account %s failed (%s)", tool, token.label or token.short, status)
                     continue
@@ -675,9 +691,18 @@ class Upstream:
                     # from picking the same drained account and failing again.
                     # HTTP 402 is parked the same way a few lines above; the
                     # business code rides inside a 200 and used to be missed.
-                    # Scoped to media: this says "cannot pay for an image", not
-                    # "cannot answer a prompt".
-                    token_manager.park(token, 402, last.message, capability=CAPABILITY_MEDIA)
+                    # Scoped to the capability that failed: on the image path
+                    # this says "cannot pay for an image", not "cannot answer a
+                    # prompt"; on the video path it says nothing about images.
+                    token_manager.park(token, 402, last.message, capability=capability)
+                elif code == 503 and capability == CAPABILITY_VIDEO:
+                    # "video generation is temporarily unavailable" is the
+                    # account's entitlement answer, and it is stable: a sibling
+                    # account either has video or does not. Without a park every
+                    # video request walks the entire pool asking all of them
+                    # again, and — before this was scoped — benched their image
+                    # channel on the way past.
+                    token_manager.park(token, 503, last.message, capability=capability)
                 log.warning(
                     "mcp %s: account %s cannot use this tool (%s), trying the next",
                     tool, token.label or token.short, code,

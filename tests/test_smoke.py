@@ -1431,6 +1431,215 @@ def test_image_request_lands_on_a_solvent_account() -> None:
     assert served == ["Bearer tok2"], f"the 40/60-credit accounts must not be tried, got {served}"
 
 
+def test_video_park_keeps_the_image_channel_alive() -> None:
+    """Video is a third budget: a video 402 must not bench images.
+
+    Measured 2026-11-25: H3 quotes 320 credits against an M Plan weekly limit
+    none of the pooled accounts has, so every H3 attempt answers 402 on accounts
+    that draw images perfectly well. Parking media on that took the whole image
+    path offline for 15 minutes per attempt.
+    """
+    from app.auth import (
+        CAPABILITY_MEDIA,
+        CAPABILITY_TEXT,
+        CAPABILITY_VIDEO,
+        Token,
+        TokenPool,
+    )
+
+    pool = TokenPool()
+    token = Token(access_token="tok", label="a@x", pooled=True)
+    pool._tokens = [token]
+    pool._loaded = True
+
+    pool.park(token, 402, "plan limit cannot cover this video", capability=CAPABILITY_VIDEO)
+    assert token.is_cooling(CAPABILITY_VIDEO)
+    assert not token.is_cooling(CAPABILITY_MEDIA), "images must survive a video 402"
+    assert not token.is_cooling(CAPABILITY_TEXT), "chat must survive a video 402"
+
+    assert asyncio.run(pool.acquire(capability=CAPABILITY_MEDIA)).label == "a@x"
+    assert asyncio.run(pool.acquire(capability=CAPABILITY_TEXT)).label == "a@x"
+
+    described = pool.describe()
+    assert described["usable_media"] == 1, described
+    assert described["usable_video"] == 0, described
+    assert described["cooling_video"] == 1, described
+
+    # A top-up refills the one balance, so it lifts the video park too.
+    pool.clear_quota_cooldown("a@x")
+    assert not token.is_cooling(CAPABILITY_VIDEO)
+
+
+def test_video_entitlement_503_parks_video_and_rotates() -> None:
+    """`video generation is temporarily unavailable` is per-account, and stable.
+
+    It used to rotate without parking, so every video request asked all 72
+    accounts again — and parked their *image* channel on the way past.
+    """
+    from unittest.mock import patch
+
+    from app import upstream as upstream_mod
+    from app.auth import (
+        CAPABILITY_MEDIA,
+        CAPABILITY_VIDEO,
+        Token,
+        token_manager,
+    )
+
+    first = Token(access_token="tok-a", label="a@x", pooled=True)
+    second = Token(access_token="tok-b", label="b@x", pooled=True)
+    tokens = [first, second]
+    served: list[str] = []
+
+    class Resp:
+        status_code = 200
+        headers: dict = {}
+        account = ""
+
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        async def aread(self):
+            return self._body
+
+        async def aclose(self):
+            pass
+
+    async def fake_dispatch(url, payload, headers, stream, timeout=None):
+        served.append(headers.get("authorization", ""))
+        if len(served) == 1:
+            return Resp(b'{"code":503,"message":"video generation is temporarily unavailable"}')
+        return Resp(b'{"code":0,"message":"ok","task_id":"1"}')
+
+    async def run():
+        with patch.object(upstream_mod.upstream, "startup", return_value=None), \
+             patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
+             patch.object(token_manager, "_tokens", tokens), \
+             patch.object(token_manager, "_loaded", True):
+            return await upstream_mod.upstream.mcp(
+                "submit_video_generation", {}, need_credits=320
+            )
+
+    body = asyncio.run(run())
+    assert body["code"] == 0, body
+    assert served == ["Bearer tok-a", "Bearer tok-b"], served
+    assert first.is_cooling(CAPABILITY_VIDEO), "an account without video must be parked"
+    assert not first.is_cooling(CAPABILITY_MEDIA), "and must keep drawing images"
+
+
+def test_video_delivery_503_does_not_park_the_account() -> None:
+    """A finished-but-undeliverable file is upstream's problem, not the account's."""
+    from unittest.mock import patch
+
+    from app import media
+    from app import upstream as upstream_mod
+    from app.auth import CAPABILITY_VIDEO, Token, token_manager
+
+    token = Token(access_token="tok-a", label="a@x", pooled=True)
+    body = b'{"code":503,"message":"the video is ready but could not be prepared for delivery"}'
+
+    class Resp:
+        status_code = 200
+        headers: dict = {}
+        account = ""
+
+        async def aread(self):
+            return body
+
+        async def aclose(self):
+            pass
+
+    async def fake_dispatch(*args, **kwargs):
+        return Resp()
+
+    async def run():
+        # Go through media.call so the business code is unwrapped the way the
+        # route sees it.
+        with patch.object(upstream_mod.upstream, "startup", return_value=None), \
+             patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
+             patch.object(token_manager, "_tokens", [token]), \
+             patch.object(token_manager, "_loaded", True):
+            return await media.call("query_video_generation", {"task_id": "1"}, 10.0)
+
+    # The business code still surfaces to the caller as a 503...
+    try:
+        asyncio.run(run())
+    except media.MediaError as exc:
+        assert exc.status == 503, exc
+    else:
+        raise AssertionError("a business 503 must surface")
+    # ...but polling the same task again is the correct next step, so no park.
+    assert not token.is_cooling(CAPABILITY_VIDEO), "a delivery hiccup must not bench the account"
+
+
+def test_video_prefilter_uses_the_measured_price() -> None:
+    """The video floor is 320 credits (H3 4 s), not the 115-credit image floor."""
+    from app import media
+    from app.auth import CAPABILITY_VIDEO, Token, TokenPool
+
+    assert media.video_credit_need("MiniMax-H3") == 320.0
+    assert media.video_credit_need("h3-max") == 250.0
+    # Hailuo runs on the legacy Token Plan, so credits are not the gate at all.
+    assert media.video_credit_need("MiniMax-Hailuo-2.3") == 0.0
+    assert media.video_credit_need(None) == 0.0
+    # An unknown model must not be silently priced — let upstream answer.
+    assert media.video_credit_need("H4") == 0.0
+
+    pool = TokenPool()
+    poor = Token(access_token="tok-p", label="poor@x", pooled=True)
+    rich = Token(access_token="tok-r", label="rich@x", pooled=True)
+    pool._tokens = [poor, rich]
+    pool._loaded = True
+    pool.set_credit_hint("poor@x", 200)
+    pool.set_credit_hint("rich@x", 400)
+
+    for _ in range(5):
+        assert asyncio.run(
+            pool.acquire(capability=CAPABILITY_VIDEO, need=320)
+        ).label == "rich@x"
+    assert not poor.is_cooling(CAPABILITY_VIDEO), "a skip must not become a park"
+
+
+def test_auth_failure_parks_every_channel() -> None:
+    """A dead credential is dead for chat, images and video alike."""
+    from app.auth import (
+        CAPABILITY_MEDIA,
+        CAPABILITY_TEXT,
+        CAPABILITY_VIDEO,
+        Token,
+        TokenPool,
+    )
+
+    pool = TokenPool()
+    token = Token(access_token="tok", label="a@x", pooled=True)
+    pool._tokens = [token]
+    pool._loaded = True
+
+    pool.park(token, 401, "invalid access token")
+    for capability in (CAPABILITY_TEXT, CAPABILITY_MEDIA, CAPABILITY_VIDEO):
+        assert token.is_cooling(capability), capability
+
+
+def test_text_402_parks_every_paying_channel() -> None:
+    """A drained balance cannot pay for images or video either."""
+    from app.auth import (
+        CAPABILITY_MEDIA,
+        CAPABILITY_TEXT,
+        CAPABILITY_VIDEO,
+        Token,
+        TokenPool,
+    )
+
+    pool = TokenPool()
+    token = Token(access_token="tok", label="a@x", pooled=True)
+    pool._tokens = [token]
+    pool._loaded = True
+
+    pool.park(token, 402, "no credits left")
+    for capability in (CAPABILITY_TEXT, CAPABILITY_MEDIA, CAPABILITY_VIDEO):
+        assert token.is_cooling(capability), capability
+
+
 def test_probe_publishes_a_balance_the_media_path_can_use() -> None:
     """The probe is the only reader of the balance; the pool needs it too."""
     import time
@@ -3395,6 +3604,12 @@ def main() -> None:
         test_image_accepts_multiple_references,
         test_a_poor_account_still_answers_chat_but_not_images,
         test_media_prefilter_uses_the_probed_balance,
+        test_video_park_keeps_the_image_channel_alive,
+        test_video_entitlement_503_parks_video_and_rotates,
+        test_video_delivery_503_does_not_park_the_account,
+        test_video_prefilter_uses_the_measured_price,
+        test_auth_failure_parks_every_channel,
+        test_text_402_parks_every_paying_channel,
         test_image_cost_floor_scales_with_the_batch,
         test_image_request_lands_on_a_solvent_account,
         test_probe_publishes_a_balance_the_media_path_can_use,
