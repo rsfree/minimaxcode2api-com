@@ -1012,12 +1012,20 @@ class TokenPool:
         log.warning("parked %s for %.0fs (%s/%s): %s",
                     token.label or token.short, delay, capability, tag, token.last_error)
 
-    def clear_quota_cooldown(self, key: str | None) -> bool:
+    def clear_quota_cooldown(self, key: str | None, video: bool = False) -> bool:
         """Put an account back in rotation after a top-up (sign-in).
 
         Only quota parks are lifted: a dead token or a rate limit has nothing to
-        do with a claim, and clearing it would just produce another 401. Both
-        channels are cleared — a top-up refills the one balance they share.
+        do with a claim, and clearing it would just produce another 401. Chat and
+        media are cleared together — a top-up refills the balance they share.
+
+        ``video`` is deliberately opt-in. The probe calls this on every sweep for
+        any account whose balance reads positive, and that is the right trigger
+        for images (paid in credits) but the wrong one for video: H3/H3-Max are
+        billed against an M Plan weekly limit that a credit balance says nothing
+        about, so a positive balance would un-park an account that still cannot
+        run the job. Only a landed check-in — fresh allowance, not just fresh
+        credits — lifts the video park early; otherwise it rides out its TTL.
         """
         token = self.find(key)
         if token is None:
@@ -1035,7 +1043,7 @@ class TokenPool:
             token.media_cooldown_until = 0.0
             token.media_cooldown_reason = ""
             cleared = True
-        if token.video_cooldown_reason == REASON_QUOTA:
+        if video and token.video_cooldown_reason == REASON_QUOTA:
             token.video_cooldown_until = 0.0
             token.video_cooldown_reason = ""
             cleared = True
@@ -1063,7 +1071,7 @@ class TokenPool:
             return False
         if points > 0:
             self.set_credit_hint(key, max(token.credit_hint() or 0.0, float(points)))
-        return self.clear_quota_cooldown(key)
+        return self.clear_quota_cooldown(key, video=True)
 
     def set_credit_hint(self, key: str | None, credit: float | None) -> None:
         """Record the probed balance so the media path can pre-filter on it."""

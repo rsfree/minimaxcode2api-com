@@ -1465,8 +1465,12 @@ def test_video_park_keeps_the_image_channel_alive() -> None:
     assert described["usable_video"] == 0, described
     assert described["cooling_video"] == 1, described
 
-    # A top-up refills the one balance, so it lifts the video park too.
+    # A positive *balance* is not proof the M Plan limit is back, and the probe
+    # clears parks on exactly that signal — so it must leave the video park be.
     pool.clear_quota_cooldown("a@x")
+    assert token.is_cooling(CAPABILITY_VIDEO), "credit > 0 says nothing about video"
+    # A landed check-in is a fresh allowance, and that does lift it.
+    pool.clear_quota_cooldown("a@x", video=True)
     assert not token.is_cooling(CAPABILITY_VIDEO)
 
 
