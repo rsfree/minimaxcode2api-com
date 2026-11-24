@@ -2699,8 +2699,8 @@ def test_ark_inline_image_is_uploaded() -> None:
 
     seen: list[dict] = []
 
-    async def fake_upload(raw, mime_type, filename):
-        seen.append({"raw": raw, "mime": mime_type, "name": filename})
+    async def fake_upload(raw, mime_type, filename, account=None):
+        seen.append({"raw": raw, "mime": mime_type, "name": filename, "account": account})
         return f"https://agent-cdn.example/{filename}"
 
     async def fake_download(url):
@@ -2713,7 +2713,12 @@ def test_ark_inline_image_is_uploaded() -> None:
     try:
         url = asyncio.run(media.resolve_reference("data:image/webp;base64,AAAA", 3))
         assert url == "https://agent-cdn.example/ref_3.webp"
-        assert seen[-1] == {"raw": b"\x00\x00\x00", "mime": "image/webp", "name": "ref_3.webp"}
+        assert seen[-1] == {
+            "raw": b"\x00\x00\x00",
+            "mime": "image/webp",
+            "name": "ref_3.webp",
+            "account": None,
+        }
 
         # A public URL is downloaded and re-staged, never forwarded: the
         # synthesis tool answers `input_urls could not be read or decoded` for
@@ -2794,6 +2799,126 @@ def test_reference_download_size_is_capped() -> None:
             raise AssertionError("an oversized reference must not be forwarded")
     finally:
         media.download = original
+
+
+def test_image_job_stages_and_generates_on_one_account() -> None:
+    """Staging is namespaced per account, so the job must not rotate mid-flight.
+
+    ``get_upload_url`` lands the object under ``mcp/u<uid>/general/...`` of
+    whichever account served it. A reference staged by account A is unreadable
+    to account B, and rotating between them reproduces the exact
+    ``input_urls could not be read or decoded`` 502 this path exists to fix.
+    """
+    from app import media
+
+    calls: list[tuple[str, str | None]] = []
+
+    async def fake_owner(need, exclude=None):
+        return "tok-A"
+
+    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
+        calls.append((tool, account))
+        if tool == "upload_to_cdn":
+            return {"cdn_url": "https://cdn/ref.png"}
+        return {"success_items": [{"output_url": "https://cdn/out.png"}]}
+
+    original = media._pin_media_owner, media.call, media.read_reference
+
+    async def fake_read(value):
+        return b"\x89PNG\r\n\x1a\n", "image/png"
+
+    media._pin_media_owner, media.call, media.read_reference = (
+        fake_owner,
+        fake_call,
+        fake_read,
+    )
+    try:
+        result = asyncio.run(
+            media.image_generate(
+                prompt="x",
+                n=1,
+                size="1024x1024",
+                reference_urls=["https://x.test/a.png", "https://x.test/b.png"],
+            )
+        )
+        assert result["images"][0]["url"] == "https://cdn/out.png"
+        assert [tool for tool, _ in calls] == [
+            "upload_to_cdn",
+            "upload_to_cdn",
+            "image_synthesize",
+        ]
+        assert {account for _, account in calls} == {"tok-A"}
+    finally:
+        media._pin_media_owner, media.call, media.read_reference = original
+
+
+def test_image_job_restages_when_the_pinned_account_gives_a_502() -> None:
+    """A 502 on a job with references is retried on another account, re-staged.
+
+    Retrying the same references would fail identically, because the object is
+    still in the old account's namespace — so the retry has to re-upload too.
+    """
+    from app import media
+
+    calls: list[tuple[str, str | None]] = []
+    owners = ["tok-A", "tok-B"]
+    synthesizes = {"count": 0}
+
+    async def fake_owner(need, exclude=None):
+        return owners.pop(0)
+
+    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
+        calls.append((tool, account))
+        if tool == "upload_to_cdn":
+            return {"cdn_url": f"https://cdn/ref-{account}.png"}
+        synthesizes["count"] += 1
+        if synthesizes["count"] == 1:
+            raise media.MediaError(502, "image generation failed: request failed")
+        return {"success_items": [{"output_url": "https://cdn/out.png"}]}
+
+    async def fake_read(value):
+        return b"\x89PNG\r\n\x1a\n", "image/png"
+
+    original = media._pin_media_owner, media.call, media.read_reference
+    media._pin_media_owner, media.call, media.read_reference = (
+        fake_owner,
+        fake_call,
+        fake_read,
+    )
+    try:
+        result = asyncio.run(
+            media.image_generate(
+                prompt="x", n=1, size="1024x1024", reference_urls=["https://x.test/a.png"]
+            )
+        )
+        assert result["images"][0]["url"] == "https://cdn/out.png"
+        assert calls == [
+            ("upload_to_cdn", "tok-A"),
+            ("image_synthesize", "tok-A"),
+            ("upload_to_cdn", "tok-B"),
+            ("image_synthesize", "tok-B"),
+        ]
+    finally:
+        media._pin_media_owner, media.call, media.read_reference = original
+
+
+def test_image_job_without_references_does_not_pin() -> None:
+    """No staging means nothing to keep together; rotation is more resilient."""
+    from app import media
+
+    calls: list[tuple[str, str | None]] = []
+
+    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
+        calls.append((tool, account))
+        return {"success_items": [{"output_url": "https://cdn/out.png"}]}
+
+    original = media.call
+    media.call = fake_call
+    try:
+        asyncio.run(media.image_generate(prompt="x", n=1, size="1024x1024"))
+        assert calls == [("image_synthesize", None)]
+    finally:
+        media.call = original
 
 
 def test_image_accepts_multiple_references() -> None:
@@ -3254,6 +3379,9 @@ def main() -> None:
         test_ark_inline_image_is_uploaded,
         test_reference_upload_picks_inline_or_presigned_by_size,
         test_reference_download_size_is_capped,
+        test_image_job_stages_and_generates_on_one_account,
+        test_image_job_restages_when_the_pinned_account_gives_a_502,
+        test_image_job_without_references_does_not_pin,
         test_image_accepts_multiple_references,
         test_a_poor_account_still_answers_chat_but_not_images,
         test_media_prefilter_uses_the_probed_balance,

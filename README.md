@@ -1385,8 +1385,10 @@ MEDIA_LIVE=1 MEDIA_LIVE_VIDEO=1 GATEWAY=... GATEWAY_KEY=... \
 - **生图的参考图由网关转存，视频的没有**。桌面端是先上传本地文件到 OSS 再把签名 URL 传给上游，网关的生图
   路径现在做同一件事：`image` 的每一项（公网 URL / `data:` URI / 裸 base64）先被读入 → ≤600 KiB 走
   `upload_to_cdn` 内联上传，更大的走 `get_upload_url` + PUT 签名直传（`put_url` 有效期 600s）→ 拿自己 OSS 的
-  `cdn_url` 作为 `input_urls`。**裸透传行不通**：上游只解析它自己 staged 的对象，第三方 CDN 一律回
+  `cdn_url` 作为   `input_urls`。**裸透传行不通**：上游只解析它自己 staged 的对象，第三方 CDN 一律回
   `input_urls could not be read or decoded`。单张上限 `MEDIA_MAX_BYTES`（10 MiB）。
+  转存与生图**必须同一个账号**——对象落在 `mcp/u<uid>/general/...` 的账号命名空间里，换号就变成别人的对象，
+  所以带参考图的任务会先钉一个账号走完全程，502 时才换号并把参考图**重传**一遍。
   视频的 `first_frame_image` / `reference_images` 走 `video_submit`，**没有转存环节**，仍然是上游能直接读的 URL。
 - **生图/视频结果是 CDN 链接**，不是网关切下来存的字节。链接会过期（H3 签名 URL 约 9 小时），
   需要长期保存请自己转存。
