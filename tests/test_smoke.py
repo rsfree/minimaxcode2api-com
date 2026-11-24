@@ -2694,25 +2694,106 @@ def test_chat_endpoint_resizes_an_oversized_image_before_it_ships() -> None:
 
 
 def test_ark_inline_image_is_uploaded() -> None:
-    """Ark allows `image` as a data: URI; the tool only reads URLs."""
+    """Ark allows `image` as a data: URI; the tool only reads staged URLs."""
     from app import media
 
-    seen: dict = {}
+    seen: list[dict] = []
 
-    async def fake_upload(data, mime_type="image/png", filename=None):
-        seen.update({"data": data, "mime": mime_type, "name": filename})
-        return "https://agent-cdn.example/ref.png"
+    async def fake_upload(raw, mime_type, filename):
+        seen.append({"raw": raw, "mime": mime_type, "name": filename})
+        return f"https://agent-cdn.example/{filename}"
 
-    original = media.upload_image
-    media.upload_image = fake_upload
+    async def fake_download(url):
+        assert url == "https://x.test/y.png"
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+
+    original_upload, original_download = media.upload_bytes, media.download
+    media.upload_bytes = fake_upload
+    media.download = fake_download
     try:
         url = asyncio.run(media.resolve_reference("data:image/webp;base64,AAAA", 3))
-        assert url == "https://agent-cdn.example/ref.png"
-        assert seen == {"data": "AAAA", "mime": "image/webp", "name": "ref_3.webp"}
-        # A real URL must never be re-uploaded.
-        assert asyncio.run(media.resolve_reference("https://x.test/y.png")) == "https://x.test/y.png"
+        assert url == "https://agent-cdn.example/ref_3.webp"
+        assert seen[-1] == {"raw": b"\x00\x00\x00", "mime": "image/webp", "name": "ref_3.webp"}
+
+        # A public URL is downloaded and re-staged, never forwarded: the
+        # synthesis tool answers `input_urls could not be read or decoded` for
+        # everything it did not stage itself, reachable PNGs included.
+        url = asyncio.run(media.resolve_reference("https://x.test/y.png", 0))
+        assert url == "https://agent-cdn.example/ref_0.png"
+        assert seen[-1]["mime"] == "image/png"
+        assert seen[-1]["raw"].startswith(b"\x89PNG")
     finally:
-        media.upload_image = original
+        media.upload_bytes = original_upload
+        media.download = original_download
+
+
+def test_reference_upload_picks_inline_or_presigned_by_size() -> None:
+    """Under 600 KiB goes inline; past it the presigned flow is the only way."""
+    from app import media
+
+    calls: list[tuple[str, dict]] = []
+    puts: list[tuple[str, int]] = []
+
+    async def fake_call(tool, payload, timeout, *args, **kwargs):
+        calls.append((tool, payload))
+        if tool == "upload_to_cdn":
+            return {"cdn_url": "https://cdn/inline.png"}
+        return {
+            "put_url": "https://put/x",
+            "cdn_url": "https://cdn/big.png",
+            "content_type": "image/png",
+        }
+
+    async def fake_put(url, raw, content_type):
+        puts.append((url, len(raw)))
+
+    original_call, original_put = media.call, media._put_object
+    media.call, media._put_object = fake_call, fake_put
+    try:
+        small = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+        url = asyncio.run(media.upload_bytes(small, "image/png", "a.png"))
+        assert url == "https://cdn/inline.png"
+        tool, payload = calls[-1]
+        assert tool == "upload_to_cdn"
+        # `mime_type` rides along because the Go channel sends it too and the
+        # tool accepts it; the media type stays known without a filename guess.
+        assert set(payload) == {"data", "filename", "mime_type"}
+        assert payload["mime_type"] == "image/png"
+
+        big = b"\x00" * (media.INLINE_UPLOAD_LIMIT + 1)
+        url = asyncio.run(media.upload_bytes(big, "image/png", "b.png"))
+        assert url == "https://cdn/big.png"
+        tool, payload = calls[-1]
+        assert tool == "get_upload_url"
+        assert payload == {
+            "filename": "b.png",
+            "mime_type": "image/png",
+            "size_bytes": len(big),
+        }
+        assert puts == [("https://put/x", len(big))]
+    finally:
+        media.call, media._put_object = original_call, original_put
+
+
+def test_reference_download_size_is_capped() -> None:
+    """A huge reference fails as a readable 400, not a vague upstream 502."""
+    from app import media
+
+    async def fake_download(url):
+        return b"\x00" * (media.settings.media_max_bytes + 1)
+
+    original = media.download
+    media.download = fake_download
+    try:
+        try:
+            asyncio.run(media.read_reference("https://x.test/huge.png"))
+        except media.MediaError as exc:
+            assert exc.status == 400
+            assert "larger than the channel allows" in exc.message
+        else:
+            raise AssertionError("an oversized reference must not be forwarded")
+    finally:
+        media.download = original
 
 
 def test_image_accepts_multiple_references() -> None:
@@ -3171,6 +3252,8 @@ def main() -> None:
         test_anthropic_native_image_block_is_resized,
         test_chat_endpoint_resizes_an_oversized_image_before_it_ships,
         test_ark_inline_image_is_uploaded,
+        test_reference_upload_picks_inline_or_presigned_by_size,
+        test_reference_download_size_is_capped,
         test_image_accepts_multiple_references,
         test_a_poor_account_still_answers_chat_but_not_images,
         test_media_prefilter_uses_the_probed_balance,

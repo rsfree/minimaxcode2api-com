@@ -980,7 +980,7 @@ curl -s http://127.0.0.1:8080/v1/images/generations \
 |---|---|
 | `model` | 只认 `minimax-h3-image` 及其别名（`minimax-image` / `image-01` / `h3-image` 等，大小写与下划线不敏感）；缺省即该值，响应回显规范名；**其它值 → `400 unknown image model`** |
 | `prompt` | 必填；缺失或空白 → `400 prompt is required` |
-| `image` | 支持 `string` 或 `string[]`，**一次可传多张**（实测 2 / 3 / 4 / 6 张均正常，`usage.input_images` 如实回显；10 张撞过单号 402，换号后带过）。各项可以是公网 URL、`data:image/...;base64,`、裸 base64，也认 `[{"image_url": {"url": …}}]` 这种 OpenAI 形状。URL 必须上游能直接下载，base64 会先转存到通道 CDN |
+| `image` | 支持 `string` 或 `string[]`，**一次可传多张**（实测 2 / 3 / 4 / 6 张均正常，`usage.input_images` 如实回显；10 张撞过单号 402，换号后带过）。各项可以是任意 http(s) URL、`data:image/...;base64,`、裸 base64，也认 `[{"image_url": {"url": …}}]` 这种 OpenAI 形状。**每一项都会先由网关读入并重新转存到通道 CDN**（≤600 KiB 走内联上传，更大的走签名直传），拿到自己 OSS 的 `cdn_url` 后再作为 `input_urls` 交给上游；单张上限 `MEDIA_MAX_BYTES`（10 MiB），超了回可读 400 |
 | `size` | **唯一的几何入参**：档位 `1K` / `1.5K` / `2K` / `3K` / `4K`，或 `宽x高`。比例与档位都由它换算，换算见下。不收 `aspect_ratio` / `resolution`（那是上游参数，传了会被忽略并记一条日志） |
 | `response_format` | `url`（默认）或 `b64_json`，都支持；其它值 → `400` |
 | `sequential_image_generation` + `sequential_image_generation_options.max_images` | 支持：`auto` 时按 `max_images` 出图，范围 1–15 |
@@ -1349,7 +1349,7 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/js
 | 视频查询 `404 does not belong to the current caller` | 提交和查询用到了不同账号；或网关重启丢了映射 | 用同一个网关实例查；重启后再查只能重新提交 |
 | 生图返回的 `.png` 打不开 / 格式不对 | 字节其实是 JPEG，只是名字和 Content-Type 写成了 png | 按文件头（`ff d8`）判断格式 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单 | 充值，或换 `MiniMax-Hailuo-2.3`（比 H3 便宜） |
-| `reference_images` 不生效 | 参考图必须是**公网可达 URL**，本地路径网关读不到 | 先上传到图床 / OSS 再传 URL |
+| `image` 报 `input_urls could not be read or decoded` | 旧版本把参考图 URL 原样透传给上游，而上游只解析它自己 staged 的对象 | 升级到含 `get_upload_url` 直传的版本，网关会先把参考图转存再交上去；参考图本身也要能被网关下载到 |
 | Credits 用完 | 这是账号额度，不是 API 配额 | 桌面端充值，或换官方开放平台 Key |
 | SDK 报 `404` + `{"detail":"Not Found"}`，但 `curl` 同一条 URL 正常 | 环境里有 `HTTP_PROXY`，httpx 连 `127.0.0.1` 也走代理，请求行变成 `POST http://127.0.0.1:8099/v1/...`，框架把整串当路径 | 已内置中间件把它还原成 origin-form；旧版本请给客户端设 `NO_PROXY=127.0.0.1,localhost` |
 | 池子里某个号一直不被使用 | 该号没有对应模型的权限，`400 unknown model` 后被自动跳过 | 正常，看 `/healthz` 的 `last_error` |
@@ -1382,9 +1382,12 @@ MEDIA_LIVE=1 MEDIA_LIVE_VIDEO=1 GATEWAY=... GATEWAY_KEY=... \
 - **个人额度通道**，不是商业 API。并发高会撞账号限流，Credits 按量扣。
 - **生图 / 视频 / TTS / 音乐各自计费**，和聊天额度是同一条 account credits 池（视频另可能走 M Plan 周额度）。
   一次 H3 4 秒视频实测报价 **320 credits**，比聊天贵得多。
-- **参考图必须是公网 URL**。桌面端是先上传本地文件到 OSS 再把签名 URL 传给上游；网关不做这一步，
-  所以 `reference_images` / `image` / `last_frame_image` 目前只接受 HTTP(S) 地址。
-  要把本地文件也支持上，需要补 `get_upload_url` + PUT 的上传流程（上游接口已知，见 `image-tools.client.js`）。
+- **生图的参考图由网关转存，视频的没有**。桌面端是先上传本地文件到 OSS 再把签名 URL 传给上游，网关的生图
+  路径现在做同一件事：`image` 的每一项（公网 URL / `data:` URI / 裸 base64）先被读入 → ≤600 KiB 走
+  `upload_to_cdn` 内联上传，更大的走 `get_upload_url` + PUT 签名直传（`put_url` 有效期 600s）→ 拿自己 OSS 的
+  `cdn_url` 作为 `input_urls`。**裸透传行不通**：上游只解析它自己 staged 的对象，第三方 CDN 一律回
+  `input_urls could not be read or decoded`。单张上限 `MEDIA_MAX_BYTES`（10 MiB）。
+  视频的 `first_frame_image` / `reference_images` 走 `video_submit`，**没有转存环节**，仍然是上游能直接读的 URL。
 - **生图/视频结果是 CDN 链接**，不是网关切下来存的字节。链接会过期（H3 签名 URL 约 9 小时），
   需要长期保存请自己转存。
 - **非官方接口**，MiniMax 改协议就可能失效。好消息是出错会明确报错，不会静默降级。

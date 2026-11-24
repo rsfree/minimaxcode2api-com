@@ -25,6 +25,7 @@ Two things differ from the Messages endpoint and are easy to get wrong:
 
 from __future__ import annotations
 
+import base64
 import logging
 import math
 import time
@@ -369,39 +370,139 @@ async def describe_asset(url: str, timeout: float = 20.0) -> dict[str, Any]:
         return {}
 
 
-async def upload_image(
-    data: str, mime_type: str = "image/png", filename: str | None = None
-) -> str:
-    """Push a base64 image to the channel's own CDN and return its URL.
+# ``matrix_upload_to_cdn`` refuses anything past this size and points at the
+# presigned-upload flow instead, so the split happens here rather than on error.
+INLINE_UPLOAD_LIMIT = 600 * 1024
 
-    Ark accepts ``image`` as a URL *or* a ``data:`` URI. The generation tool only
-    reads URLs, so an inline image has to be materialised first — this tool is
-    the only way to do that without a caller-visible bucket.
+_MIME_BY_FORMAT = {"jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+
+
+def _sniff_mime(raw: bytes) -> str:
+    """Read the media type from the bytes; URL suffixes and CDN headers lie."""
+    return _MIME_BY_FORMAT.get(str(image_info(raw).get("output_format") or ""), "image/png")
+
+
+def _extension_for(mime_type: str) -> str:
+    return (mime_type.rsplit("/", 1)[-1] or "png").replace("jpg", "jpeg")
+
+
+async def _put_object(url: str, raw: bytes, content_type: str) -> None:
+    """Upload bytes to a presigned target.
+
+    Redirects are followed here even though the shared client disables them:
+    object stores routinely answer a presigned PUT with a 307 to the shard that
+    actually holds the bucket, and refusing it would surface as an upload
+    failure that retrying never fixes.
     """
-    payload: dict[str, Any] = {"data": data, "mime_type": mime_type}
-    if filename:
-        payload["filename"] = filename
-    result = await call("upload_to_cdn", payload, UPLOAD_TIMEOUT)
-    url = result.get("cdn_url") or ""
+    await upstream.startup()
+    client = upstream.client
+    try:
+        response = await client.put(
+            url,
+            content=raw,
+            headers={"Content-Type": content_type},
+            timeout=UPLOAD_TIMEOUT,
+            follow_redirects=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - network layer
+        raise MediaError(502, f"image upload failed: {exc}") from exc
+    try:
+        if response.status_code not in (200, 201, 204):
+            raise MediaError(502, f"image upload rejected with HTTP {response.status_code}")
+    finally:
+        await response.aclose()
+
+
+async def upload_bytes(raw: bytes, mime_type: str, filename: str) -> str:
+    """Stage reference bytes on the channel's own CDN and return a readable URL.
+
+    This is mandatory, not an optimisation. ``image_synthesize`` does not fetch
+    arbitrary public URLs: ``input_urls`` only resolves for objects this channel
+    staged itself, and every other address — including a perfectly reachable
+    PNG on someone else's CDN — comes back as
+
+        input_urls could not be read or decoded; download the resource in your
+        local or sandbox workspace first, then call matrix_get_upload_url ...
+
+    Two paths, because the inline tool caps out at 600 KiB: small files go
+    through ``upload_to_cdn`` in one call, larger ones ask for a presigned
+    target and PUT the bytes themselves.
+    """
+    if len(raw) <= INLINE_UPLOAD_LIMIT:
+        result = await call(
+            "upload_to_cdn",
+            {
+                "data": base64.b64encode(raw).decode("ascii"),
+                "filename": filename,
+                "mime_type": mime_type,
+            },
+            UPLOAD_TIMEOUT,
+        )
+        url = result.get("cdn_url") or ""
+        if not url:
+            raise MediaError(502, "image upload returned no cdn_url", payload=result)
+        return url
+
+    prepared = await call(
+        "get_upload_url",
+        {"filename": filename, "mime_type": mime_type, "size_bytes": len(raw)},
+        UPLOAD_TIMEOUT,
+    )
+    put_url = str(prepared.get("put_url") or "")
+    if not put_url:
+        raise MediaError(502, "upload target returned no put_url", payload=prepared)
+    await _put_object(put_url, raw, str(prepared.get("content_type") or mime_type))
+    url = str(prepared.get("cdn_url") or "")
     if not url:
-        raise MediaError(502, "image upload returned no cdn_url", payload=result)
+        raise MediaError(502, "upload target returned no cdn_url", payload=prepared)
     return url
 
 
-async def resolve_reference(value: str, index: int = 0) -> str:
-    """Turn a URL or an inline base64 image into something the tool can read."""
+async def upload_image(
+    data: str, mime_type: str = "image/png", filename: str | None = None
+) -> str:
+    """Base64-in, CDN-URL-out wrapper kept for callers of the old signature."""
+    return await upload_bytes(base64.b64decode(data), mime_type, filename or "ref.png")
+
+
+async def read_reference(value: str) -> tuple[bytes, str]:
+    """Load one reference image from a URL, a ``data:`` URI or bare base64."""
     text = (value or "").strip()
     if not text:
         raise MediaError(400, "empty image reference", code=400)
     if text.startswith("data:"):
         header, _, blob = text.partition(",")
-        mime = (header[5:].split(";")[0] or "image/png").strip().lower()
-        extension = mime.rsplit("/", 1)[-1].replace("jpg", "jpeg")
-        return await upload_image(blob, mime, f"ref_{index}.{extension}")
+        mime_type = (header[5:].split(";")[0] or "image/png").strip().lower()
+        try:
+            return base64.b64decode(blob), mime_type
+        except Exception as exc:  # noqa: BLE001 - malformed input
+            raise MediaError(400, "image reference is not valid base64", code=400) from exc
     if "://" in text:
-        return text
+        raw = await download(text)
+        if len(raw) > settings.media_max_bytes:
+            raise MediaError(
+                400,
+                "a reference image is larger than the channel allows "
+                f"({settings.media_max_bytes} bytes); send a smaller image",
+                code=400,
+            )
+        return raw, _sniff_mime(raw)
     # Bare base64: some Ark SDKs drop the data: prefix on the way through.
-    return await upload_image(text, "image/png", f"ref_{index}.png")
+    try:
+        return base64.b64decode(text), "image/png"
+    except Exception as exc:  # noqa: BLE001 - malformed input
+        raise MediaError(400, "image reference is neither a URL nor base64", code=400) from exc
+
+
+async def resolve_reference(value: str, index: int = 0) -> str:
+    """Turn a URL or an inline image into something the tool can actually read.
+
+    A public URL is downloaded and re-staged rather than forwarded: forwarding
+    was the original behaviour and it fails for every third-party host, which is
+    exactly what a caller means when they send one.
+    """
+    raw, mime_type = await read_reference(value)
+    return await upload_bytes(raw, mime_type, f"ref_{index}.{_extension_for(mime_type)}")
 
 
 async def image_generate(
