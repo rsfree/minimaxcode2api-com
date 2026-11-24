@@ -26,12 +26,13 @@ Two things differ from the Messages endpoint and are easy to get wrong:
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import math
 import time
 from typing import Any
 
-from .auth import CAPABILITY_MEDIA, CredentialError, token_manager
+from .auth import token_manager
 from .config import settings
 from .metrics import metrics
 from .upstream import UpstreamError, upstream
@@ -413,9 +414,7 @@ async def _put_object(url: str, raw: bytes, content_type: str) -> None:
         await response.aclose()
 
 
-async def upload_bytes(
-    raw: bytes, mime_type: str, filename: str, account: str | None = None
-) -> str:
+async def upload_bytes(raw: bytes, mime_type: str, filename: str) -> str:
     """Stage reference bytes on the channel's own CDN and return a readable URL.
 
     This is mandatory, not an optimisation. ``image_synthesize`` does not fetch
@@ -429,9 +428,6 @@ async def upload_bytes(
     Two paths, because the inline tool caps out at 600 KiB: small files go
     through ``upload_to_cdn`` in one call, larger ones ask for a presigned
     target and PUT the bytes themselves.
-
-    ``account`` pins the upload; see :func:`resolve_reference` for why the
-    namespace makes that matter.
     """
     if len(raw) <= INLINE_UPLOAD_LIMIT:
         result = await call(
@@ -442,7 +438,6 @@ async def upload_bytes(
                 "mime_type": mime_type,
             },
             UPLOAD_TIMEOUT,
-            account=account,
         )
         url = result.get("cdn_url") or ""
         if not url:
@@ -453,7 +448,6 @@ async def upload_bytes(
         "get_upload_url",
         {"filename": filename, "mime_type": mime_type, "size_bytes": len(raw)},
         UPLOAD_TIMEOUT,
-        account=account,
     )
     put_url = str(prepared.get("put_url") or "")
     if not put_url:
@@ -466,15 +460,10 @@ async def upload_bytes(
 
 
 async def upload_image(
-    data: str,
-    mime_type: str = "image/png",
-    filename: str | None = None,
-    account: str | None = None,
+    data: str, mime_type: str = "image/png", filename: str | None = None
 ) -> str:
     """Base64-in, CDN-URL-out wrapper kept for callers of the old signature."""
-    return await upload_bytes(
-        base64.b64decode(data), mime_type, filename or "ref.png", account=account
-    )
+    return await upload_bytes(base64.b64decode(data), mime_type, filename or "ref.png")
 
 
 async def read_reference(value: str) -> tuple[bytes, str]:
@@ -506,49 +495,42 @@ async def read_reference(value: str) -> tuple[bytes, str]:
         raise MediaError(400, "image reference is neither a URL nor base64", code=400) from exc
 
 
-async def resolve_reference(
-    value: str, index: int = 0, account: str | None = None
-) -> str:
+async def resolve_reference(value: str, index: int = 0) -> str:
     """Turn a URL or an inline image into something the tool can actually read.
 
     A public URL is downloaded and re-staged rather than forwarded: forwarding
     was the original behaviour and it fails for every third-party host, which is
     exactly what a caller means when they send one.
-
-    ``account`` pins the upload to one pooled account. This is not optional when
-    the result feeds a generation: the staging namespace is per-account
-    (``mcp/u<uid>/general/...``), so a reference uploaded by account A is
-    unreadable to account B, and a job that rotates between them fails with the
-    same ``input_urls could not be read or decoded`` the caller was trying to
-    escape.
     """
     raw, mime_type = await read_reference(value)
-    return await upload_bytes(
-        raw, mime_type, f"ref_{index}.{_extension_for(mime_type)}", account=account
-    )
+    return await upload_bytes(raw, mime_type, f"ref_{index}.{_extension_for(mime_type)}")
 
 
-async def _pin_media_owner(need: float, exclude: set[str] | None = None) -> str | None:
-    """Pick the account that will stage the references and run the synthesis.
+async def _normalise_reference(raw: bytes, mime_type: str) -> tuple[bytes, str]:
+    """Re-encode one reference into a plain image upstream can always decode.
 
-    Uploading and generating must be the same account. Staging lands the object
-    under that account's own namespace (``mcp/u<uid>/general/...``), so a job
-    split across two accounts reads its own references as foreign and fails.
-
-    ``None`` means "could not pin" — let the normal rotation raise the error it
-    would have raised anyway, with its better wording.
+    Measured on a caller's photo: a 1024x1024 JPEG that opens fine everywhere
+    locally was refused by ``image_synthesize`` with the generic
+    ``request failed`` (no err_code), while the same pixels re-encoded passed.
+    What upstream chokes on is the container — EXIF/ICC blocks and exotic JPEG
+    profiles — not the picture. Alpha is preserved by falling back to PNG.
     """
+    from PIL import Image
+
     try:
-        token = await token_manager.acquire(
-            exclude=exclude, capability=CAPABILITY_MEDIA, need=need
-        )
-    except CredentialError as exc:
-        if getattr(exc, "status", None) == 402:
-            # The pool is too poor for this job, which is a 402 for the caller
-            # rather than a 502 that reads like a gateway fault.
-            raise UpstreamError(402, str(exc)) from exc
-        return None
-    return token.access_token
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception as exc:  # noqa: BLE001 - corrupt input from the caller
+        raise MediaError(400, "a reference image could not be decoded", code=400) from exc
+
+    buffer = io.BytesIO()
+    if image.mode in ("RGBA", "LA") or (
+        image.mode == "P" and "transparency" in image.info
+    ):
+        image.convert("RGBA").save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue(), "image/png"
+    image.convert("RGB").save(buffer, format="JPEG", quality=92, optimize=True)
+    return buffer.getvalue(), "image/jpeg"
 
 
 async def image_generate(
@@ -565,9 +547,10 @@ async def image_generate(
     to pass them separately — two inputs meant two answers for one request, and
     the pair silently overrode ``size`` whenever a caller sent both.
 
-    A job with references is pinned to one account for both the staging and the
-    synthesis; without references the call rotates as usual, which is more
-    resilient and costs nothing.
+    A job whose references were refused is retried once against normalised
+    copies. Upstream answers the same opaque ``request failed`` for a JPEG it
+    cannot decode as for a real outage, so the only way to tell them apart is to
+    send a copy that cannot be misdecoded: baseline, no EXIF, no ICC.
     """
     aspect, res = size_to_params(size)
     refs = list(reference_urls or [])
@@ -587,39 +570,28 @@ async def image_generate(
         )
         return _collect_images(data)
 
-    owner = await _pin_media_owner(need)
+    loaded = [await read_reference(value) for value in refs]
     for attempt in range(2):
         try:
-            staged: list[str] = []
-            for index, reference in enumerate(refs):
-                staged.append(await resolve_reference(reference, index, owner))
+            staged = [
+                await upload_bytes(raw, mime, f"ref_{index}.{_extension_for(mime)}")
+                for index, (raw, mime) in enumerate(loaded)
+            ]
             for item in requests:
                 item["input_urls"] = staged
             data = await call(
-                "image_synthesize",
-                {"requests": requests},
-                IMAGE_TIMEOUT,
-                account=owner,
-                need_credits=need,
+                "image_synthesize", {"requests": requests}, IMAGE_TIMEOUT, need_credits=need
             )
             return _collect_images(data)
         except MediaError as exc:
-            # A 502 here is almost always "the references were not readable",
-            # and the cause is the account, not the images: re-stage under a
-            # different one before telling the caller to retry.
-            if attempt == 1 or exc.status not in (502, 503) or owner is None:
+            if attempt == 1 or exc.status != 502:
                 raise
             log.warning(
-                "image: synthesis on %s failed (%s); re-staging references under "
-                "another account",
-                _account_label(owner), (exc.message or "")[:160],
+                "image: upstream refused the references (%s); re-encoding them "
+                "and retrying once",
+                (exc.message or "")[:160],
             )
-            replacement = await _pin_media_owner(need, exclude={owner})
-            if replacement is None or replacement == owner:
-                raise
-            owner = replacement
-            for item in requests:
-                item.pop("input_urls", None)
+            loaded = [await _normalise_reference(raw, mime) for raw, mime in loaded]
     raise MediaError(502, "image generation failed")  # pragma: no cover - loop returns
 
 

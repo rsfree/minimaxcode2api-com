@@ -1349,6 +1349,7 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/js
 | 视频查询 `404 does not belong to the current caller` | 提交和查询用到了不同账号；或网关重启丢了映射 | 用同一个网关实例查；重启后再查只能重新提交 |
 | 生图返回的 `.png` 打不开 / 格式不对 | 字节其实是 JPEG，只是名字和 Content-Type 写成了 png | 按文件头（`ff d8`）判断格式 |
 | 视频提交 `402` + `this task costs N credits` | 余额不够这一单 | 充值，或换 `MiniMax-Hailuo-2.3`（比 H3 便宜） |
+| 带参考图的生图回 `request failed`（无 err_code） | 参考图是上游解不了的容器格式（EXIF / ICC / 非基线 JPEG） | 网关会自动重编码后重试一次；仍失败就换一张图 |
 | `image` 报 `input_urls could not be read or decoded` | 旧版本把参考图 URL 原样透传给上游，而上游只解析它自己 staged 的对象 | 升级到含 `get_upload_url` 直传的版本，网关会先把参考图转存再交上去；参考图本身也要能被网关下载到 |
 | Credits 用完 | 这是账号额度，不是 API 配额 | 桌面端充值，或换官方开放平台 Key |
 | SDK 报 `404` + `{"detail":"Not Found"}`，但 `curl` 同一条 URL 正常 | 环境里有 `HTTP_PROXY`，httpx 连 `127.0.0.1` 也走代理，请求行变成 `POST http://127.0.0.1:8099/v1/...`，框架把整串当路径 | 已内置中间件把它还原成 origin-form；旧版本请给客户端设 `NO_PROXY=127.0.0.1,localhost` |
@@ -1387,8 +1388,9 @@ MEDIA_LIVE=1 MEDIA_LIVE_VIDEO=1 GATEWAY=... GATEWAY_KEY=... \
   `upload_to_cdn` 内联上传，更大的走 `get_upload_url` + PUT 签名直传（`put_url` 有效期 600s）→ 拿自己 OSS 的
   `cdn_url` 作为   `input_urls`。**裸透传行不通**：上游只解析它自己 staged 的对象，第三方 CDN 一律回
   `input_urls could not be read or decoded`。单张上限 `MEDIA_MAX_BYTES`（10 MiB）。
-  转存与生图**必须同一个账号**——对象落在 `mcp/u<uid>/general/...` 的账号命名空间里，换号就变成别人的对象，
-  所以带参考图的任务会先钉一个账号走完全程，502 时才换号并把参考图**重传**一遍。
+  参考图被上游拒绝时（一律回 `request failed`、不带 err_code），网关会**去掉元数据重编码后重试一次**：实测一张
+  1024×1024 JPEG 本地解码完全正常却被拒，同样的像素重编码成基线 JPEG 就通过——失败的是容器（EXIF / ICC /
+  非基线 profile），不是画面。转存后的对象是**公网可读**的，与账号无关。
   视频的 `first_frame_image` / `reference_images` 走 `video_submit`，**没有转存环节**，仍然是上游能直接读的 URL。
 - **生图/视频结果是 CDN 链接**，不是网关切下来存的字节。链接会过期（H3 签名 URL 约 9 小时），
   需要长期保存请自己转存。

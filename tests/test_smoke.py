@@ -2801,124 +2801,134 @@ def test_reference_download_size_is_capped() -> None:
         media.download = original
 
 
-def test_image_job_stages_and_generates_on_one_account() -> None:
-    """Staging is namespaced per account, so the job must not rotate mid-flight.
+def test_refused_references_are_re_encoded_and_retried() -> None:
+    """Upstream's opaque `request failed` on a JPEG is retried against a clean copy.
 
-    ``get_upload_url`` lands the object under ``mcp/u<uid>/general/...`` of
-    whichever account served it. A reference staged by account A is unreadable
-    to account B, and rotating between them reproduces the exact
-    ``input_urls could not be read or decoded`` 502 this path exists to fix.
+    Measured: one caller photo was refused while the same pixels re-encoded
+    passed, so the container is what fails, not the picture. Retrying the same
+    bytes would fail the same way, which is why the second attempt uploads a
+    normalised copy.
     """
     from app import media
 
-    calls: list[tuple[str, str | None]] = []
-
-    async def fake_owner(need, exclude=None):
-        return "tok-A"
-
-    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
-        calls.append((tool, account))
-        if tool == "upload_to_cdn":
-            return {"cdn_url": "https://cdn/ref.png"}
-        return {"success_items": [{"output_url": "https://cdn/out.png"}]}
-
-    original = media._pin_media_owner, media.call, media.read_reference
-
-    async def fake_read(value):
-        return b"\x89PNG\r\n\x1a\n", "image/png"
-
-    media._pin_media_owner, media.call, media.read_reference = (
-        fake_owner,
-        fake_call,
-        fake_read,
-    )
-    try:
-        result = asyncio.run(
-            media.image_generate(
-                prompt="x",
-                n=1,
-                size="1024x1024",
-                reference_urls=["https://x.test/a.png", "https://x.test/b.png"],
-            )
-        )
-        assert result["images"][0]["url"] == "https://cdn/out.png"
-        assert [tool for tool, _ in calls] == [
-            "upload_to_cdn",
-            "upload_to_cdn",
-            "image_synthesize",
-        ]
-        assert {account for _, account in calls} == {"tok-A"}
-    finally:
-        media._pin_media_owner, media.call, media.read_reference = original
-
-
-def test_image_job_restages_when_the_pinned_account_gives_a_502() -> None:
-    """A 502 on a job with references is retried on another account, re-staged.
-
-    Retrying the same references would fail identically, because the object is
-    still in the old account's namespace — so the retry has to re-upload too.
-    """
-    from app import media
-
-    calls: list[tuple[str, str | None]] = []
-    owners = ["tok-A", "tok-B"]
+    uploads: list[tuple[int, str]] = []
     synthesizes = {"count": 0}
 
-    async def fake_owner(need, exclude=None):
-        return owners.pop(0)
+    async def fake_read(value):
+        return b"\xff\xd8\xff" + b"\x00" * 64, "image/jpeg"
+
+    async def fake_upload(raw, mime_type, filename):
+        uploads.append((len(raw), mime_type))
+        return f"https://cdn/ref-{len(uploads)}.{filename.rsplit('.', 1)[-1]}"
+
+    async def fake_normalise(raw, mime_type):
+        return b"\xff\xd8\xff" + b"\x00" * 8, "image/jpeg"
 
     async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
-        calls.append((tool, account))
-        if tool == "upload_to_cdn":
-            return {"cdn_url": f"https://cdn/ref-{account}.png"}
         synthesizes["count"] += 1
         if synthesizes["count"] == 1:
             raise media.MediaError(502, "image generation failed: request failed")
         return {"success_items": [{"output_url": "https://cdn/out.png"}]}
 
-    async def fake_read(value):
-        return b"\x89PNG\r\n\x1a\n", "image/png"
-
-    original = media._pin_media_owner, media.call, media.read_reference
-    media._pin_media_owner, media.call, media.read_reference = (
-        fake_owner,
-        fake_call,
-        fake_read,
-    )
+    original = (media.read_reference, media.upload_bytes, media._normalise_reference, media.call)
+    media.read_reference = fake_read
+    media.upload_bytes = fake_upload
+    media._normalise_reference = fake_normalise
+    media.call = fake_call
     try:
         result = asyncio.run(
             media.image_generate(
-                prompt="x", n=1, size="1024x1024", reference_urls=["https://x.test/a.png"]
+                prompt="x", n=1, size="1024x1024", reference_urls=["https://x.test/a.jpg"]
             )
         )
         assert result["images"][0]["url"] == "https://cdn/out.png"
-        assert calls == [
-            ("upload_to_cdn", "tok-A"),
-            ("image_synthesize", "tok-A"),
-            ("upload_to_cdn", "tok-B"),
-            ("image_synthesize", "tok-B"),
-        ]
+        # Attempt 1 sends the original bytes, attempt 2 the normalised copy.
+        assert uploads == [(67, "image/jpeg"), (11, "image/jpeg")]
+        assert synthesizes["count"] == 2
     finally:
-        media._pin_media_owner, media.call, media.read_reference = original
+        (
+            media.read_reference,
+            media.upload_bytes,
+            media._normalise_reference,
+            media.call,
+        ) = original
 
 
-def test_image_job_without_references_does_not_pin() -> None:
-    """No staging means nothing to keep together; rotation is more resilient."""
+def test_generic_500_does_not_trigger_a_re_encode() -> None:
+    """Only the opaque 502 is worth a second attempt; a 500 is a real outage."""
     from app import media
 
-    calls: list[tuple[str, str | None]] = []
+    synthesizes = {"count": 0}
+    normalised: list[int] = []
+
+    async def fake_read(value):
+        return b"\xff\xd8\xff" + b"\x00" * 16, "image/jpeg"
+
+    async def fake_upload(raw, mime_type, filename):
+        return "https://cdn/ref.jpeg"
+
+    async def fake_normalise(raw, mime_type):
+        normalised.append(1)
+        return raw, mime_type
 
     async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
-        calls.append((tool, account))
-        return {"success_items": [{"output_url": "https://cdn/out.png"}]}
+        synthesizes["count"] += 1
+        raise media.MediaError(500, "upstream fell over")
 
-    original = media.call
+    original = (media.read_reference, media.upload_bytes, media._normalise_reference, media.call)
+    media.read_reference = fake_read
+    media.upload_bytes = fake_upload
+    media._normalise_reference = fake_normalise
     media.call = fake_call
     try:
-        asyncio.run(media.image_generate(prompt="x", n=1, size="1024x1024"))
-        assert calls == [("image_synthesize", None)]
+        try:
+            asyncio.run(
+                media.image_generate(
+                    prompt="x", n=1, size="1024x1024", reference_urls=["https://x.test/a.jpg"]
+                )
+            )
+        except media.MediaError as exc:
+            assert exc.status == 500
+        else:
+            raise AssertionError("a 500 must surface, not be retried")
+        assert synthesizes["count"] == 1
+        assert normalised == []
     finally:
-        media.call = original
+        (
+            media.read_reference,
+            media.upload_bytes,
+            media._normalise_reference,
+            media.call,
+        ) = original
+
+
+def test_normalise_reference_strips_metadata_and_keeps_alpha() -> None:
+    """The normaliser has to fix the container without flattening transparency."""
+    import io as _io
+
+    from PIL import Image
+
+    from app import media
+
+    opaque = _io.BytesIO()
+    Image.new("RGB", (64, 64), (10, 20, 30)).save(opaque, format="JPEG")
+    raw, mime = asyncio.run(media._normalise_reference(opaque.getvalue(), "image/jpeg"))
+    assert mime == "image/jpeg"
+    assert raw[:3] == b"\xff\xd8\xff"
+    assert Image.open(_io.BytesIO(raw)).size == (64, 64)
+
+    translucent = _io.BytesIO()
+    Image.new("RGBA", (32, 32), (0, 0, 0, 0)).save(translucent, format="PNG")
+    raw, mime = asyncio.run(media._normalise_reference(translucent.getvalue(), "image/png"))
+    assert mime == "image/png"
+    assert Image.open(_io.BytesIO(raw)).mode == "RGBA"
+
+    try:
+        asyncio.run(media._normalise_reference(b"not an image", "image/png"))
+    except media.MediaError as exc:
+        assert exc.status == 400
+    else:
+        raise AssertionError("undecodable bytes must be a readable 400")
 
 
 def test_image_accepts_multiple_references() -> None:
@@ -3379,9 +3389,9 @@ def main() -> None:
         test_ark_inline_image_is_uploaded,
         test_reference_upload_picks_inline_or_presigned_by_size,
         test_reference_download_size_is_capped,
-        test_image_job_stages_and_generates_on_one_account,
-        test_image_job_restages_when_the_pinned_account_gives_a_502,
-        test_image_job_without_references_does_not_pin,
+        test_refused_references_are_re_encoded_and_retried,
+        test_generic_500_does_not_trigger_a_re_encode,
+        test_normalise_reference_strips_metadata_and_keeps_alpha,
         test_image_accepts_multiple_references,
         test_a_poor_account_still_answers_chat_but_not_images,
         test_media_prefilter_uses_the_probed_balance,
