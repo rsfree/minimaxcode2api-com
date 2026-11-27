@@ -145,7 +145,25 @@ def legacy_type(status: int) -> str:
     return "upstream_error"
 
 
-def caller_error(decision: ge.Decision, legacy_status: int, legacy_code: Any) -> dict[str, Any]:
+#: The taxonomy is written for image jobs; this channel also serves video. Two
+#: templates name the artifact, so they are reworded for the video tools rather
+#: than being leaked into a poll a caller is reading about a video task.
+_VIDEO_TOOLS = {"submit_video_generation", "query_video_generation"}
+
+_VIDEO_MESSAGES = {
+    "task_not_found": "the video task was not found; the task id is wrong, "
+    "or it belongs to another account, or it has expired",
+    "result_unavailable": "the video finished rendering but the file could not be "
+    "prepared for delivery; keep polling the same task id instead of resubmitting",
+}
+
+
+def caller_error(
+    decision: ge.Decision,
+    legacy_status: int,
+    legacy_code: Any,
+    tool: str = "",
+) -> dict[str, Any]:
     """Render the caller-facing error: template text plus the canonical verdict.
 
     Upstream text never appears here -- ``to_caller`` fills the message from the
@@ -154,6 +172,8 @@ def caller_error(decision: ge.Decision, legacy_status: int, legacy_code: Any) ->
     """
     envelope = ge.to_caller(decision)
     error = envelope["error"]
+    if tool in _VIDEO_TOOLS and decision.canonical in _VIDEO_MESSAGES:
+        error["message"] = _VIDEO_MESSAGES[decision.canonical]
     error["type"] = legacy_type(legacy_status)
     error["code"] = legacy_code if legacy_code is not None else legacy_status
     error["canonical"] = decision.canonical

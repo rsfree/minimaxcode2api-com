@@ -80,6 +80,7 @@ class MediaError(RuntimeError):
         code: int | None = None,
         payload: Any = None,
         decision: Any = None,
+        tool: str = "",
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -87,6 +88,7 @@ class MediaError(RuntimeError):
         self.code = code
         self.payload = payload
         self.decision = decision
+        self.tool = tool
 
     @property
     def canonical(self) -> str:
@@ -195,7 +197,7 @@ async def call_ex(
             error=_logged(exc.message, decision),
         )
         raise MediaError(
-            exc.status, exc.message, payload=exc.payload, decision=decision
+            exc.status, exc.message, payload=exc.payload, decision=decision, tool=tool
         ) from exc
 
     label = _account_label(served)
@@ -214,7 +216,8 @@ async def call_ex(
             latency_ms=(time.time() - started) * 1000, error=_logged(str(message), decision),
         )
         raise MediaError(
-            _status_for(code), str(message), code=code, payload=data, decision=decision
+            _status_for(code), str(message), code=code, payload=data,
+            decision=decision, tool=tool,
         )
 
     failures = data.get("failed_items")

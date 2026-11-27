@@ -396,7 +396,9 @@ def media_error_response(exc: MediaError) -> JSONResponse:
         # request, not a channel fault. Leaving it at 502 is what told callers
         # "upstream glitched, retry shortly" for a prompt that can never pass.
         status = 400 if exc.decision.canonical == "content_policy_violation" else exc.status
-        body: dict[str, Any] = channel_errors.caller_error(exc.decision, status, exc.code)
+        body: dict[str, Any] = channel_errors.caller_error(
+            exc.decision, status, exc.code, exc.tool
+        )
     else:
         status = exc.status
         body = {
@@ -1273,7 +1275,9 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
         # (the id, and whether retrying this task is safe).
         status = 400 if exc.canonical == "content_policy_violation" else exc.status
         if exc.decision is not None:
-            body: dict[str, Any] = channel_errors.caller_error(exc.decision, status, exc.code)
+            body: dict[str, Any] = channel_errors.caller_error(
+                exc.decision, status, exc.code, exc.tool
+            )
         else:
             body = {
                 "error": {
