@@ -1269,16 +1269,20 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
     try:
         response = await media.video_query(task_id, resolved, account=_video_owner(task_id))
     except MediaError as exc:
-        body = {
-            "error": {
-                "message": redact.for_caller(exc.message, exc.status),
-                "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
-                "code": exc.code if exc.code is not None else exc.status,
-            },
-            "id": task_id,
-            "object": "video.generation",
-            "model": resolved,
-        }
+        # Same taxonomy as the media endpoints, plus the fields a poll needs
+        # (the id, and whether retrying this task is safe).
+        status = 400 if exc.canonical == "content_policy_violation" else exc.status
+        if exc.decision is not None:
+            body: dict[str, Any] = channel_errors.caller_error(exc.decision, status, exc.code)
+        else:
+            body = {
+                "error": {
+                    "message": redact.for_caller(exc.message, exc.status),
+                    "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
+                    "code": exc.code if exc.code is not None else exc.status,
+                }
+            }
+        body.update({"id": task_id, "object": "video.generation", "model": resolved})
         if exc.status_field:
             body["status"] = exc.status_field
         # The channel reports 503 when the task rendered but the server could not
@@ -1293,7 +1297,7 @@ async def videos_generations_get(request: Request, task_id: str, model: str | No
                 "a video task can only be polled by the account that created it, and "
                 "that mapping is lost after a gateway restart"
             )
-        return JSONResponse(status_code=exc.status, content=body)
+        return JSONResponse(status_code=status, content=body)
 
     status = response.get("status") or "unknown"
     body = {

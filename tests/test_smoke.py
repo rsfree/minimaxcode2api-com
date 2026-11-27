@@ -3710,6 +3710,61 @@ def test_caller_error_keeps_the_legacy_fields() -> None:
     assert "request failed" not in error["message"].lower()
 
 
+def test_accept_stage_business_code_is_still_a_failure() -> None:
+    """A 402 inside a 200 on an async submit must not read as "accepted".
+
+    ``accept`` is exempt from the artifact-count rule because a task id is the
+    whole payload — which, when the transport status was passed through as 200,
+    also exempted it from every other failure signal. Caught live on
+    2026-11-27: an H3 submit answered ``{"code":402}`` and the MediaError
+    reached the route with ``decision=None``, so the caller got upstream prose
+    instead of the taxonomy and the retry gate had nothing to read.
+    """
+    from itertools import count
+    from unittest.mock import patch
+
+    from app import media
+    from app import upstream as upstream_mod
+    from app.auth import Token, token_manager
+
+    token = Token(access_token="tok-a", label="a@x", pooled=True)
+    body = b'{"code":402,"message":"the remaining M Plan weekly limit cannot cover this job"}'
+
+    class Resp:
+        status_code = 200
+        headers: dict = {}
+        account = ""
+
+        async def aread(self):
+            return body
+
+        async def aclose(self):
+            pass
+
+    async def fake_dispatch(*args, **kwargs):
+        return Resp()
+
+    async def run():
+        # The pool round-robins from a shared counter; consuming it here would
+        # shift the start index of every later test that asserts token order.
+        with patch.object(upstream_mod.upstream, "startup", return_value=None), \
+             patch.object(upstream_mod.upstream, "_dispatch", fake_dispatch), \
+             patch.object(token_manager, "_tokens", [token]), \
+             patch.object(token_manager, "_loaded", True), \
+             patch.object(token_manager, "_cursor", count()), \
+             patch.object(upstream_mod.settings, "retry_attempts", 0):
+            return await media.call("submit_video_generation", {"model": "MiniMax-H3"}, 10.0)
+
+    try:
+        asyncio.run(run())
+    except media.MediaError as exc:
+        assert exc.status == 402, exc
+        assert exc.decision is not None, "a business code is a status signal too"
+        assert exc.decision.canonical == "insufficient_quota", exc.decision.canonical
+    else:  # pragma: no cover
+        raise AssertionError("a business 402 must surface")
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
@@ -3728,6 +3783,7 @@ def main() -> None:
         test_refused_references_are_re_encoded_and_retried,
         test_moderation_refusal_is_neither_retried_nor_a_502,
         test_mcp_business_code_beats_base_resp,
+        test_accept_stage_business_code_is_still_a_failure,
         test_partial_delivery_is_not_an_error,
         test_caller_error_keeps_the_legacy_fields,
         test_generic_500_does_not_trigger_a_re_encode,

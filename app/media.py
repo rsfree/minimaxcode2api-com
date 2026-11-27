@@ -202,7 +202,11 @@ async def call_ex(
     code = data.get("code", 0)
     if isinstance(code, int) and code != 0:
         message = data.get("message") or f"upstream tool {tool} failed (code {code})"
-        decision = channel_errors.classify_tool(tool, 200, data, requested)
+        # The business code *is* the status here: the transport said 200. Feeding
+        # 200 to the classifier makes the accept phase treat the envelope as a
+        # normal acknowledgement (an async submit legitimately carries no
+        # artifact), so a 402 or 503 inside it would be scored as success.
+        decision = channel_errors.classify_tool(tool, _status_for(code), data, requested)
         # A business code on an HTTP 200 is still a failed call; the console
         # would otherwise show a 100% success rate while generation never works.
         metrics.record(
