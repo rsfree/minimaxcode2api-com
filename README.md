@@ -1185,16 +1185,57 @@ TTS 额外支持 `emotion`（`happy` / `sad` / `angry` / `fearful` / `disgusted`
 
 ### 3.7 多模态的错误语义
 
-上游把业务码塞在 HTTP 200 里，网关把它们翻成真正的 HTTP 状态。文案按状态处理：`402` 一律换成
-中性句子（原文在说我们买的是什么套餐，对调用方没有可执行的下一步），其余原样保留：
+上游把业务码塞在 HTTP 200 里，网关把它们翻成真正的 HTTP 状态。**对外只认 16 类 canonical**，
+判定顺序是「阶段 → 体内状态 → 产物数量 → status/code/message」，不是只看状态行：
 
-| 上游 `code` | 网关 HTTP | 含义 | 能做什么 |
+```json
+{
+  "error": {
+    "message": "the prompt or image was rejected by the upstream content policy; changing timing will not help, the request itself must change",
+    "type": "invalid_request_error",
+    "code": 400,
+    "canonical": "content_policy_violation",
+    "request_id": "req_9f3c1a2b"
+  }
+}
+```
+
+- `code` / `type` / HTTP 状态**保持原样**，现有调用方不用改（内严外宽）。
+- 新增 `canonical`：16 类语义码，用来判 `retry_after` / 是否值得重试。
+- 新增 `request_id`：与容器日志里的 `[canonical]` 行对得上。
+- `message` 改成模板，**不再透传上游原文** —— 上游那句话里带邮箱、套餐名和签名链接。
+
+| 上游 `code` | 网关 HTTP | `canonical` | 含义 / 该做什么 |
 |---|---|---|---|
-| `402` | 402（文案固定为 `upstream quota exhausted for this account; please retry later`） | 这个号付不起这次生成 | 稍后重试；换号由网关自己完成，全池都不够时才把 402 交给你 |
-| `503`（视频查询） | 503 + `status: succeeded` + `retryable: true` | 任务已渲染完成，但服务端没备好文件交付 | 继续轮询同一个 `task_id`，**不要重新提交** |
-| `401` | 401 | token 失效 | 网关会自动刷新一次 |
+| `402` | 402 | `insufficient_quota` | 这个号付不起这次生成；换号由网关自己完成，全池都不够时才交给你 |
+| `503`（视频查询） | 503 + `status: succeeded` + `retryable: true` | `result_unavailable` | 任务已渲染完成但文件没备好；**继续轮询同一个 `task_id`，不要重新提交** |
+| `503`（提交视频） | 503 | `permission_denied` | 这个号没有该工具的权限，网关会换号并停掉它的视频通道 |
+| `404`（查询任务） | 404 | `task_not_found` | `task_id` 错或已过期，换号也没用 |
+| `401` | 401 | `authentication_error` | token 失效，网关自动刷新一次 |
+| `200` + `failed_items` 全是安全过滤 | **400** | `content_policy_violation` | 提示词或参考图被审核拒绝；**改请求本身**，重试必然再失败 |
+
+**唯一改状态的是内容审核**：502 会告诉调用方「上游抽风，稍后重试」，而审核拒绝重试一万次也一样。
+2026-11-26 线上一次拒绝由此被客户端重试 10 次、白打 20 次上游调用，就是这么来的。
+
+内部动作由 `retry_policy()` 决定，与对外状态无关：
+
+| canonical | 同号重试 | 换号 | 冷却 | 说明 |
+|---|---|---|---|---|
+| `content_policy_violation` / `invalid_request_error` / `invalid_image` | ❌ | ❌ | ❌ | 换号绕审核会让整个池被打上风控标记 |
+| `insufficient_quota` | ❌ | ✅ | ✅ | 停到签到到账或 TTL |
+| `generation_failed` | 仅重编码参考图后 1 次 | ✅ | 0 | 相同字节重发=二次计费；换掉元数据是另一份请求 |
+| `result_unavailable` | ❌ | ❌ | 0 | 重下 ≠ 重生成 |
+| `partial_success` | — | — | — | **不是错误**：给了几张是几张，按 200 返回 |
+
+参考图重编码重试的准入条件从「HTTP 502」收紧到「`generation_failed` / `unknown_upstream_error`」：
+审核、额度、传输 5xx 一律不再触发第二次生成。
 
 视频任务的 `status` 取值：`submitted` / `queued` / `running` / `succeeded` / `failed` / `cancelled`。
+
+> 分类器 `app/gateway_errors.py` + `app/error_map.json` 来自 `image-upstream-error-mapping` 技能，
+> 本通道的规则块是 `minimax-mcp`：**以 `code` 为主判据**。探针实测该通道的
+> `base_resp.status_code` 恒为 0（连 `{"code":404}` 的响应里也是 0），照抄官方 MiniMax 规则
+> 会把每一次业务失败都判成成功。
 
 ### 3.8 对话里的图片：单张 ≤ 10 MiB
 
@@ -1388,7 +1429,11 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/js
 ## 七、测试
 
 ```bash
-python tests/test_smoke.py          # 无网络，翻译层单元测试，CI 会跑
+python tests/test_smoke.py          # 无网络，翻译层单元测试（103 项）+ 错误映射契约（56 项），CI 会跑
+python tests/test_error_map.py      # 只跑错误映射契约，调试分类器时用
+
+# 只读审计：上游文本出站 / 状态码塌陷 / 体内状态从不读 / 签名 URL 进日志
+python ~/.workbuddy/skills/image-upstream-error-mapping/scripts/verify_offline.py .
 python tests/test_media.py          # 无网络，多模态参数换算与错误映射
 GATEWAY=http://127.0.0.1:8080 GATEWAY_KEY=sk-local \
   python tests/test_sdk_compat.py   # 需要真实凭证，跑官方 openai / anthropic SDK

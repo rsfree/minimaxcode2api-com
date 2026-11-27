@@ -37,7 +37,10 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import admin, logring, media, metrics as metrics_mod, probe, redact, security, store as store_mod
+from . import (
+    admin, channel_errors, logring, media, metrics as metrics_mod, probe, redact,
+    security, store as store_mod,
+)
 from .auth import CredentialError, seconds_until_next_day, token_manager
 from .security import UI_COOKIE, UI_COOKIE_MAX_AGE, authorized as _authorized, is_loopback as _is_loopback
 from .catalog import DEFAULT_MODEL, resolve_model, visible_media_models, visible_models
@@ -376,23 +379,38 @@ def error_response(status: int, message: str, code: str = "upstream_error") -> J
 def media_error_response(exc: MediaError) -> JSONResponse:
     """Surface a media tool failure without leaking how the pool is billed.
 
-    A 402 here explains which plan ran dry and suggests upgrading it — useful to
-    us, meaningless to a caller. The reason is therefore replaced with a retry
-    hint (see ``redact.for_caller``); the operator still gets the original text
-    in the request log.
+    The outward contract is unchanged — the HTTP status and the integer ``code``
+    callers already branch on stay where they were. What is new is the
+    ``canonical`` field: one of the sixteen taxonomy codes, decided by
+    :mod:`app.channel_errors` from the phase, the body status and the artifact
+    count, not from the status line alone.
+
+    The ``message`` is now a template rather than upstream prose. A moderation
+    refusal used to arrive as "request failed; please retry the same request
+    shortly", which invited ten retries of a request that could never succeed;
+    the template says the request itself has to change. It also means no
+    mailbox, plan name or signed URL can reach the caller through this path.
     """
-    body: dict[str, Any] = {
-        "error": {
-            "message": redact.for_caller(exc.message, exc.status),
-            "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
-            # A plain HTTP 402 carries no business code; reporting the status is
-            # more useful than `null` and matches the shape callers parse.
-            "code": exc.code if exc.code is not None else exc.status,
+    if exc.decision is not None and not getattr(exc.decision, "partial", False):
+        # The one status the taxonomy overrides: a content refusal is a bad
+        # request, not a channel fault. Leaving it at 502 is what told callers
+        # "upstream glitched, retry shortly" for a prompt that can never pass.
+        status = 400 if exc.decision.canonical == "content_policy_violation" else exc.status
+        body: dict[str, Any] = channel_errors.caller_error(exc.decision, status, exc.code)
+    else:
+        status = exc.status
+        body = {
+            "error": {
+                "message": redact.for_caller(exc.message, exc.status),
+                "type": "insufficient_quota" if exc.status == 402 else "upstream_error",
+                # A plain HTTP 402 carries no business code; reporting the status
+                # is more useful than `null` and matches the shape callers parse.
+                "code": exc.code if exc.code is not None else exc.status,
+            }
         }
-    }
     if exc.status_field:
         body["status"] = exc.status_field
-    return JSONResponse(status_code=exc.status, content=body)
+    return JSONResponse(status_code=status, content=body)
 
 
 @app.exception_handler(Exception)

@@ -14,11 +14,21 @@ from app.media import MediaError  # noqa: E402
 def test_size_to_params() -> None:
     assert media.size_to_params(None) == ("1:1", "1K")
     assert media.size_to_params("1024x1024") == ("1:1", "1K")
-    assert media.size_to_params("1792x1024") == ("16:9", "2K")
-    assert media.size_to_params("1024x1792") == ("9:16", "2K")
+    # 1.83 MP sits under the 2.1 MP bucket boundary, so it stays at 1K even
+    # though the ratio snaps to 16:9. The bucket is decided by area, not by the
+    # longer edge -- see the README table.
+    assert media.size_to_params("1792x1024") == ("16:9", "1K")
+    assert media.size_to_params("1024x1792") == ("9:16", "1K")
     assert media.size_to_params("2048x2048") == ("1:1", "2K")
     assert media.size_to_params("4096x4096") == ("1:1", "4K")
-    assert media.size_to_params("garbage") == ("1:1", "1K")
+    # An unparseable size is rejected, not silently rounded to 1:1: the caller
+    # would otherwise get a different image than the one it asked for.
+    try:
+        media.size_to_params("garbage")
+    except media.MediaError as exc:
+        assert exc.status == 400
+    else:  # pragma: no cover
+        raise AssertionError("an invalid size must be rejected")
 
 
 def test_video_model_aliases() -> None:

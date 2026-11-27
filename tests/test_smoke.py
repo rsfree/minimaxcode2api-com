@@ -2593,7 +2593,7 @@ def test_image_geometry_comes_from_size_alone() -> None:
 
     captured: dict = {}
 
-    async def fake_call(tool, payload, timeout, need_credits=0):
+    async def fake_call(tool, payload, timeout, need_credits=0, requested=None):
         captured["tool"] = tool
         captured["payload"] = payload
         captured["need_credits"] = need_credits
@@ -3037,10 +3037,22 @@ def test_refused_references_are_re_encoded_and_retried() -> None:
     async def fake_normalise(raw, mime_type):
         return b"\xff\xd8\xff" + b"\x00" * 8, "image/jpeg"
 
-    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
+    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0, requested=None):
         synthesizes["count"] += 1
         if synthesizes["count"] == 1:
-            raise media.MediaError(502, "image generation failed: request failed")
+            # The real path raises this from `_collect_images`, which classifies
+            # the empty artifact list as generation_failed. Building the decision
+            # the same way keeps the retry gate honest instead of bypassing it.
+            from app import channel_errors
+
+            decision = channel_errors.classify_tool(
+                "image_synthesize", 200,
+                {"code": 0, "failed_items": [{"error_msg": "request failed"}]},
+                requested,
+            )
+            raise media.MediaError(
+                502, "image generation failed: request failed", decision=decision
+            )
         return {"success_items": [{"output_url": "https://cdn/out.png"}]}
 
     original = (media.read_reference, media.upload_bytes, media._normalise_reference, media.call)
@@ -3084,9 +3096,14 @@ def test_generic_500_does_not_trigger_a_re_encode() -> None:
         normalised.append(1)
         return raw, mime_type
 
-    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0):
+    async def fake_call(tool, payload, timeout, account=None, need_credits=0.0, requested=None):
         synthesizes["count"] += 1
-        raise media.MediaError(500, "upstream fell over")
+        from app import channel_errors
+
+        decision = channel_errors.classify_tool(
+            "image_synthesize", 500, {"code": 0, "message": "upstream fell over"}, requested
+        )
+        raise media.MediaError(500, "upstream fell over", decision=decision)
 
     original = (media.read_reference, media.upload_bytes, media._normalise_reference, media.call)
     media.read_reference = fake_read
@@ -3587,6 +3604,112 @@ def test_runtime_config_is_writable_and_survives_a_restart() -> None:
         assert third.retry_attempts == 3
 
 
+def test_mcp_business_code_beats_base_resp() -> None:
+    """The channel reports failures in `code`, not in `base_resp`.
+
+    Probe 2026-11-27: a forged task id answers ``HTTP 200
+    {"code":404,...}`` while ``base_resp.status_code`` stays 0. The stock
+    MiniMax table reads ``base_resp``, so leasing it would score every business
+    failure as a success — the precise reason this channel has its own rules.
+    """
+    from app import channel_errors
+
+    data = {
+        "code": 404,
+        "message": "video task was not found or does not belong to the current caller",
+        "base_resp": {"status_code": 0, "status_msg": "success"},
+    }
+    decision = channel_errors.classify_tool("query_video_generation", 200, data)
+    assert decision is not None, "a 200 with code 404 is a failure"
+    assert decision.canonical == "task_not_found", decision.canonical
+    assert decision.stage == "poll"
+
+    # Same code at submit means the model, not the task. Stage is not optional.
+    assert channel_errors.classify_tool(
+        "image_synthesize", 200, {"code": 404, "message": "no such model"}
+    ).canonical == "model_not_found"
+
+
+def test_moderation_refusal_is_neither_retried_nor_a_502() -> None:
+    """A refused prompt must fail once, in the shape that says "change it".
+
+    This is the live incident of 2026-11-26: the opaque "request failed; please
+    retry shortly" was taken as a transient 502, so the gateway re-encoded the
+    references and re-sent the job while the caller retried ten times — twenty
+    billed calls for a prompt that could never pass.
+    """
+    from app import channel_errors
+    from app.main import media_error_response
+    from app.media import MediaError
+
+    moderation = {
+        "code": 0,
+        "failed_items": [
+            {
+                "error_msg": (
+                    "image generation failed: content was rejected by the safety "
+                    "filter; rephrase the prompt to remove sensitive content"
+                )
+            }
+        ],
+    }
+    decision = channel_errors.classify_tool("image_synthesize", 200, moderation, 1)
+    assert decision is not None and decision.canonical == "content_policy_violation", decision
+    assert not channel_errors.retryable_after_reencode(decision), (
+        "re-encoding pixels cannot pass a prompt moderation check"
+    )
+
+    response = media_error_response(
+        MediaError(502, "image generation failed: content was rejected", decision=decision)
+    )
+    body = json.loads(response.body)
+    assert response.status_code == 400, "a refused prompt is a bad request, not a channel fault"
+    assert body["error"]["canonical"] == "content_policy_violation"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert "request failed" not in body["error"]["message"].lower()
+    assert "rephrase" not in body["error"]["message"].lower(), "upstream text must not ship"
+    assert body["error"]["request_id"].startswith("req_")
+
+
+def test_partial_delivery_is_not_an_error() -> None:
+    """Two of four delivered is a success with two paid images in hand."""
+    from app import channel_errors, media
+
+    data = {
+        "code": 0,
+        "success_items": [{"output_url": "https://cdn/a.png"}, {"output_url": "https://cdn/b.png"}],
+        "failed_items": [{"error_msg": "request failed"}, {"error_msg": "request failed"}],
+    }
+    decision = channel_errors.classify_tool("image_synthesize", 200, data, 4)
+    assert decision is not None and decision.canonical == "partial_success", decision
+    assert decision.partial is True
+
+    # The route keeps the images: rendering an error body would discard them and
+    # invite a second, also-paid generation.
+    collected = media._collect_images(data, 4)
+    assert [image["url"] for image in collected["images"]] == [
+        "https://cdn/a.png",
+        "https://cdn/b.png",
+    ]
+
+
+def test_caller_error_keeps_the_legacy_fields() -> None:
+    """Internal verdict, outward contract: the integer code stays where it was."""
+    from app import channel_errors
+
+    decision = channel_errors.classify_tool(
+        "image_synthesize", 200,
+        {"code": 0, "failed_items": [{"error_msg": "request failed"}]}, 1,
+    )
+    assert decision.canonical == "generation_failed"
+    body = channel_errors.caller_error(decision, 502, None)
+    error = body["error"]
+    assert error["code"] == 502, "callers branch on the integer status"
+    assert error["type"] == "upstream_error"
+    assert error["canonical"] == "generation_failed"
+    assert "request failed" not in error["message"].lower()
+
+
 def main() -> None:
     tests = [
         test_model_aliases,
@@ -3603,6 +3726,10 @@ def main() -> None:
         test_reference_upload_picks_inline_or_presigned_by_size,
         test_reference_download_size_is_capped,
         test_refused_references_are_re_encoded_and_retried,
+        test_moderation_refusal_is_neither_retried_nor_a_502,
+        test_mcp_business_code_beats_base_resp,
+        test_partial_delivery_is_not_an_error,
+        test_caller_error_keeps_the_legacy_fields,
         test_generic_500_does_not_trigger_a_re_encode,
         test_normalise_reference_strips_metadata_and_keeps_alpha,
         test_image_accepts_multiple_references,
@@ -3678,6 +3805,17 @@ def main() -> None:
         test()
         print(f"PASS {test.__name__}")
     print(f"\n{len(tests)} tests passed")
+
+    # The error-taxonomy contract suite (vendored from the skill) is unittest
+    # shaped, so it is loaded here instead of being rewritten: CI runs exactly
+    # one command, and the map cannot drift away from the tests.
+    import unittest
+
+    suite = unittest.defaultTestLoader.loadTestsFromName("test_error_map")
+    outcome = unittest.TextTestRunner(verbosity=0).run(suite)
+    if not outcome.wasSuccessful():  # pragma: no cover - failure path
+        raise SystemExit(1)
+    print(f"{outcome.testsRun} taxonomy contract tests passed")
 
 
 if __name__ == "__main__":

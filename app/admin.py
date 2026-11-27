@@ -21,7 +21,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import catalog, logring, media, signin, upstream
+from . import catalog, logring, media, redact, signin, upstream
 from .auth import Token, token_manager
 from .config import RUNTIME_NOTES, settings
 from .metrics import metrics, stamp
@@ -403,9 +403,12 @@ async def import_accounts(request: Request) -> dict:
     try:
         job = await importer.start(text, concurrency, mode or "password")
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # The importer echoes the offending line back, and that line is a
+        # credential pair. Scrub on the way out even though this is the console:
+        # the console is reachable with the same key as the API.
+        raise HTTPException(status_code=400, detail=redact.scrub(str(exc))) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=redact.scrub(str(exc))) from exc
     return {"job": job}
 
 

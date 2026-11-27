@@ -1,0 +1,1508 @@
+{
+  "schema_version": 2,
+  "kind": "image",
+  "_comment": "Single source of truth for image-generation upstream errors. Rules are INBOUND (raw -> canonical); the canonical table is the OUTBOUND contract. Edit this file, never the if-else in gateway_errors.py.",
+  "canonical": {
+    "invalid_request_error": {
+      "http": 400,
+      "type": "invalid_request_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the request is invalid or unsupported by this model; see the parameter and message"
+    },
+    "invalid_image": {
+      "http": 400,
+      "type": "invalid_request_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the input image could not be used: unsupported format, unreadable data, or a size/mask mismatch"
+    },
+    "content_policy_violation": {
+      "http": 400,
+      "type": "invalid_request_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the prompt or image was rejected by the upstream content policy; changing timing will not help, the request itself must change"
+    },
+    "request_too_large": {
+      "http": 413,
+      "type": "invalid_request_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the request body or the input image exceeds the size limit of this channel"
+    },
+    "authentication_error": {
+      "http": 401,
+      "type": "authentication_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "upstream rejected the channel credentials"
+    },
+    "permission_denied": {
+      "http": 403,
+      "type": "permission_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "this channel or key is not permitted to use the requested model or feature"
+    },
+    "model_not_found": {
+      "http": 404,
+      "type": "invalid_request_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the requested model does not exist or is not enabled on this channel"
+    },
+    "task_not_found": {
+      "http": 404,
+      "type": "invalid_request_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the image task was not found; the task id is wrong or the task has already expired"
+    },
+    "rate_limit_exceeded": {
+      "http": 429,
+      "type": "rate_limit_error",
+      "retry": "after_retry_after",
+      "retry_after_default": 30,
+      "message": "upstream is rate limiting this channel; retry after {retry_after}s"
+    },
+    "insufficient_quota": {
+      "http": 429,
+      "type": "insufficient_quota",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "upstream quota for this channel is exhausted; retrying will not help until the operator tops it up"
+    },
+    "generation_failed": {
+      "http": 502,
+      "type": "image_generation_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the upstream accepted the job but produced no usable image; the generation itself failed"
+    },
+    "result_unavailable": {
+      "http": 502,
+      "type": "image_generation_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "the generated image could not be retrieved; the upstream link has expired or is not fetchable"
+    },
+    "server_is_overloaded": {
+      "http": 503,
+      "type": "service_unavailable_error",
+      "retry": "after_retry_after",
+      "retry_after_default": 15,
+      "message": "upstream image capacity is exhausted; retry after {retry_after}s"
+    },
+    "api_error": {
+      "http": 500,
+      "type": "api_error",
+      "retry": "with_backoff",
+      "retry_after_default": null,
+      "message": "upstream service error; retry with backoff"
+    },
+    "upstream_timeout": {
+      "http": 504,
+      "type": "timeout_error",
+      "retry": "with_backoff",
+      "retry_after_default": null,
+      "message": "upstream did not finish the image job in time"
+    },
+    "unknown_upstream_error": {
+      "http": 502,
+      "type": "upstream_error",
+      "retry": "never",
+      "retry_after_default": null,
+      "message": "upstream returned an error this gateway could not classify (request_id: {request_id})"
+    },
+    "partial_success": {
+      "http": 200,
+      "type": "none",
+      "retry": "never",
+      "retry_after_default": null,
+      "not_an_error": true,
+      "message": "some of the requested images were delivered; this is not an error and must not be rendered as one"
+    }
+  },
+  "hints": {
+    "policy": [
+      "content policy",
+      "safety system",
+      "sensitive",
+      "moderation",
+      "flagged",
+      "violat",
+      "prohibited",
+      "审核",
+      "敏感",
+      "涉敏",
+      "违规",
+      "不安全",
+      "内容安全"
+    ],
+    "quota": [
+      "insufficient balance",
+      "insufficient credit",
+      "credit not enough",
+      "no balance",
+      "arrearage",
+      "overdue",
+      "欠费",
+      "余额不足",
+      "额度已用完",
+      "额度用完",
+      "额度已耗尽",
+      "积分不足",
+      "spend limit",
+      "exceeded your current quota"
+    ],
+    "rate": [
+      "rate limit",
+      "too many requests",
+      "throttl",
+      "concurrency",
+      "frequency",
+      "requests per minute",
+      "请求过于频繁",
+      "并发"
+    ],
+    "overloaded": [
+      "overloaded",
+      "over capacity",
+      "server is busy",
+      "temporarily unavailable",
+      "service busy",
+      "繁忙",
+      "访问量较大",
+      "负载"
+    ],
+    "invalid_image": [
+      "could not decode",
+      "invalid image",
+      "unsupported image",
+      "image format",
+      "dimensions",
+      "mask",
+      "下载图片",
+      "download image"
+    ],
+    "expired": [
+      "expired",
+      "no longer available",
+      "task not found",
+      "过期",
+      "失效"
+    ]
+  },
+  "providers": {
+    "openai": {
+      "source": "https://developers.openai.com/api/docs/guides/image-generation",
+      "confidence": "official",
+      "extract": {
+        "code": [
+          "error.code"
+        ],
+        "type": [
+          "error.type"
+        ],
+        "message": [
+          "error.message",
+          "message"
+        ]
+      },
+      "rules": [
+        {
+          "id": "openai.moderation",
+          "status": [
+            400
+          ],
+          "code_exact": [
+            "moderation_blocked",
+            "content_policy_violation"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "openai.invalid_image",
+          "status": [
+            400
+          ],
+          "code_exact": [
+            "invalid_image",
+            "invalid_image_format",
+            "invalid_image_dimensions",
+            "invalid_image_url",
+            "image_parse_error",
+            "image_too_large",
+            "invalid_mask"
+          ],
+          "canonical": "invalid_image"
+        },
+        {
+          "id": "openai.user_error",
+          "status": [
+            400
+          ],
+          "type_exact": [
+            "image_generation_user_error"
+          ],
+          "canonical": "invalid_request_error"
+        },
+        {
+          "id": "openai.generation_failed",
+          "status": [
+            400,
+            500,
+            502
+          ],
+          "code_exact": [
+            "image_generation_failed",
+            "generation_failed"
+          ],
+          "canonical": "generation_failed"
+        },
+        {
+          "id": "openai.billing_hard_limit",
+          "status": [
+            400,
+            403
+          ],
+          "code_exact": [
+            "billing_hard_limit_reached",
+            "billing_not_active"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "openai.quota_429",
+          "status": [
+            429
+          ],
+          "code_exact": [
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "openai.rate_429",
+          "status": [
+            429
+          ],
+          "code_exact": [
+            "rate_limit_exceeded",
+            "slow_down"
+          ],
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "openai.org_not_verified",
+          "status": [
+            403
+          ],
+          "message_contains": [
+            "must be verified"
+          ],
+          "canonical": "permission_denied"
+        },
+        {
+          "id": "openai.model_404",
+          "status": [
+            404
+          ],
+          "code_exact": [
+            "model_not_found"
+          ],
+          "canonical": "model_not_found"
+        }
+      ]
+    },
+    "ark": {
+      "aliases": [
+        "sd",
+        "seedream",
+        "volcengine",
+        "doubao"
+      ],
+      "source": "https://www.volcengine.com/docs/82379/1299023",
+      "confidence": "official",
+      "extract": {
+        "code": [
+          "error.code",
+          "ResponseMetadata.Error.Code"
+        ],
+        "type": [
+          "error.type"
+        ],
+        "message": [
+          "error.message",
+          "ResponseMetadata.Error.Message"
+        ]
+      },
+      "rules": [
+        {
+          "id": "ark.reference_download_timeout",
+          "status": [
+            400
+          ],
+          "code_exact": [
+            "InvalidParameter"
+          ],
+          "message_contains": [
+            "timeout while downloading url"
+          ],
+          "canonical": "invalid_image"
+        },
+        {
+          "id": "ark.input_image_privacy",
+          "status": [
+            400
+          ],
+          "code_prefix": [
+            "InputImageSensitiveContentDetected"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "ark.sensitive",
+          "status": [
+            400
+          ],
+          "code_prefix": [
+            "SensitiveContentDetected",
+            "InputTextSensitiveContentDetected",
+            "OutputImageSensitiveContentDetected",
+            "OutputTextSensitiveContentDetected"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "ark.overdue",
+          "status": [
+            403
+          ],
+          "code_exact": [
+            "AccountOverdueError"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "ark.quota_429",
+          "status": [
+            429
+          ],
+          "code_exact": [
+            "QuotaExceeded"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "ark.overloaded_429",
+          "status": [
+            429
+          ],
+          "code_exact": [
+            "ServerOverloaded",
+            "RequestBurstTooFast"
+          ],
+          "canonical": "server_is_overloaded"
+        },
+        {
+          "id": "ark.rate_429",
+          "status": [
+            429
+          ],
+          "code_prefix": [
+            "RateLimitExceeded",
+            "ModelAccount"
+          ],
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "ark.model_not_open",
+          "status": [
+            403,
+            404
+          ],
+          "code_exact": [
+            "ModelNotOpen",
+            "InvalidEndpointOrModel.NotFound"
+          ],
+          "canonical": "model_not_found"
+        },
+        {
+          "id": "ark.closed_endpoint",
+          "status": [
+            400
+          ],
+          "code_exact": [
+            "InvalidEndpoint.ClosedEndpoint"
+          ],
+          "canonical": "unknown_upstream_error"
+        },
+        {
+          "id": "ark.auth",
+          "status": [
+            401
+          ],
+          "code_exact": [
+            "AuthenticationError",
+            "InvalidAccountStatus"
+          ],
+          "canonical": "authentication_error"
+        },
+        {
+          "id": "ark.access_denied",
+          "status": [
+            403
+          ],
+          "code_exact": [
+            "AccessDenied"
+          ],
+          "canonical": "permission_denied"
+        }
+      ]
+    },
+    "qwen": {
+      "aliases": [
+        "dashscope",
+        "aliyun",
+        "bailian",
+        "wanx"
+      ],
+      "source": "https://help.aliyun.com/zh/model-studio/text-to-image-api-reference",
+      "confidence": "official+field",
+      "extract": {
+        "code": [
+          "output.code",
+          "error.code",
+          "data.code",
+          "code"
+        ],
+        "type": [
+          "error.type"
+        ],
+        "message": [
+          "output.message",
+          "error.message",
+          "data.details",
+          "message"
+        ]
+      },
+      "rules": [
+        {
+          "id": "qwen.ret_challenge",
+          "code_exact": [
+            "x5sec"
+          ],
+          "canonical": "permission_denied",
+          "policy": {
+            "same_account_retry": 0,
+            "rotate": false,
+            "cooldown_s": 900,
+            "channel_penalty": false
+          }
+        },
+        {
+          "id": "qwen.poll_moderation",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "DataInspectionFailed",
+            "data_inspection_failed"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "qwen.poll_invalid",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "InvalidParameter",
+            "InvalidParameterValue"
+          ],
+          "canonical": "invalid_request_error"
+        },
+        {
+          "id": "qwen.poll_internal",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "InternalError",
+            "UnknownError",
+            "InternalServerError"
+          ],
+          "canonical": "generation_failed"
+        },
+        {
+          "id": "qwen.poll_failed",
+          "body_status": [
+            "FAILED"
+          ],
+          "canonical": "generation_failed"
+        },
+        {
+          "id": "qwen.task_missing",
+          "status": [
+            400,
+            404
+          ],
+          "code_exact": [
+            "TaskNotFound",
+            "InvalidTaskId",
+            "TaskExpired"
+          ],
+          "canonical": "task_not_found"
+        },
+        {
+          "id": "qwen.moderation_400",
+          "status": [
+            400
+          ],
+          "code_exact": [
+            "DataInspectionFailed",
+            "data_inspection_failed"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "qwen.web_quota",
+          "code_exact": [
+            "RateLimited",
+            "quota_limit"
+          ],
+          "hint_any": [
+            "quota"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "qwen.web_burst",
+          "code_exact": [
+            "RateLimited",
+            "quota_limit"
+          ],
+          "canonical": "server_is_overloaded"
+        },
+        {
+          "id": "qwen.x5sec",
+          "message_contains": [
+            "RGV587",
+            "FAIL_SYS_USER_VALIDATE",
+            "x5sec",
+            "滑动验证"
+          ],
+          "canonical": "permission_denied",
+          "policy": {
+            "same_account_retry": 0,
+            "rotate": false,
+            "cooldown_s": 900,
+            "channel_penalty": false
+          }
+        },
+        {
+          "id": "qwen.arrearage",
+          "status": [
+            403
+          ],
+          "code_exact": [
+            "Arrearage"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "qwen.throttle",
+          "status": [
+            429
+          ],
+          "code_prefix": [
+            "Throttling"
+          ],
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "qwen.auth",
+          "status": [
+            401
+          ],
+          "code_exact": [
+            "InvalidApiKey",
+            "invalid_api_key",
+            "invalid_authentication_error"
+          ],
+          "canonical": "authentication_error"
+        },
+        {
+          "id": "qwen.model_404",
+          "status": [
+            404
+          ],
+          "code_exact": [
+            "ModelNotFound",
+            "NotFound"
+          ],
+          "canonical": "model_not_found"
+        }
+      ]
+    },
+    "hunyuan": {
+      "aliases": [
+        "hy",
+        "tencent",
+        "tencent_hunyuan"
+      ],
+      "source": "https://cloud.tencent.com/document/product/1729/105970",
+      "confidence": "official",
+      "extract": {
+        "code": [
+          "Response.Error.Code",
+          "JobErrorCode",
+          "error.code"
+        ],
+        "type": [
+          "error.type"
+        ],
+        "message": [
+          "Response.Error.Message",
+          "JobErrorMsg",
+          "error.message"
+        ]
+      },
+      "rules": [
+        {
+          "id": "hy.job_moderation",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "FailedOperation.GenerateImageFailed",
+            "OperationDenied.ImageIllegalDetected"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "hy.job_not_exist",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "FailedOperation.JobNotExist"
+          ],
+          "canonical": "task_not_found"
+        },
+        {
+          "id": "hy.job_bad_input",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "FailedOperation.DownloadError",
+            "FailedOperation.ImageDownloadError",
+            "FailedOperation.ImageDecodeFailed",
+            "InvalidParameterValue.ImageEmpty",
+            "InvalidParameterValue.UrlIllegal"
+          ],
+          "canonical": "invalid_image"
+        },
+        {
+          "id": "hy.job_too_large",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "FailedOperation.ImageResolutionExceed",
+            "FailedOperation.ImageSizeExceed",
+            "FailedOperation.RequestEntityTooLarge"
+          ],
+          "canonical": "request_too_large"
+        },
+        {
+          "id": "hy.job_timeout",
+          "body_status": [
+            "FAILED"
+          ],
+          "code_exact": [
+            "FailedOperation.RequestTimeout"
+          ],
+          "canonical": "upstream_timeout"
+        },
+        {
+          "id": "hy.limit",
+          "status": [
+            429
+          ],
+          "code_prefix": [
+            "RequestLimitExceeded"
+          ],
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "hy.quota",
+          "status": [
+            403
+          ],
+          "code_exact": [
+            "LimitExceeded"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "hy.job_failed",
+          "body_status": [
+            "FAILED"
+          ],
+          "canonical": "generation_failed"
+        }
+      ]
+    },
+    "minimax": {
+      "aliases": [
+        "mm"
+      ],
+      "source": "https://platform.minimax.cn/docs/api-reference/errorcode",
+      "confidence": "official",
+      "extract": {
+        "code": [
+          "base_resp.status_code"
+        ],
+        "type": [],
+        "message": [
+          "base_resp.status_msg"
+        ]
+      },
+      "rules": [
+        {
+          "id": "mm.quota",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              1008,
+              2053,
+              2056
+            ]
+          },
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "mm.rate",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              1002,
+              1041,
+              1045,
+              2045,
+              2047,
+              2062
+            ]
+          },
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "mm.auth",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              1004,
+              2049
+            ]
+          },
+          "canonical": "authentication_error"
+        },
+        {
+          "id": "mm.input_sensitive",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              1026
+            ]
+          },
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "mm.output_sensitive",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              1027
+            ]
+          },
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "mm.invalid_params",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              2013,
+              2014
+            ]
+          },
+          "canonical": "invalid_request_error"
+        },
+        {
+          "id": "mm.model",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              2022,
+              2061
+            ]
+          },
+          "canonical": "model_not_found"
+        },
+        {
+          "id": "mm.timeout",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              1001
+            ]
+          },
+          "canonical": "upstream_timeout"
+        },
+        {
+          "id": "mm.system",
+          "body_int": {
+            "key": "base_resp.status_code",
+            "in": [
+              1000,
+              1024,
+              1033
+            ]
+          },
+          "canonical": "api_error"
+        }
+      ]
+    },
+    "google": {
+      "aliases": [
+        "gemini",
+        "vertex",
+        "imagen"
+      ],
+      "source": "https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/gemini-image-generation-limitations",
+      "confidence": "official",
+      "extract": {
+        "code": [
+          "error.status",
+          "error.code"
+        ],
+        "type": [
+          "error.type"
+        ],
+        "message": [
+          "error.message"
+        ]
+      },
+      "rules": [
+        {
+          "id": "g.402_prepaid",
+          "status": [
+            402
+          ],
+          "code_exact": [
+            "RESOURCE_EXHAUSTED"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "g.blocked_input",
+          "block_reason": [
+            "SAFETY",
+            "OTHER",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "IMAGE_SAFETY",
+            "SPII"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "g.blocked_output",
+          "finish_reason": [
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "PROHIBITED_CONTENT",
+            "IMAGE_RECITATION",
+            "RECITATION",
+            "SAFETY"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "g.no_image",
+          "finish_reason": [
+            "NO_IMAGE"
+          ],
+          "canonical": "generation_failed"
+        },
+        {
+          "id": "g.text_only_refusal",
+          "finish_reason": [
+            "STOP"
+          ],
+          "requires_empty_artifact": true,
+          "canonical": "invalid_request_error"
+        },
+        {
+          "id": "g.invalid_argument",
+          "status": [
+            400
+          ],
+          "code_exact": [
+            "INVALID_ARGUMENT",
+            "FAILED_PRECONDITION",
+            "OUT_OF_RANGE"
+          ],
+          "canonical": "invalid_request_error"
+        },
+        {
+          "id": "g.permission",
+          "status": [
+            403
+          ],
+          "code_exact": [
+            "PERMISSION_DENIED"
+          ],
+          "canonical": "permission_denied"
+        },
+        {
+          "id": "g.not_found",
+          "status": [
+            404
+          ],
+          "code_exact": [
+            "NOT_FOUND"
+          ],
+          "canonical": "model_not_found"
+        },
+        {
+          "id": "g.429_quota",
+          "status": [
+            429
+          ],
+          "code_exact": [
+            "RESOURCE_EXHAUSTED"
+          ],
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "g.unavailable",
+          "status": [
+            503
+          ],
+          "code_exact": [
+            "UNAVAILABLE"
+          ],
+          "canonical": "server_is_overloaded"
+        },
+        {
+          "id": "g.deadline",
+          "status": [
+            504
+          ],
+          "code_exact": [
+            "DEADLINE_EXCEEDED"
+          ],
+          "canonical": "upstream_timeout"
+        }
+      ]
+    },
+    "fal": {
+      "aliases": [
+        "bfl",
+        "flux"
+      ],
+      "source": "https://docs.fal.ai/model-endpoints/queue",
+      "confidence": "official-2nd",
+      "extract": {
+        "code": [
+          "error.type",
+          "type"
+        ],
+        "type": [
+          "error.type"
+        ],
+        "message": [
+          "error.message",
+          "detail",
+          "error"
+        ]
+      },
+      "rules": [
+        {
+          "id": "fal.policy_422",
+          "status": [
+            422
+          ],
+          "message_contains": [
+            "content policy",
+            "nsfw",
+            "safety",
+            "moderation",
+            "not allowed"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "fal.queue_policy",
+          "body_status": [
+            "FAILED",
+            "ERROR"
+          ],
+          "message_contains": [
+            "nsfw",
+            "content policy",
+            "safety",
+            "moderation"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "fal.queue_failed",
+          "body_status": [
+            "FAILED",
+            "ERROR"
+          ],
+          "canonical": "generation_failed"
+        },
+        {
+          "id": "fal.validation_422",
+          "status": [
+            422
+          ],
+          "canonical": "invalid_request_error"
+        },
+        {
+          "id": "fal.quota",
+          "status": [
+            402
+          ],
+          "canonical": "insufficient_quota"
+        }
+      ]
+    },
+    "stability": {
+      "aliases": [],
+      "source": "https://platform.stability.ai/docs/api-reference",
+      "confidence": "official-2nd",
+      "extract": {
+        "code": [
+          "errors.0.name",
+          "name"
+        ],
+        "type": [
+          "errors.0.name"
+        ],
+        "message": [
+          "errors.0.message",
+          "message"
+        ]
+      },
+      "rules": [
+        {
+          "id": "stability.filtered",
+          "finish_reason": [
+            "CONTENT_FILTERED"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "stability.invalid_prompt",
+          "status": [
+            400
+          ],
+          "code_exact": [
+            "invalid_prompt"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "stability.quota",
+          "status": [
+            402
+          ],
+          "canonical": "insufficient_quota"
+        }
+      ]
+    },
+    "minimax-mcp": {
+      "aliases": [
+        "minimax_mcp",
+        "mavis",
+        "minimax-desktop"
+      ],
+      "source": "in-house probes 2026-11-27: agent.minimax.io/mavis/api/v1/mcp answers 200 with {code,message}; base_resp.status_code is always 0 here",
+      "confidence": "field",
+      "extract": {
+        "code": [
+          "code"
+        ],
+        "type": [],
+        "message": [
+          "message"
+        ]
+      },
+      "rules": [
+        {
+          "id": "mm-mcp.auth",
+          "code_exact": [
+            "401"
+          ],
+          "canonical": "authentication_error"
+        },
+        {
+          "id": "mm-mcp.quota",
+          "code_exact": [
+            "402"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "mm-mcp.permission",
+          "code_exact": [
+            "403"
+          ],
+          "canonical": "permission_denied"
+        },
+        {
+          "id": "mm-mcp.rate",
+          "code_exact": [
+            "429"
+          ],
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "mm-mcp.task_missing",
+          "stage": [
+            "poll"
+          ],
+          "code_exact": [
+            "404"
+          ],
+          "canonical": "task_not_found"
+        },
+        {
+          "id": "mm-mcp.delivery_not_ready",
+          "stage": [
+            "poll"
+          ],
+          "code_exact": [
+            "503"
+          ],
+          "canonical": "result_unavailable",
+          "policy": {
+            "rotate": false,
+            "resubmit": false,
+            "channel_penalty": false
+          }
+        },
+        {
+          "id": "mm-mcp.entitlement",
+          "stage": [
+            "submit",
+            "accept"
+          ],
+          "code_exact": [
+            "503"
+          ],
+          "canonical": "permission_denied"
+        },
+        {
+          "id": "mm-mcp.model",
+          "code_exact": [
+            "404"
+          ],
+          "canonical": "model_not_found"
+        },
+        {
+          "id": "mm-mcp.policy",
+          "message_contains": [
+            "safety filter",
+            "content was rejected",
+            "sensitive content",
+            "内容审核",
+            "敏感内容",
+            "违规"
+          ],
+          "canonical": "content_policy_violation"
+        },
+        {
+          "id": "mm-mcp.quota_hint",
+          "message_contains": [
+            "insufficient balance",
+            "not enough credit",
+            "credit balance",
+            "quota",
+            "积分不足",
+            "余额不足",
+            "额度"
+          ],
+          "canonical": "insufficient_quota"
+        },
+        {
+          "id": "mm-mcp.rate_hint",
+          "message_contains": [
+            "rate limit",
+            "too many request",
+            "请求过于频繁"
+          ],
+          "canonical": "rate_limit_exceeded"
+        },
+        {
+          "id": "mm-mcp.auth_hint",
+          "message_contains": [
+            "auth failed",
+            "not logged in",
+            "token expired",
+            "登录已失效"
+          ],
+          "canonical": "authentication_error"
+        },
+        {
+          "id": "mm-mcp.timeout_hint",
+          "message_contains": [
+            "timed out",
+            "timeout"
+          ],
+          "canonical": "upstream_timeout"
+        },
+        {
+          "id": "mm-mcp.overload_hint",
+          "message_contains": [
+            "overloaded",
+            "system busy",
+            "temporarily unavailable",
+            "服务繁忙"
+          ],
+          "canonical": "server_is_overloaded"
+        }
+      ]
+    }
+  },
+  "generic_rules": [
+    {
+      "id": "generic.transport_failure",
+      "status": [
+        0
+      ],
+      "canonical": "upstream_timeout"
+    },
+    {
+      "id": "generic.result_gone",
+      "stage": [
+        "result"
+      ],
+      "status": [
+        401,
+        403,
+        404,
+        410,
+        498,
+        499
+      ],
+      "canonical": "result_unavailable"
+    },
+    {
+      "id": "generic.result_5xx",
+      "stage": [
+        "result"
+      ],
+      "status": [
+        500,
+        502,
+        503,
+        504,
+        522,
+        524
+      ],
+      "canonical": "api_error"
+    },
+    {
+      "id": "generic.moderation_unavailable",
+      "status": [
+        500,
+        502,
+        503
+      ],
+      "message_contains": [
+        "MODERATION_UNAVAILABLE",
+        "moderation is unavailable"
+      ],
+      "canonical": "api_error"
+    },
+    {
+      "id": "generic.moderation_unavailable_code",
+      "status": [
+        500,
+        502,
+        503
+      ],
+      "code_exact": [
+        "MODERATION_UNAVAILABLE"
+      ],
+      "canonical": "api_error"
+    },
+    {
+      "id": "generic.200_with_error",
+      "status": [
+        200,
+        201,
+        202
+      ],
+      "requires_error": true,
+      "canonical": "api_error"
+    },
+    {
+      "id": "generic.200_empty_artifact",
+      "status": [
+        200,
+        201,
+        202
+      ],
+      "requires_empty_artifact": true,
+      "canonical": "generation_failed"
+    },
+    {
+      "id": "generic.429_quota_hint",
+      "status": [
+        429
+      ],
+      "hint_any": [
+        "quota"
+      ],
+      "canonical": "insufficient_quota"
+    },
+    {
+      "id": "generic.400_policy_hint",
+      "status": [
+        400,
+        422
+      ],
+      "hint_any": [
+        "policy"
+      ],
+      "canonical": "content_policy_violation"
+    },
+    {
+      "id": "generic.400_image_hint",
+      "status": [
+        400
+      ],
+      "hint_any": [
+        "invalid_image"
+      ],
+      "canonical": "invalid_image"
+    },
+    {
+      "id": "generic.400_expired_hint",
+      "status": [
+        400,
+        404
+      ],
+      "hint_any": [
+        "expired"
+      ],
+      "canonical": "task_not_found"
+    },
+    {
+      "id": "generic.status_400",
+      "status": [
+        400,
+        405,
+        415
+      ],
+      "canonical": "invalid_request_error"
+    },
+    {
+      "id": "generic.status_401",
+      "status": [
+        401
+      ],
+      "canonical": "authentication_error"
+    },
+    {
+      "id": "generic.status_402",
+      "status": [
+        402
+      ],
+      "canonical": "insufficient_quota"
+    },
+    {
+      "id": "generic.status_403",
+      "status": [
+        403
+      ],
+      "canonical": "permission_denied"
+    },
+    {
+      "id": "generic.status_404",
+      "status": [
+        404
+      ],
+      "canonical": "model_not_found"
+    },
+    {
+      "id": "generic.status_413",
+      "status": [
+        413
+      ],
+      "canonical": "request_too_large"
+    },
+    {
+      "id": "generic.status_422",
+      "status": [
+        422
+      ],
+      "canonical": "invalid_request_error"
+    },
+    {
+      "id": "generic.status_429",
+      "status": [
+        429
+      ],
+      "canonical": "rate_limit_exceeded"
+    },
+    {
+      "id": "generic.status_500",
+      "status": [
+        500,
+        501,
+        505
+      ],
+      "canonical": "api_error"
+    },
+    {
+      "id": "generic.status_502",
+      "status": [
+        502,
+        520,
+        522,
+        524
+      ],
+      "canonical": "api_error"
+    },
+    {
+      "id": "generic.status_503",
+      "status": [
+        503,
+        529
+      ],
+      "canonical": "server_is_overloaded"
+    },
+    {
+      "id": "generic.status_504",
+      "status": [
+        504
+      ],
+      "canonical": "upstream_timeout"
+    }
+  ]
+}

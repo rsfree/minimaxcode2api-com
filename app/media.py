@@ -32,6 +32,7 @@ import math
 import time
 from typing import Any
 
+from . import channel_errors
 from .auth import token_manager
 from .config import settings
 from .metrics import metrics
@@ -63,7 +64,14 @@ _ASPECT_PRESETS = ((21, 9), (16, 9), (3, 2), (4, 3), (1, 1), (4, 5), (3, 4), (2,
 
 
 class MediaError(RuntimeError):
-    """An upstream tool failure with an HTTP status already mapped."""
+    """An upstream tool failure with an HTTP status already mapped.
+
+    ``status``/``code`` keep the outward contract callers already parse. The
+    canonical verdict from the image taxonomy rides along in ``decision``; it is
+    what the retry gate, the log line and the caller's ``canonical`` field are
+    built from, and it is ``None`` for failures that never spoke to a provider
+    (a bad ``size`` argument, an over-size reference image).
+    """
 
     def __init__(
         self,
@@ -71,12 +79,18 @@ class MediaError(RuntimeError):
         message: str,
         code: int | None = None,
         payload: Any = None,
+        decision: Any = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
         self.code = code
         self.payload = payload
+        self.decision = decision
+
+    @property
+    def canonical(self) -> str:
+        return getattr(self.decision, "canonical", "") or ""
 
     @property
     def status_field(self) -> str | None:
@@ -141,10 +155,10 @@ def video_credit_need(model: str | None) -> float:
 
 async def call(
     tool: str, payload: dict, timeout: float, account: str | None = None,
-    need_credits: float = 0.0,
+    need_credits: float = 0.0, requested: int | None = None,
 ) -> dict:
     """Invoke one MCP tool and unwrap the business-code envelope."""
-    data, _ = await call_ex(tool, payload, timeout, account, need_credits)
+    data, _ = await call_ex(tool, payload, timeout, account, need_credits, requested)
     return data
 
 
@@ -156,40 +170,88 @@ def _account_label(served: str) -> str:
 
 async def call_ex(
     tool: str, payload: dict, timeout: float, account: str | None = None,
-    need_credits: float = 0.0,
+    need_credits: float = 0.0, requested: int | None = None,
 ) -> tuple[dict, str]:
-    """Same as :func:`call`, but also returns the account that served it."""
+    """Same as :func:`call`, but also returns the account that served it.
+
+    ``requested`` is how many images the caller asked for. It is what tells a
+    partial delivery (two of four, still billed) apart from a clean success, so
+    the metrics row can say ``partial`` instead of silently scoring 100%.
+    """
     started = time.time()
     try:
         data, served = await upstream.mcp_ex(
             tool, payload, timeout=timeout, account=account, need_credits=need_credits
         )
     except UpstreamError as exc:
+        # Classify before the status is collapsed to a legacy code: the canonical
+        # verdict is what decides rotation, retries and the caller's ``canonical``.
+        decision = channel_errors.classify_tool(tool, exc.status, exc.payload, requested)
         metrics.record(
             f"mcp:{tool}", tool,
             account=account or getattr(exc, "account", "") or "-",
             ok=False, status=exc.status,
-            latency_ms=(time.time() - started) * 1000, error=exc.message,
+            latency_ms=(time.time() - started) * 1000,
+            error=_logged(exc.message, decision),
         )
-        raise MediaError(exc.status, exc.message, payload=exc.payload) from exc
+        raise MediaError(
+            exc.status, exc.message, payload=exc.payload, decision=decision
+        ) from exc
 
     label = _account_label(served)
     code = data.get("code", 0)
     if isinstance(code, int) and code != 0:
         message = data.get("message") or f"upstream tool {tool} failed (code {code})"
+        decision = channel_errors.classify_tool(tool, 200, data, requested)
         # A business code on an HTTP 200 is still a failed call; the console
         # would otherwise show a 100% success rate while generation never works.
         metrics.record(
             f"mcp:{tool}", tool, account=label, ok=False, status=_status_for(code),
-            latency_ms=(time.time() - started) * 1000, error=str(message),
+            latency_ms=(time.time() - started) * 1000, error=_logged(str(message), decision),
         )
-        raise MediaError(_status_for(code), str(message), code=code, payload=data)
+        raise MediaError(
+            _status_for(code), str(message), code=code, payload=data, decision=decision
+        )
 
-    metrics.record(
-        f"mcp:{tool}", tool, account=label, ok=True, status=200,
-        latency_ms=(time.time() - started) * 1000,
-    )
+    failures = data.get("failed_items")
+    successes = data.get("success_items")
+    if isinstance(failures, list) and failures:
+        # The image tool reports per-item failures inside a 200 with ``code: 0``.
+        # Counting that as success is how the console showed 83/83 while the
+        # caller was getting 502s.
+        decision = channel_errors.classify_tool(tool, 200, data, requested)
+        delivered = len(successes) if isinstance(successes, list) else 0
+        metrics.record(
+            f"mcp:{tool}", tool, account=label, ok=delivered > 0, status=200 if delivered else 502,
+            latency_ms=(time.time() - started) * 1000,
+            error=("partial: " if delivered else "") + _logged(_first_failure(failures), decision),
+        )
+        if decision is not None and delivered:
+            log.info(
+                "image: partial delivery %d/%s (rule %s)",
+                delivered, requested or "?", decision.rule_id,
+            )
+    else:
+        decision = channel_errors.classify_tool(tool, 200, data, requested)
+        metrics.record(
+            f"mcp:{tool}", tool, account=label, ok=True, status=200,
+            latency_ms=(time.time() - started) * 1000,
+        )
     return data, served
+
+
+def _first_failure(failures: list) -> str:
+    first = failures[0] if failures else {}
+    if not isinstance(first, dict):
+        return "upstream reported a failed item"
+    return str(first.get("error_msg") or first.get("err_code") or "upstream reported a failed item")
+
+
+def _logged(message: str, decision: Any) -> str:
+    """Operator-side text: the canonical rule first, then what upstream said."""
+    if decision is None:
+        return message
+    return f"[{decision.canonical}] {message}"
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +454,13 @@ async def describe_asset(url: str, timeout: float = 20.0) -> dict[str, Any]:
                     return info
             return image_info(head)
     except Exception as exc:  # noqa: BLE001 - metadata is a nicety, never fatal
-        log.debug("cannot describe asset %s: %s", url, exc)
+        # The asset URL is signed: query carries the credential, so only the
+        # host and path may reach a log line.
+        log.debug(
+            "cannot describe asset %s: %s",
+            channel_errors.ge.sanitize_url(url) if isinstance(url, str) else url,
+            exc,
+        )
         return {}
 
 
@@ -591,9 +659,10 @@ async def image_generate(
 
     if not refs:
         data = await call(
-            "image_synthesize", {"requests": requests}, IMAGE_TIMEOUT, need_credits=need
+            "image_synthesize", {"requests": requests}, IMAGE_TIMEOUT,
+            need_credits=need, requested=len(requests),
         )
-        return _collect_images(data)
+        return _collect_images(data, len(requests))
 
     loaded = [await read_reference(value) for value in refs]
     for attempt in range(2):
@@ -605,11 +674,16 @@ async def image_generate(
             for item in requests:
                 item["input_urls"] = staged
             data = await call(
-                "image_synthesize", {"requests": requests}, IMAGE_TIMEOUT, need_credits=need
+                "image_synthesize", {"requests": requests}, IMAGE_TIMEOUT,
+                need_credits=need, requested=len(requests),
             )
-            return _collect_images(data)
+            return _collect_images(data, len(requests))
         except MediaError as exc:
-            if attempt == 1 or exc.status != 502:
+            # Only a refusal that re-encoding can plausibly fix is worth a second
+            # upstream call. A moderation hit or an exhausted balance answers the
+            # same thing byte-for-byte, and retrying it is how one refused prompt
+            # turns into twenty billed calls.
+            if attempt == 1 or not channel_errors.retryable_after_reencode(exc.decision):
                 raise
             log.warning(
                 "image: upstream refused the references (%s); re-encoding them "
@@ -620,7 +694,7 @@ async def image_generate(
     raise MediaError(502, "image generation failed")  # pragma: no cover - loop returns
 
 
-def _collect_images(data: dict) -> dict:
+def _collect_images(data: dict, requested: int | None = None) -> dict:
     """Turn one ``image_synthesize`` envelope into the caller-facing shape."""
     images: list[dict[str, Any]] = []
     for item in data.get("success_items") or []:
@@ -641,7 +715,12 @@ def _collect_images(data: dict) -> dict:
             detail = failed[0].get("error_msg") or ""
             if failed[0].get("err_code"):
                 detail = f"{detail} [{failed[0]['err_code']}]".strip()
-        raise MediaError(502, detail or "upstream returned no image", payload=data)
+        decision = channel_errors.classify_tool(
+            "image_synthesize", 200, data, requested, force=True
+        )
+        raise MediaError(
+            502, detail or "upstream returned no image", payload=data, decision=decision
+        )
 
     return {"images": images, "raw": data}
 
